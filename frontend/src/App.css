@@ -1,0 +1,230 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&display=swap");
+
+:root {
+  --bg0: #0f1c17;
+  --bg1: #163028;
+  --ink: #edf4ef;
+  --muted: #9fb3a8;
+  --accent: #d6f26a;
+  --accent-ink: #142018;
+  --panel: rgba(237, 244, 239, 0.06);
+  --line: rgba(237, 244, 239, 0.12);
+  --danger: #ff8f7a;
+  --radius: 14px;
+  font-family: "DM Sans", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #2a5a45 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #3a4d20 0%, transparent 50%),
+    linear-gradient(160deg, var(--bg0), var(--bg1));
+  line-height: 1.45;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.page {
+  width: min(980px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2.5rem 0 4rem;
+}
+
+.brand {
+  font-family: "Instrument Serif", serif;
+  font-size: 2rem;
+  margin: 0;
+  letter-spacing: 0.01em;
+}
+
+.brand-block h1,
+.top h1 {
+  font-family: "Instrument Serif", serif;
+  font-weight: 400;
+  font-size: clamp(2rem, 4vw, 2.8rem);
+  margin: 0.35rem 0 0.5rem;
+}
+
+.lede {
+  color: var(--muted);
+  margin: 0 0 1.25rem;
+  max-width: 36rem;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+  backdrop-filter: blur(8px);
+}
+
+.panel h2 {
+  margin: 0 0 0.85rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+@media (max-width: 760px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.85rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+input {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  padding: 0.7rem 0.85rem;
+  font: inherit;
+}
+
+.inline {
+  display: flex;
+  gap: 0.65rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.inline input {
+  flex: 1;
+  min-width: 180px;
+}
+
+button,
+.file {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+button.ghost {
+  opacity: 0.85;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.tabs button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+}
+
+.list li {
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.list.compact li {
+  padding: 0.45rem 0;
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(214, 242, 106, 0.15);
+  color: var(--accent);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.error {
+  color: var(--danger);
+}
+
+.notice {
+  margin-top: 0.85rem;
+  color: var(--accent);
+}
+
+.file input {
+  margin-top: 0.35rem;
+}
+
+.auth {
+  display: grid;
+  gap: 1.5rem;
+  align-items: start;
+  min-height: 100vh;
+  padding-top: 4rem;
+}
+
+@media (min-width: 900px) {
+  .auth {
+    grid-template-columns: 1.1fr 0.9fr;
+    align-items: center;
+  }
+}

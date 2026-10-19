@@ -1,0 +1,106 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: futsal
+      POSTGRES_PASSWORD: futsal
+      POSTGRES_DB: futsal
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U futsal -d futsal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # MinIO image pull may be blocked in some environments.
+  # Default STORAGE_BACKEND=local writes to ./backend/data/videos (shared volume).
+  # To use S3 later: set STORAGE_BACKEND=s3 and add a reachable MinIO/S3 endpoint.
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql+psycopg://futsal:futsal@db:5432/futsal
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_PATH: /data/videos
+      API_PUBLIC_URL: http://localhost:8000
+      JWT_SECRET: dev-change-me
+      CORS_ORIGINS: http://localhost:5173
+      VISION_BACKEND: yolo
+      YOLO_MODEL: yolov8n.pt
+      VISION_DEVICE: cpu
+      VISION_FRAME_STRIDE: "5"
+      ALLOW_SINGLE_CAMERA: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - video_data:/data/videos
+      - yolo_weights:/root/.cache/torch
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m app.workers.runner
+    environment:
+      DATABASE_URL: postgresql+psycopg://futsal:futsal@db:5432/futsal
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_PATH: /data/videos
+      API_PUBLIC_URL: http://localhost:8000
+      JWT_SECRET: dev-change-me
+      VISION_BACKEND: yolo
+      YOLO_MODEL: yolov8n.pt
+      VISION_DEVICE: cpu
+      VISION_FRAME_STRIDE: "5"
+      ALLOW_SINGLE_CAMERA: "true"
+    volumes:
+      - ./backend:/app
+      - video_data:/data/videos
+      - yolo_weights:/root/.cache/torch
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  video_data:
+  yolo_weights:
