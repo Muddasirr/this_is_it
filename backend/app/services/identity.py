@@ -1,8 +1,10 @@
-"""Identity: kit color + jersey number → roster; staff confirms/corrects."""
+"""Identity: kit color (team) + jersey number → roster; staff confirms/corrects.
+
+Same shirt number on opposite kits is allowed (Kit A #10 ≠ Kit B #10).
+"""
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -11,7 +13,7 @@ from app.models import Match, MatchRoster, Player, PlayerTrack, Team, TrackIdent
 from app.models.entities import IdentityState
 
 COLOR_SIM_THRESHOLD = 0.72
-MAX_AUTO_PLAYERS = 14
+MAX_AUTO_PLAYERS = 16
 
 
 def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack]) -> list[TrackIdentityLink]:
@@ -30,30 +32,26 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
         reverse=True,
     )[:MAX_AUTO_PLAYERS]
 
-    # Enrich each cluster with dominant jersey number (OCR votes)
     cluster_meta: list[dict] = []
     for cluster in clusters:
         number, nconf = _cluster_jersey(cluster)
-        has_color = any((t.features or {}).get("color_hist") for t in cluster)
+        hist = _cluster_mean_hist(cluster)
         cluster_meta.append(
             {
                 "tracks": cluster,
                 "jersey_number": number,
                 "jersey_confidence": nconf,
-                "has_color": has_color,
+                "has_color": hist is not None,
+                "color_hist": hist,
                 "duration": sum(t.end_ms - t.start_ms for t in cluster),
+                "kit": "A",  # filled below
             }
         )
 
-    roster = (
-        db.query(MatchRoster).filter(MatchRoster.match_id == match_id).order_by(MatchRoster.shirt_number).all()
-    )
-    roster_by_number = {r.shirt_number: r for r in roster}
+    _assign_kits(cluster_meta)
 
-    # Ensure roster players exist for detected numbers / clusters
-    if cluster_meta and (not roster or len(roster) < min(6, len(cluster_meta))):
-        roster = _ensure_detected_roster(db, match, cluster_meta)
-        roster_by_number = {r.shirt_number: r for r in roster}
+    roster = _ensure_kit_roster(db, match, cluster_meta)
+    roster_by_key = {(r.team_id, r.shirt_number): r for r in roster}
 
     used_roster_ids: set[UUID] = set()
     links: list[TrackIdentityLink] = []
@@ -61,14 +59,14 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
     for meta in cluster_meta:
         cluster = meta["tracks"]
         number = meta["jersey_number"]
+        team_id = meta.get("team_id")
         player_id = None
         state = IdentityState.unknown
         conf = 0.2
         source = "model_color"
 
-        # 1) Prefer exact shirt-number match on roster
-        if number is not None and number in roster_by_number:
-            entry = roster_by_number[number]
+        if number is not None and team_id is not None and (team_id, number) in roster_by_key:
+            entry = roster_by_key[(team_id, number)]
             if entry.player_id not in used_roster_ids:
                 player_id = entry.player_id
                 used_roster_ids.add(entry.player_id)
@@ -76,18 +74,31 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
                 conf = min(0.9, 0.45 + float(meta["jersey_confidence"] or 0) * 0.5)
                 if meta["has_color"]:
                     conf = min(0.95, conf + 0.1)
-                source = "model_color_number"
-        # 2) Else assign next unused roster slot (color cluster only)
+                source = "model_kit_number"
+
         if player_id is None and roster:
+            # Prefer unused roster slot on same kit team
             for entry in roster:
                 if entry.player_id in used_roster_ids:
+                    continue
+                if team_id and entry.team_id != team_id:
                     continue
                 player_id = entry.player_id
                 used_roster_ids.add(entry.player_id)
                 state = IdentityState.proposed
                 conf = 0.55 if meta["has_color"] else 0.35
-                source = "model_color"
+                source = "model_kit"
                 break
+            if player_id is None:
+                for entry in roster:
+                    if entry.player_id in used_roster_ids:
+                        continue
+                    player_id = entry.player_id
+                    used_roster_ids.add(entry.player_id)
+                    state = IdentityState.proposed
+                    conf = 0.4
+                    source = "model_color"
+                    break
 
         for track in cluster:
             link = TrackIdentityLink(
@@ -116,6 +127,8 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
 
 
 def _cluster_jersey(cluster: list[PlayerTrack]) -> tuple[int | None, float]:
+    from app.services.jersey_ocr import prefer_jersey_number
+
     votes: list[tuple[int, float]] = []
     for t in cluster:
         feats = t.features or {}
@@ -124,87 +137,149 @@ def _cluster_jersey(cluster: list[PlayerTrack]) -> tuple[int | None, float]:
             continue
         conf = float(feats.get("jersey_confidence") or 0.5)
         votes.append((int(num), conf))
-        # weight by vote count if present
         for _ in range(max(0, int(feats.get("jersey_votes") or 1) - 1)):
             votes.append((int(num), conf))
-    if not votes:
-        return None, 0.0
-    scores: dict[int, float] = defaultdict(float)
-    counts: Counter[int] = Counter()
-    for n, c in votes:
-        scores[n] += c
-        counts[n] += 1
-    best = max(scores.keys(), key=lambda n: (scores[n], counts[n]))
-    return best, round(scores[best] / max(1, counts[best]), 3)
+    return prefer_jersey_number(votes)
 
 
-def _ensure_detected_roster(db: Session, match: Match, cluster_meta: list[dict]) -> list[MatchRoster]:
-    """Create/reuse Auto-detected players named by jersey when OCR found one."""
-    team = (
-        db.query(Team)
-        .filter(Team.facility_id == match.facility_id, Team.name == "Auto-detected")
-        .first()
-    )
-    if team is None:
-        team = Team(facility_id=match.facility_id, name="Auto-detected", primary_color=None)
-        db.add(team)
-        db.flush()
+def _cluster_mean_hist(cluster: list[PlayerTrack]) -> list[float] | None:
+    hists = []
+    for t in cluster:
+        h = (t.features or {}).get("color_hist")
+        if h:
+            hists.append(list(h))
+    if not hists:
+        return None
+    return _mean_hist(hists)
 
-    existing_players = (
-        db.query(Player)
-        .filter(Player.facility_id == match.facility_id, Player.team_id == team.id)
-        .order_by(Player.default_shirt_number)
-        .all()
-    )
-    by_number = {p.default_shirt_number: p for p in existing_players if p.default_shirt_number is not None}
 
-    # Choose shirt numbers: OCR number when unique, else free slots 1..N
-    used_numbers: set[int] = set()
-    assigned: list[tuple[dict, int]] = []
+def _dominant_hue_bin(hist: list[float] | None) -> float:
+    """8x8 HSV hist → weighted hue bin (0–7)."""
+    if not hist or len(hist) < 64:
+        return 3.5
+    bins = 8
+    weights = [0.0] * bins
+    for i, v in enumerate(hist[:64]):
+        weights[i // bins] += float(v)
+    total = sum(weights) or 1.0
+    return sum(i * w for i, w in enumerate(weights)) / total
+
+
+def _assign_kits(cluster_meta: list[dict]) -> None:
+    """Split clusters into Kit A / Kit B by kit-color hue."""
+    if not cluster_meta:
+        return
+    hues = [_dominant_hue_bin(m.get("color_hist")) for m in cluster_meta]
+    if len(cluster_meta) == 1 or max(hues) - min(hues) < 0.8:
+        for m in cluster_meta:
+            m["kit"] = "A"
+        return
+
+    # 2-means on hue
+    c0, c1 = min(hues), max(hues)
+    for _ in range(8):
+        g0, g1 = [], []
+        for h in hues:
+            if abs(h - c0) <= abs(h - c1):
+                g0.append(h)
+            else:
+                g1.append(h)
+        if not g0 or not g1:
+            break
+        c0 = sum(g0) / len(g0)
+        c1 = sum(g1) / len(g1)
+
+    # Label lower-hue as A for stability
+    if c0 > c1:
+        c0, c1 = c1, c0
+    for m, h in zip(cluster_meta, hues):
+        m["kit"] = "A" if abs(h - c0) <= abs(h - c1) else "B"
+
+
+def _ensure_kit_roster(db: Session, match: Match, cluster_meta: list[dict]) -> list[MatchRoster]:
+    """Create Kit A / Kit B teams; allow same shirt number on both."""
+    teams: dict[str, Team] = {}
+    for kit, color in (("A", "#3b82f6"), ("B", "#ef4444")):
+        name = f"Kit {kit}"
+        team = (
+            db.query(Team)
+            .filter(Team.facility_id == match.facility_id, Team.name == name)
+            .first()
+        )
+        if team is None:
+            team = Team(facility_id=match.facility_id, name=name, primary_color=color)
+            db.add(team)
+            db.flush()
+        teams[kit] = team
+
+    # Assign shirt numbers unique within kit
+    used_by_kit: dict[str, set[int]] = {"A": set(), "B": set()}
+    assignments: list[tuple[dict, str, int]] = []
+
     for meta in cluster_meta:
-        num = meta["jersey_number"]
-        if num is not None and num not in used_numbers:
-            used_numbers.add(num)
-            assigned.append((meta, num))
+        kit = meta.get("kit") or "A"
+        num = meta.get("jersey_number")
+        if num is not None and int(num) not in used_by_kit[kit]:
+            used_by_kit[kit].add(int(num))
+            assignments.append((meta, kit, int(num)))
         else:
-            assigned.append((meta, 0))  # fill later
+            assignments.append((meta, kit, 0))
 
-    next_free = 1
-    filled: list[tuple[dict, int]] = []
-    for meta, num in assigned:
+    next_free = {"A": 1, "B": 1}
+    filled: list[tuple[dict, str, int]] = []
+    for meta, kit, num in assignments:
         if num:
-            filled.append((meta, num))
+            filled.append((meta, kit, num))
             continue
-        while next_free in used_numbers:
-            next_free += 1
-        used_numbers.add(next_free)
-        filled.append((meta, next_free))
-        next_free += 1
+        n = next_free[kit]
+        while n in used_by_kit[kit]:
+            n += 1
+        used_by_kit[kit].add(n)
+        next_free[kit] = n + 1
+        filled.append((meta, kit, n))
+        # Keep OCR miss visible as assigned slot number
+        meta["jersey_number"] = n
 
-    for _, num in filled:
-        if num in by_number:
+    # Players keyed by (team_id, shirt)
+    players_by_key: dict[tuple[UUID, int], Player] = {}
+    for kit, team in teams.items():
+        existing = (
+            db.query(Player)
+            .filter(Player.facility_id == match.facility_id, Player.team_id == team.id)
+            .all()
+        )
+        for p in existing:
+            if p.default_shirt_number is not None:
+                players_by_key[(team.id, p.default_shirt_number)] = p
+
+    for meta, kit, num in filled:
+        team = teams[kit]
+        meta["team_id"] = team.id
+        meta["jersey_number"] = num
+        key = (team.id, num)
+        if key in players_by_key:
+            player = players_by_key[key]
+            # Refresh auto names
+            if player.display_name.startswith(("Player #", "Detected Player", "Kit A #", "Kit B #")):
+                player.display_name = f"Kit {kit} #{num}"
+                player.default_shirt_number = num
             continue
-        name = f"Player #{num}"
         player = Player(
             facility_id=match.facility_id,
             team_id=team.id,
-            display_name=name,
+            display_name=f"Kit {kit} #{num}",
             default_shirt_number=num,
             is_active=True,
         )
         db.add(player)
         db.flush()
-        by_number[num] = player
-        existing_players.append(player)
+        players_by_key[key] = player
 
     db.query(MatchRoster).filter(MatchRoster.match_id == match.id).delete(synchronize_session=False)
     roster: list[MatchRoster] = []
-    for _, num in filled:
-        player = by_number[num]
-        # Keep display name synced to number for auto players
-        if player.display_name.startswith("Detected Player") or player.display_name.startswith("Player #"):
-            player.display_name = f"Player #{num}"
-            player.default_shirt_number = num
+    for meta, kit, num in filled:
+        team = teams[kit]
+        player = players_by_key[(team.id, num)]
         entry = MatchRoster(
             match_id=match.id,
             player_id=player.id,

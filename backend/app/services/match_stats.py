@@ -127,6 +127,8 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         )
 
     # Normalize heatmaps 0–1 for UI
+    from app.services.avatars import avatar_url_for
+
     match_heat_n = _normalize_heat(match_heat)
     player_rows = []
     for pid, r in by_player.items():
@@ -135,6 +137,9 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             {
                 "player_id": pid,
                 "display_name": player.display_name if player else "Unknown",
+                "shirt_number": player.default_shirt_number if player else None,
+                "team_id": str(player.team_id) if player and player.team_id else None,
+                "avatar_url": avatar_url_for(player),
                 "goal": r["goal"],
                 "shot": r["shot"],
                 "pass": r["pass"],

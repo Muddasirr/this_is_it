@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
@@ -61,11 +63,15 @@ class YoloTrackBackend(VisionBackend):
         color_sums: dict[int, Any] = {}
         color_counts: dict[int, int] = defaultdict(int)
         jersey_votes: dict[int, list[tuple[int, float]]] = defaultdict(list)
+        best_thumbs: dict[int, tuple[float, str]] = {}
         ball_hits = 0
         frames_processed = 0
         t0 = time.perf_counter()
         frame_idx = 0
-        ocr_every = max(4, 12 // max(1, self.frame_stride))  # ~sparse OCR for CPU
+        # With stride 15, keep OCR rare — full jersey OCR is expensive on CPU
+        ocr_every = max(8, 48 // max(1, self.frame_stride))
+        thumb_dir = Path(tempfile.gettempdir()) / "courtlens_thumbs" / camera_label
+        thumb_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             while True:
@@ -130,6 +136,20 @@ class YoloTrackBackend(VisionBackend):
                             else:
                                 color_sums[tid] = color_sums[tid] + hist
                             color_counts[tid] += 1
+                        # Best in-match crop for avatar (prefer large, confident box)
+                        bw = max(1.0, xyxy[2] - xyxy[0])
+                        bh = max(1.0, xyxy[3] - xyxy[1])
+                        thumb_score = bw * bh * conf
+                        if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= 28 and bh >= 40:
+                            x1 = max(0, int(xyxy[0]))
+                            y1 = max(0, int(xyxy[1]))
+                            x2 = min(frame.shape[1], int(xyxy[2]))
+                            y2 = min(frame.shape[0], int(xyxy[3]))
+                            crop = frame[y1:y2, x1:x2]
+                            if crop.size:
+                                path = str(thumb_dir / f"p{tid}.jpg")
+                                cv2.imwrite(path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                                best_thumbs[tid] = (thumb_score, path)
                         # Occasional jersey OCR when box is large enough
                         if frames_processed % ocr_every == 0 and (xyxy[2] - xyxy[0]) >= 36:
                             from app.services.jersey_ocr import read_jersey_number
@@ -165,6 +185,9 @@ class YoloTrackBackend(VisionBackend):
                     feats["jersey_number"] = number
                     feats["jersey_confidence"] = jconf
                     feats["jersey_votes"] = len(jersey_votes[tid])
+            if class_name == "person" and tid in best_thumbs:
+                feats["thumb_path"] = best_thumbs[tid][1]
+                feats["thumb_score"] = float(best_thumbs[tid][0])
 
             detections.append(
                 Detection(
@@ -219,15 +242,9 @@ class YoloTrackBackend(VisionBackend):
 
 
 def _majority_jersey(votes: list[tuple[int, float]]) -> tuple[int | None, float]:
-    if not votes:
-        return None, 0.0
-    scores: dict[int, float] = defaultdict(float)
-    counts: dict[int, int] = defaultdict(int)
-    for num, conf in votes:
-        scores[num] += conf
-        counts[num] += 1
-    best = max(scores.keys(), key=lambda n: (scores[n], counts[n]))
-    return best, round(scores[best] / max(1, counts[best]), 3)
+    from app.services.jersey_ocr import prefer_jersey_number
+
+    return prefer_jersey_number(votes)
 
 
 def _downsample_series(obs: list[dict[str, Any]], max_n: int) -> list[dict[str, Any]]:

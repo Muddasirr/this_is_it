@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # Lightweight schema upgrades for existing DBs (create_all won't ALTER)
+    try:
+        from sqlalchemy import text
+
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE players ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(512)"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Schema patch skipped: %s", exc)
     try:
         ensure_bucket()
     except Exception as exc:  # noqa: BLE001

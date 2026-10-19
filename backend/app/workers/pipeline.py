@@ -15,6 +15,7 @@ from app.models import (
     EventObservation,
     EventParticipant,
     HighlightClip,
+    Match,
     MatchEvent,
     ModelVersion,
     PlayerTrack,
@@ -35,6 +36,7 @@ from app.models.entities import (
 from app.core.config import get_settings
 from app.services import jobs as job_service
 from app.services.clips import render_and_store_clip
+from app.services.avatars import attach_player_avatars
 from app.services.identity import propose_identity_links
 from app.services.media import estimate_offset_ms_stub, probe_video, validate_probe
 from app.services.storage import download_to_path, object_key_for_proxy, upload_file
@@ -312,8 +314,17 @@ def process_job(db: Session, job_id: UUID) -> None:
                 )
                 db.commit()
             links = propose_identity_links(db, job.match_id, saved_tracks)
+            match_row = db.get(Match, job.match_id)
+            avatar_count = 0
+            if match_row:
+                avatar_count = attach_player_avatars(db, match_row, saved_tracks)
             track_by_key = {t.track_key: t for t in saved_tracks}
-            _finish_run(db, run, JobStatus.succeeded, {"identity_links": len(links)})
+            _finish_run(
+                db,
+                run,
+                JobStatus.succeeded,
+                {"identity_links": len(links), "avatars": avatar_count},
+            )
 
             # 6. Infer events
             run = _start_run(db, job, JobStage.infer_events, model.id)

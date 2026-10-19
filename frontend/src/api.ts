@@ -8,6 +8,8 @@ export type Player = {
   team_id: string | null;
   display_name: string;
   default_shirt_number: number | null;
+  avatar_key?: string | null;
+  avatar_url?: string | null;
 };
 export type Match = {
   id: string;
@@ -76,6 +78,9 @@ export type MatchStats = {
   by_player: {
     player_id: string;
     display_name: string;
+    shirt_number?: number | null;
+    team_id?: string | null;
+    avatar_url?: string | null;
     goal: number;
     shot: number;
     pass: number;

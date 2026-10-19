@@ -58,8 +58,10 @@ function AuthPage({ onAuthed }: { onAuthed: () => void }) {
     <div className="page auth">
       <header className="brand-block">
         <p className="brand">CourtLens</p>
-        <h1>Facility match analytics</h1>
-        <p className="lede">Upload two-camera futsal recordings. Review uncertain events. Publish player reports.</p>
+        <h1>Match stats for your court</h1>
+        <p className="lede">
+          Upload match video, review goals, shots and passes, then share a report with coaches and players.
+        </p>
       </header>
       <form className="panel" onSubmit={submit}>
         <div className="tabs">
@@ -118,7 +120,7 @@ function FacilitiesPage() {
       <header className="top">
         <div>
           <p className="brand">CourtLens</p>
-          <h1>Facilities</h1>
+          <h1>Your courts</h1>
         </div>
         <div className="inline">
           <Link to="/phase0">Phase 0 feasibility</Link>
@@ -182,9 +184,9 @@ function FacilityHome() {
       <header className="top">
         <div>
           <p className="brand">CourtLens</p>
-          <h1>Facility workspace</h1>
+          <h1>Squad & fixtures</h1>
         </div>
-        <Link to="/">All facilities</Link>
+        <Link to="/">All courts</Link>
       </header>
 
       <section className="grid-2">
@@ -227,6 +229,7 @@ function FacilityHome() {
           <ul className="list compact">
             {players.map((p) => (
               <li key={p.id}>
+                {p.avatar_url ? <img className="player-thumb" src={p.avatar_url} alt="" /> : null}
                 #{p.default_shirt_number ?? "—"} {p.display_name}
               </li>
             ))}
@@ -271,37 +274,171 @@ function formatMatchClock(ms: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function HeatmapGrid({
+function heatFill(v: number): string {
+  // Cold → hot over grass (Opta-style)
+  if (v < 0.2) return `rgba(56, 189, 248, ${0.15 + v * 0.55})`;
+  if (v < 0.45) return `rgba(250, 204, 21, ${0.28 + v * 0.45})`;
+  if (v < 0.7) return `rgba(249, 115, 22, ${0.4 + v * 0.4})`;
+  return `rgba(239, 68, 68, ${0.5 + v * 0.45})`;
+}
+
+function PitchHeatmap({
   grid,
   label,
 }: {
   grid: number[][] | undefined;
   label: string;
 }) {
+  const uid = `ph-${label.replace(/\W+/g, "").slice(0, 18) || "map"}`;
   if (!grid?.length) {
     return <p className="bc-empty">Heatmap unavailable for this selection.</p>;
   }
-  const w = grid[0]?.length || 1;
+  const rows = grid.length;
+  const cols = grid[0]?.length || 1;
+  // Standard pitch proportions (metres)
+  const PW = 105;
+  const PH = 68;
+  const cellW = PW / cols;
+  const cellH = PH / rows;
+  const blobs: { x: number; y: number; r: number; fill: string; key: string }[] = [];
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const v = grid[y][x];
+      if (v < 0.06) continue;
+      blobs.push({
+        key: `${y}-${x}`,
+        x: (x + 0.5) * cellW,
+        y: (y + 0.5) * cellH,
+        r: Math.max(cellW, cellH) * (0.7 + v * 1.1),
+        fill: heatFill(v),
+      });
+    }
+  }
+  const grassId = `${uid}-grass`;
+  const blurId = `${uid}-blur`;
+
   return (
     <div className="bc-heat-wrap">
-      <div
-        className="bc-heat"
-        style={{ gridTemplateColumns: `repeat(${w}, minmax(0, 1fr))` }}
-        role="img"
-        aria-label={label}
-      >
-        {grid.flatMap((row, y) =>
-          row.map((v, x) => (
-            <span
-              key={`${y}-${x}`}
-              className="bc-heat-cell"
-              style={{ opacity: 0.08 + v * 0.92 }}
-              title={`${Math.round(v * 100)}%`}
-            />
-          )),
-        )}
+      <div className="bc-pitch" role="img" aria-label={label}>
+        <svg viewBox={`0 0 ${PW} ${PH}`} className="bc-pitch-svg" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <pattern id={grassId} width="6" height="68" patternUnits="userSpaceOnUse">
+              <rect width="3" height="68" fill="#1f7a42" />
+              <rect x="3" width="3" height="68" fill="#1a6b39" />
+            </pattern>
+            <filter id={blurId} x="-40%" y="-40%" width="180%" height="180%">
+              <feGaussianBlur stdDeviation="2.2" />
+            </filter>
+          </defs>
+          <rect width={PW} height={PH} fill={`url(#${grassId})`} rx="1.2" />
+          {/* Markings */}
+          <g fill="none" stroke="rgba(255,255,255,0.88)" strokeWidth="0.35">
+            <rect x="1.5" y="1.5" width={PW - 3} height={PH - 3} />
+            <line x1={PW / 2} y1="1.5" x2={PW / 2} y2={PH - 1.5} />
+            <circle cx={PW / 2} cy={PH / 2} r="9.15" />
+            <circle cx={PW / 2} cy={PH / 2} r="0.55" fill="rgba(255,255,255,0.9)" stroke="none" />
+            {/* Left penalty */}
+            <rect x="1.5" y={(PH - 40.32) / 2} width="16.5" height="40.32" />
+            <rect x="1.5" y={(PH - 18.32) / 2} width="5.5" height="18.32" />
+            <circle cx="11" cy={PH / 2} r="0.45" fill="rgba(255,255,255,0.9)" stroke="none" />
+            {/* Right penalty */}
+            <rect x={PW - 1.5 - 16.5} y={(PH - 40.32) / 2} width="16.5" height="40.32" />
+            <rect x={PW - 1.5 - 5.5} y={(PH - 18.32) / 2} width="5.5" height="18.32" />
+            <circle cx={PW - 11} cy={PH / 2} r="0.45" fill="rgba(255,255,255,0.9)" stroke="none" />
+            {/* Goals */}
+            <rect x="0.35" y={(PH - 7.32) / 2} width="1.15" height="7.32" />
+            <rect x={PW - 1.5} y={(PH - 7.32) / 2} width="1.15" height="7.32" />
+          </g>
+          <g filter={`url(#${blurId})`} style={{ mixBlendMode: "screen" }}>
+            {blobs.map((b) => (
+              <circle key={b.key} cx={b.x} cy={b.y} r={b.r} fill={b.fill} />
+            ))}
+          </g>
+        </svg>
+        <div className="bc-heat-legend" aria-hidden>
+          <span>Low</span>
+          <span className="bc-heat-scale" />
+          <span>High</span>
+        </div>
       </div>
       <p className="bc-heat-caption">{label}</p>
+    </div>
+  );
+}
+
+function PhotoLightbox({
+  src,
+  title,
+  onClose,
+}: {
+  src: string;
+  title: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="bc-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={onClose}
+    >
+      <button type="button" className="bc-lightbox-close" onClick={onClose} aria-label="Close">
+        Close
+      </button>
+      <figure className="bc-lightbox-figure" onClick={(e) => e.stopPropagation()}>
+        <img src={src} alt={title} className="bc-lightbox-img" />
+        <figcaption>{title}</figcaption>
+      </figure>
+    </div>
+  );
+}
+
+function ClipLightbox({
+  src,
+  title,
+  onClose,
+}: {
+  src: string;
+  title: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="bc-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={onClose}
+    >
+      <button type="button" className="bc-lightbox-close" onClick={onClose} aria-label="Close">
+        Close
+      </button>
+      <div className="bc-clip-panel" onClick={(e) => e.stopPropagation()}>
+        <video className="bc-clip-video" src={src} controls autoPlay playsInline />
+        <div className="bc-clip-meta">
+          <p className="bc-clip-title">{title}</p>
+          <a className="bc-clip-download" href={src} download target="_blank" rel="noopener noreferrer">
+            Download clip
+          </a>
+        </div>
+      </div>
     </div>
   );
 }
@@ -335,6 +472,9 @@ function MatchPage() {
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<"center" | "setup" | "identity">("center");
   const [heatPlayerId, setHeatPlayerId] = useState<string>("match");
+  const [photoModal, setPhotoModal] = useState<{ src: string; title: string } | null>(null);
+  const [clipModal, setClipModal] = useState<{ src: string; title: string } | null>(null);
+  const [clipBusyId, setClipBusyId] = useState<string | null>(null);
 
   async function refresh() {
     const [m, p, v, j, sync] = await Promise.all([
@@ -475,7 +615,7 @@ function MatchPage() {
             <div className="bc-progress-bar">
               <span style={{ width: `${latestJob.progress_pct}%` }} />
             </div>
-            <p className="bc-progress-label">Broadcast stats update when analysis finishes.</p>
+            <p className="bc-progress-label">Match stats update when processing finishes.</p>
           </div>
         )}
       </section>
@@ -497,8 +637,8 @@ function MatchPage() {
           <div className="bc-layout">
             <section className="bc-board">
               <div className="bc-board-head">
-                <h2>Player stats</h2>
-                <span>POS% · TCH · DIST · G · S · P</span>
+                <h2>Squad board</h2>
+                <span>POS% · Touches · Move · G · S · P</span>
               </div>
               {leaderboard.length ? (
                 <>
@@ -506,18 +646,24 @@ function MatchPage() {
                     <thead>
                       <tr>
                         <th>Player</th>
-                        <th className="num">POS%</th>
-                        <th className="num">TCH</th>
-                        <th className="num">DIST</th>
-                        <th className="num">G</th>
-                        <th className="num">S</th>
-                        <th className="num">P</th>
+                        <th className="num" title="Possession share">POS%</th>
+                        <th className="num" title="Ball touches">Touches</th>
+                        <th
+                          className="num"
+                          title="Relative movement in the camera view — not metres. Path length as % of frame diagonal."
+                        >
+                          Move
+                        </th>
+                        <th className="num" title="Goals">G</th>
+                        <th className="num" title="Shots">S</th>
+                        <th className="num" title="Passes">P</th>
                       </tr>
                     </thead>
                     <tbody>
                       {leaderboard.map((row, idx) => {
                         const rosterPlayer = players.find((p) => p.id === row.player_id);
-                        const shirt = rosterPlayer?.default_shirt_number ?? idx + 1;
+                        const shirt = row.shirt_number ?? rosterPlayer?.default_shirt_number ?? idx + 1;
+                        const avatar = row.avatar_url || rosterPlayer?.avatar_url;
                         return (
                           <tr
                             key={row.player_id}
@@ -526,6 +672,21 @@ function MatchPage() {
                           >
                             <td>
                               <div className="bc-player">
+                                {avatar ? (
+                                  <button
+                                    type="button"
+                                    className="bc-avatar-btn"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPhotoModal({ src: avatar, title: row.display_name });
+                                    }}
+                                    aria-label={`Open photo of ${row.display_name}`}
+                                  >
+                                    <img className="bc-avatar" src={avatar} alt="" />
+                                  </button>
+                                ) : (
+                                  <span className="bc-avatar-fallback">#{shirt}</span>
+                                )}
                                 <span className="bc-shirt">{shirt}</span>
                                 <div>
                                   <span className="bc-player-name">{row.display_name}</span>
@@ -547,9 +708,9 @@ function MatchPage() {
                       })}
                     </tbody>
                   </table>
-                  <p className="bc-table-note">
-                    POS% possession share · TCH ball touches · DIST relative movement (not metres). Click a
-                    player for their heatmap.
+                              <p className="bc-table-note">
+                    POS% possession · Touches = times on the ball · Move = relative distance in camera view
+                    (not metres). Tap a player for their pitch map; tap photo to enlarge.
                   </p>
                 </>
               ) : (
@@ -559,8 +720,8 @@ function MatchPage() {
 
             <section className="bc-board">
               <div className="bc-board-head">
-                <h2>Key moments</h2>
-                <span>{timeline.length} events</span>
+                <h2>Match timeline</h2>
+                <span>{timeline.length} moments</span>
               </div>
               <div className="bc-timeline">
                 {timeline.length ? (
@@ -618,20 +779,30 @@ function MatchPage() {
                           </select>
                           <button
                             type="button"
+                            disabled={clipBusyId === ev.id}
                             onClick={async () => {
-                              const clip = await api.createClip(facilityId, matchId, ev.id);
-                              setMessage(`Clip ready — open from notice below`);
-                              window.open(clip.playback_url, "_blank", "noopener,noreferrer");
+                              setClipBusyId(ev.id);
+                              try {
+                                const clip = await api.createClip(facilityId, matchId, ev.id);
+                                setClipModal({
+                                  src: clip.playback_url,
+                                  title: `${ev.event_type} · ${formatMatchClock(ev.canonical_ts_ms)} · ${eventPlayer(ev)}`,
+                                });
+                              } catch (err) {
+                                setMessage(err instanceof Error ? err.message : "Could not load clip");
+                              } finally {
+                                setClipBusyId(null);
+                              }
                             }}
                           >
-                            Watch clip
+                            {clipBusyId === ev.id ? "Loading…" : "Watch clip"}
                           </button>
                         </div>
                       </div>
                     </article>
                   ))
                 ) : (
-                  <p className="bc-empty">Key moments appear here after processing — like a broadcast timeline.</p>
+                  <p className="bc-empty">Goals, shots and passes show here after the match is processed.</p>
                 )}
               </div>
             </section>
@@ -639,11 +810,11 @@ function MatchPage() {
 
           <section className="bc-board bc-heat-board">
             <div className="bc-board-head">
-              <h2>Heatmap</h2>
+              <h2>Pitch map</h2>
               <label className="bc-heat-select">
-                View
+                Player
                 <select value={heatPlayerId} onChange={(e) => setHeatPlayerId(e.target.value)}>
-                  <option value="match">Full match</option>
+                  <option value="match">Whole match</option>
                   {leaderboard.map((p) => (
                     <option key={p.player_id} value={p.player_id}>
                       {p.display_name}
@@ -652,7 +823,7 @@ function MatchPage() {
                 </select>
               </label>
             </div>
-            <HeatmapGrid grid={selectedHeat} label={heatLabel} />
+            <PitchHeatmap grid={selectedHeat} label={heatLabel} />
             {stats?.heatmap?.note && <p className="bc-table-note">{stats.heatmap.note}</p>}
           </section>
 
@@ -834,6 +1005,16 @@ function MatchPage() {
               {players.map((p) => (
                 <li key={p.id} className="inline" style={{ justifyContent: "space-between", gap: "0.75rem" }}>
                   <span>
+                    {p.avatar_url ? (
+                      <button
+                        type="button"
+                        className="bc-avatar-btn"
+                        onClick={() => setPhotoModal({ src: p.avatar_url!, title: p.display_name })}
+                        aria-label={`Open photo of ${p.display_name}`}
+                      >
+                        <img className="player-thumb" src={p.avatar_url} alt="" />
+                      </button>
+                    ) : null}
                     #{p.default_shirt_number ?? "—"} {p.display_name}
                   </span>
                   <form
@@ -897,6 +1078,20 @@ function MatchPage() {
       )}
 
       {message && <p className="bc-toast">{message}</p>}
+      {photoModal && (
+        <PhotoLightbox
+          src={photoModal.src}
+          title={photoModal.title}
+          onClose={() => setPhotoModal(null)}
+        />
+      )}
+      {clipModal && (
+        <ClipLightbox
+          src={clipModal.src}
+          title={clipModal.title}
+          onClose={() => setClipModal(null)}
+        />
+      )}
     </div>
   );
 }
@@ -944,6 +1139,7 @@ function PublicReportPage() {
   const { shareToken = "" } = useParams();
   const [data, setData] = useState<Awaited<ReturnType<typeof api.getPublicReport>> | null>(null);
   const [error, setError] = useState("");
+  const [photoModal, setPhotoModal] = useState<{ src: string; title: string } | null>(null);
 
   useEffect(() => {
     api
@@ -1005,26 +1201,31 @@ function PublicReportPage() {
           </div>
         </div>
         <div className="bc-confidence">
-          <span>Estimated analytics for coaches & players</span>
+          <span>For coaches & players</span>
         </div>
       </section>
 
       <div className="bc-layout">
         <section className="bc-board">
           <div className="bc-board-head">
-            <h2>Player board</h2>
-            <span>POS% · TCH · DIST · G · S · P</span>
+            <h2>Squad board</h2>
+            <span>POS% · Touches · Move · G · S · P</span>
           </div>
           <table className="bc-table">
             <thead>
               <tr>
                 <th>Player</th>
-                <th className="num">POS%</th>
-                <th className="num">TCH</th>
-                <th className="num">DIST</th>
-                <th className="num">G</th>
-                <th className="num">S</th>
-                <th className="num">P</th>
+                <th className="num" title="Possession share">POS%</th>
+                <th className="num" title="Ball touches">Touches</th>
+                <th
+                  className="num"
+                  title="Relative movement in the camera view — not metres. Path length as % of frame diagonal."
+                >
+                  Move
+                </th>
+                <th className="num" title="Goals">G</th>
+                <th className="num" title="Shots">S</th>
+                <th className="num" title="Passes">P</th>
               </tr>
             </thead>
             <tbody>
@@ -1032,7 +1233,21 @@ function PublicReportPage() {
                 <tr key={`${row.display_name}-${idx}`}>
                   <td>
                     <div className="bc-player">
-                      <span className="bc-shirt">{idx + 1}</span>
+                      {row.avatar_url ? (
+                        <button
+                          type="button"
+                          className="bc-avatar-btn"
+                          onClick={() =>
+                            setPhotoModal({ src: row.avatar_url!, title: row.display_name })
+                          }
+                          aria-label={`Open photo of ${row.display_name}`}
+                        >
+                          <img className="bc-avatar" src={row.avatar_url} alt="" />
+                        </button>
+                      ) : (
+                        <span className="bc-avatar-fallback">#{row.shirt_number ?? idx + 1}</span>
+                      )}
+                      <span className="bc-shirt">{row.shirt_number ?? idx + 1}</span>
                       <div>
                         <span className="bc-player-name">{row.display_name}</span>
                         <span className="bc-player-sub">{row.attribution}</span>
@@ -1055,10 +1270,17 @@ function PublicReportPage() {
             <h2>Heatmap</h2>
             <span>Full match</span>
           </div>
-          <HeatmapGrid grid={data.heatmap?.match} label="Match movement heatmap" />
+          <PitchHeatmap grid={data.heatmap?.match} label="Match movement heatmap" />
           {data.heatmap?.note && <p className="bc-table-note">{data.heatmap.note}</p>}
         </section>
       </div>
+      {photoModal && (
+        <PhotoLightbox
+          src={photoModal.src}
+          title={photoModal.title}
+          onClose={() => setPhotoModal(null)}
+        />
+      )}
     </div>
   );
 }

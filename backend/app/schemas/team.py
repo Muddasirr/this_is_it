@@ -31,6 +31,8 @@ class PlayerOut(BaseModel):
     team_id: UUID | None
     display_name: str
     default_shirt_number: int | None
+    avatar_key: str | None = None
+    avatar_url: str | None = None
     is_active: bool
     created_at: datetime
 
