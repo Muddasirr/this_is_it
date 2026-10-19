@@ -74,7 +74,8 @@ services:
       VISION_BACKEND: yolo
       YOLO_MODEL: yolov8n.pt
       VISION_DEVICE: cpu
-      VISION_FRAME_STRIDE: "5"
+      VISION_FRAME_STRIDE: "15"
+      VISION_MAX_FRAMES: "0"
       ALLOW_SINGLE_CAMERA: "true"
     volumes:
       - ./backend:/app

@@ -1,14 +1,20 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_facility_member
 from app.models import FacilityUser, Player, Team
 from app.schemas import PlayerCreate, PlayerOut, TeamCreate, TeamOut
+from app.services.identity import rename_player
 
 router = APIRouter()
+
+
+class PlayerRename(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
 
 
 @router.post("/teams", response_model=TeamOut, status_code=status.HTTP_201_CREATED)
@@ -69,3 +75,17 @@ def list_players(
         .order_by(Player.display_name)
         .all()
     )
+
+
+@router.patch("/players/{player_id}", response_model=PlayerOut)
+def update_player_name(
+    facility_id: UUID,
+    player_id: UUID,
+    payload: PlayerRename,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> Player:
+    player = db.get(Player, player_id)
+    if not player or player.facility_id != facility_id:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return rename_player(db, player_id, payload.display_name)

@@ -1,6 +1,7 @@
 .env
 .venv/
 venv/
+testing_videos
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -19,4 +20,5 @@ coverage/
 .tmp/
 uploads/
 backend/data/
+backend/wheels/
 data/

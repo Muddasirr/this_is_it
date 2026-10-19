@@ -58,6 +58,7 @@ class StatsOut(BaseModel):
     status: str
     totals: dict
     by_player: list[dict]
+    heatmap: dict | None = None
     labels: dict
 
 
@@ -307,56 +308,17 @@ def match_stats(
     db: Session = Depends(get_db),
     _: FacilityUser = Depends(require_facility_member),
 ) -> StatsOut:
+    from app.services.match_stats import build_match_stats
+
     match = _match(db, facility_id, match_id)
-    events = (
-        db.query(MatchEvent)
-        .filter(MatchEvent.match_id == match_id, MatchEvent.is_canonical.is_(True))
-        .all()
-    )
-    totals = {"goal": 0, "shot": 0, "pass": 0, "assist": 0, "confirmed": 0, "estimated": 0, "rejected": 0}
-    by_player: dict[str, dict] = {}
-    for e in events:
-        et = _event_type_value(e.event_type)
-        if et in totals:
-            if e.confirmation != ConfirmationState.rejected:
-                totals[et] += 1
-        totals[e.confirmation.value] = totals.get(e.confirmation.value, 0) + 1
-        parts = db.query(EventParticipant).filter(EventParticipant.event_id == e.id).all()
-        for p in parts:
-            if not p.player_id or e.confirmation == ConfirmationState.rejected:
-                continue
-            pid = str(p.player_id)
-            row = by_player.setdefault(pid, {"player_id": pid, "goal": 0, "shot": 0, "pass": 0})
-            if et in row:
-                row[et] += 1
-                row["_confidence"] = "confirmed" if e.confirmation == ConfirmationState.confirmed else "estimated"
-
-    # attach names
-    player_rows = []
-    for pid, row in by_player.items():
-        player = db.get(Player, UUID(pid))
-        player_rows.append(
-            {
-                "player_id": pid,
-                "display_name": player.display_name if player else "Unknown",
-                "goal": row["goal"],
-                "shot": row["shot"],
-                "pass": row["pass"],
-                "attribution": row.get("_confidence", "estimated"),
-            }
-        )
-
+    built = build_match_stats(db, match_id)
     return StatsOut(
         match_id=match.id,
         status=match.status.value,
-        totals=totals,
-        by_player=player_rows,
-        labels={
-            "estimated": "Model estimate — not staff-confirmed",
-            "confirmed": "Staff-confirmed",
-            "rejected": "Rejected in review",
-            "unavailable": "Metric not available for this match",
-        },
+        totals=built["totals"],
+        by_player=built["by_player"],
+        heatmap=built.get("heatmap"),
+        labels=built["labels"],
     )
 
 
@@ -367,9 +329,21 @@ def publish_match(
     db: Session = Depends(get_db),
     _: FacilityUser = Depends(require_facility_member),
 ) -> dict:
+    from app.api.share import ensure_match_share
+    from app.core.config import get_settings
+
     match = _match(db, facility_id, match_id)
     match.status = MatchStatus.published
     db.commit()
-    return {"match_id": str(match.id), "status": match.status.value}
+    share = ensure_match_share(db, match.id)
+    # Front-end origin for the public report page
+    report_path = f"/report/{share.share_token}"
+    return {
+        "match_id": str(match.id),
+        "status": match.status.value,
+        "share_token": share.share_token,
+        "report_path": report_path,
+        "api_report": f"{get_settings().api_public_url}/api/v1/share/matches/{share.share_token}",
+    }
 
 

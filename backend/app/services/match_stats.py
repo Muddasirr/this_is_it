@@ -1,0 +1,342 @@
+"""Derive richer match / player stats from tracks + canonical events.
+
+Possession and heatmaps are estimated from image-plane tracking (not calibrated
+pitch meters). Always treat as estimated unless staff-confirmed events say otherwise.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from app.models import EventParticipant, MatchEvent, Player, PlayerTrack, TrackIdentityLink
+from app.models.entities import ConfirmationState, EventType
+
+HEAT_W = 32
+HEAT_H = 18
+POSSESSION_RADIUS_FRAC = 0.18
+PERSON_TIME_WINDOW_MS = 2500
+
+
+def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
+    events = (
+        db.query(MatchEvent)
+        .filter(MatchEvent.match_id == match_id, MatchEvent.is_canonical.is_(True))
+        .all()
+    )
+    tracks = db.query(PlayerTrack).filter(PlayerTrack.match_id == match_id).all()
+
+    totals = {
+        "goal": 0,
+        "shot": 0,
+        "pass": 0,
+        "assist": 0,
+        "confirmed": 0,
+        "estimated": 0,
+        "rejected": 0,
+    }
+    by_player: dict[str, dict[str, Any]] = {}
+
+    def row(pid: str) -> dict[str, Any]:
+        return by_player.setdefault(
+            pid,
+            {
+                "player_id": pid,
+                "goal": 0,
+                "shot": 0,
+                "pass": 0,
+                "assist": 0,
+                "possession_pct": 0.0,
+                "touches": 0,
+                "distance": 0.0,
+                "heatmap": _empty_heat(),
+                "attribution": "estimated",
+            },
+        )
+
+    for e in events:
+        et = _event_type_value(e.event_type)
+        if et in totals and e.confirmation != ConfirmationState.rejected:
+            totals[et] += 1
+        totals[e.confirmation.value] = totals.get(e.confirmation.value, 0) + 1
+        parts = db.query(EventParticipant).filter(EventParticipant.event_id == e.id).all()
+        for p in parts:
+            if not p.player_id or e.confirmation == ConfirmationState.rejected:
+                continue
+            if et == "pass" and p.role not in {"passer", "primary"}:
+                continue
+            if et == "shot" and p.role not in {"shooter", "primary"}:
+                continue
+            if et == "goal" and p.role not in {"scorer", "primary"}:
+                continue
+            if et == "assist" and p.role not in {"passer", "assist", "primary"}:
+                continue
+            r = row(str(p.player_id))
+            if et in r:
+                r[et] += 1
+            r["attribution"] = (
+                "confirmed" if e.confirmation == ConfirmationState.confirmed else "estimated"
+            )
+
+    # Track-derived metrics: distance, heatmap, possession, touches
+    track_player = _latest_track_players(db, tracks)
+    persons = [t for t in tracks if (t.features or {}).get("class", "person") == "person"]
+    balls = [t for t in tracks if (t.features or {}).get("class") == "sports_ball"]
+
+    match_heat = _empty_heat()
+    for t in persons:
+        pid = track_player.get(t.id)
+        series = (t.features or {}).get("bbox_series") or []
+        dist = _path_length(series)
+        heat = _series_to_heat(series)
+        _add_heat(match_heat, heat)
+        if pid:
+            r = row(pid)
+            r["distance"] += dist
+            _add_heat(r["heatmap"], heat)
+
+    poss_ms, touches = _possession_and_touches(persons, balls, track_player)
+    # Blend ball-control with on-camera presence so sparse ball tracking
+    # does not give one player ~100% possession.
+    presence_ms: dict[str, int] = defaultdict(int)
+    for t in persons:
+        pid = track_player.get(t.id)
+        if pid:
+            presence_ms[pid] += max(0, t.end_ms - t.start_ms)
+    total_poss = sum(poss_ms.values())
+    total_pres = sum(presence_ms.values()) or 1
+    all_pids = set(by_player) | set(poss_ms) | set(presence_ms)
+    for pid in all_pids:
+        r = row(pid)
+        ball_share = (poss_ms.get(pid, 0) / total_poss) if total_poss else 0.0
+        pres_share = presence_ms.get(pid, 0) / total_pres
+        # Prefer ball when we have decent coverage; otherwise lean on presence
+        coverage = _ball_coverage_pct(balls, persons) / 100.0
+        w_ball = 0.35 + 0.55 * coverage
+        blended = w_ball * ball_share + (1 - w_ball) * pres_share
+        r["possession_pct"] = round(100.0 * blended, 1)
+        r["touches"] = touches.get(pid, 0)
+    # Renormalize possession to ~100%
+    poss_sum = sum(by_player[p]["possession_pct"] for p in by_player) or 1.0
+    for pid in by_player:
+        by_player[pid]["possession_pct"] = round(
+            100.0 * by_player[pid]["possession_pct"] / poss_sum, 1
+        )
+
+    # Normalize heatmaps 0–1 for UI
+    match_heat_n = _normalize_heat(match_heat)
+    player_rows = []
+    for pid, r in by_player.items():
+        player = db.get(Player, UUID(pid))
+        player_rows.append(
+            {
+                "player_id": pid,
+                "display_name": player.display_name if player else "Unknown",
+                "goal": r["goal"],
+                "shot": r["shot"],
+                "pass": r["pass"],
+                "assist": r["assist"],
+                "possession_pct": r["possession_pct"],
+                "touches": r["touches"],
+                "distance": round(r["distance"], 1),
+                "heatmap": _normalize_heat(r["heatmap"]),
+                "attribution": r["attribution"],
+            }
+        )
+
+    player_rows.sort(
+        key=lambda x: (-x["possession_pct"], -(x["pass"] + x["shot"] * 3 + x["goal"] * 10))
+    )
+
+    return {
+        "totals": {
+            **totals,
+            "possession_coverage_pct": _ball_coverage_pct(balls, persons),
+        },
+        "by_player": player_rows,
+        "heatmap": {
+            "width": HEAT_W,
+            "height": HEAT_H,
+            "match": match_heat_n,
+            "unit": "image_plane_bins",
+            "note": "Estimated from camera pixels — not calibrated pitch meters",
+        },
+        "labels": {
+            "estimated": "Model estimate — not staff-confirmed",
+            "confirmed": "Staff-confirmed",
+            "rejected": "Rejected in review",
+            "unavailable": "Metric not available for this match",
+            "possession": "Share of ball-control samples attributed to this player",
+            "distance": "Relative path length in image space (not metres)",
+            "heatmap": "Where the player was detected most often in the camera frame",
+            "touches": "Times the player was nearest to the ball within possession range",
+        },
+    }
+
+
+def _event_type_value(et: EventType) -> str:
+    return "pass" if et == EventType.pass_event else et.value
+
+
+def _empty_heat() -> list[list[float]]:
+    return [[0.0 for _ in range(HEAT_W)] for _ in range(HEAT_H)]
+
+
+def _latest_track_players(db: Session, tracks: list[PlayerTrack]) -> dict[UUID, str]:
+    out: dict[UUID, str] = {}
+    for t in tracks:
+        link = (
+            db.query(TrackIdentityLink)
+            .filter(TrackIdentityLink.track_id == t.id)
+            .order_by(TrackIdentityLink.created_at.desc())
+            .first()
+        )
+        if link and link.player_id:
+            out[t.id] = str(link.player_id)
+    return out
+
+
+def _center(pt: dict[str, Any]) -> tuple[float, float]:
+    return ((pt.get("x1", 0) + pt.get("x2", 0)) / 2, (pt.get("y1", 0) + pt.get("y2", 0)) / 2)
+
+
+def _path_length(series: list[dict[str, Any]]) -> float:
+    if len(series) < 2:
+        return 0.0
+    total = 0.0
+    pts = sorted(series, key=lambda s: s.get("ts_ms", 0))
+    # normalize by frame diagonal so different resolutions are comparable
+    w = float(pts[0].get("frame_w") or 1280)
+    h = float(pts[0].get("frame_h") or 720)
+    diag = (w * w + h * h) ** 0.5 or 1.0
+    for a, b in zip(pts, pts[1:]):
+        ax, ay = _center(a)
+        bx, by = _center(b)
+        total += ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+    return total / diag * 100.0  # “relative distance units”
+
+
+def _series_to_heat(series: list[dict[str, Any]]) -> list[list[float]]:
+    heat = _empty_heat()
+    for pt in series:
+        w = float(pt.get("frame_w") or 1280)
+        h = float(pt.get("frame_h") or 720)
+        cx, cy = _center(pt)
+        x = min(HEAT_W - 1, max(0, int((cx / w) * HEAT_W)))
+        y = min(HEAT_H - 1, max(0, int((cy / h) * HEAT_H)))
+        heat[y][x] += 1.0
+    return heat
+
+
+def _add_heat(dst: list[list[float]], src: list[list[float]]) -> None:
+    for y in range(HEAT_H):
+        for x in range(HEAT_W):
+            dst[y][x] += src[y][x]
+
+
+def _normalize_heat(heat: list[list[float]]) -> list[list[float]]:
+    peak = max((v for row in heat for v in row), default=0.0)
+    if peak <= 0:
+        return heat
+    return [[round(v / peak, 4) for v in row] for row in heat]
+
+
+def _person_at(series: list[dict[str, Any]], ts_ms: int) -> dict[str, Any] | None:
+    if not series:
+        return None
+    best = min(series, key=lambda s: abs(s.get("ts_ms", 0) - ts_ms))
+    if abs(best.get("ts_ms", 0) - ts_ms) > PERSON_TIME_WINDOW_MS:
+        return None
+    return best
+
+
+def _ball_to_player_dist(ball: dict[str, Any], person: dict[str, Any]) -> float:
+    bx, by = _center(ball)
+    x1, y1 = float(person.get("x1", 0)), float(person.get("y1", 0))
+    x2, y2 = float(person.get("x2", 0)), float(person.get("y2", 0))
+    pad_x = 0.15 * max(1.0, x2 - x1)
+    x1, x2 = x1 - pad_x, x2 + pad_x
+    y1 = y1 + 0.45 * (y2 - y1)
+    cx = min(max(bx, x1), x2)
+    cy = min(max(by, y1), y2)
+    return ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
+
+
+def _possession_and_touches(
+    persons: list[PlayerTrack],
+    balls: list[PlayerTrack],
+    track_player: dict[UUID, str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    ball_pts: list[dict[str, Any]] = []
+    for b in balls:
+        for pt in (b.features or {}).get("bbox_series") or []:
+            ball_pts.append(pt)
+    ball_pts.sort(key=lambda p: p.get("ts_ms", 0))
+
+    person_series: dict[UUID, list[dict[str, Any]]] = {}
+    for t in persons:
+        series = (t.features or {}).get("bbox_series") or []
+        if series:
+            person_series[t.id] = sorted(series, key=lambda s: s.get("ts_ms", 0))
+
+    poss_ms: dict[str, int] = defaultdict(int)
+    touches: dict[str, int] = defaultdict(int)
+    last_holder: str | None = None
+
+    if not ball_pts or not person_series:
+        # Fallback: share "presence time" so possession UI is not empty
+        for t in persons:
+            pid = track_player.get(t.id)
+            if not pid:
+                continue
+            span = max(0, t.end_ms - t.start_ms)
+            poss_ms[pid] += span
+        total = sum(poss_ms.values()) or 1
+        # scale to look like percentages later
+        return dict(poss_ms), dict(touches)
+
+    for i, ball in enumerate(ball_pts):
+        ts = int(ball.get("ts_ms", 0))
+        w = float(ball.get("frame_w") or 1280)
+        h = float(ball.get("frame_h") or 720)
+        diag = (w * w + h * h) ** 0.5
+        radius = max(80.0, POSSESSION_RADIUS_FRAC * diag)
+        best_pid = None
+        best_dist = radius
+        best_tid = None
+        for tid, series in person_series.items():
+            sample = _person_at(series, ts)
+            if not sample:
+                continue
+            dist = _ball_to_player_dist(ball, sample)
+            if dist <= best_dist:
+                best_dist = dist
+                best_tid = tid
+                best_pid = track_player.get(tid)
+        if best_pid and best_tid is not None:
+            # duration until next ball sample
+            next_ts = int(ball_pts[i + 1].get("ts_ms", ts)) if i + 1 < len(ball_pts) else ts + 200
+            poss_ms[best_pid] += max(50, next_ts - ts)
+            if best_pid != last_holder:
+                touches[best_pid] += 1
+                last_holder = best_pid
+
+    return dict(poss_ms), dict(touches)
+
+
+def _ball_coverage_pct(balls: list[PlayerTrack], persons: list[PlayerTrack]) -> float:
+    """Rough signal: how often we had ball observations vs person activity window."""
+    if not persons:
+        return 0.0
+    p_start = min(t.start_ms for t in persons)
+    p_end = max(t.end_ms for t in persons)
+    window = max(1, p_end - p_start)
+    ball_pts = 0
+    for b in balls:
+        ball_pts += len((b.features or {}).get("bbox_series") or [])
+    # expect ~1 sample / 500ms if dense; report relative coverage 0-100 capped
+    expected = window / 500
+    return round(min(100.0, 100.0 * ball_pts / max(1.0, expected)), 1)

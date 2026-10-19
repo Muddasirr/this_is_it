@@ -94,6 +94,53 @@ def _finish_run(db: Session, run: ProcessingRun, status: JobStatus, checkpoint: 
     db.commit()
 
 
+def _clear_auto_analysis(db: Session, match_id: UUID) -> None:
+    """Remove prior estimated analysis so reprocessing does not stack duplicates.
+
+    Staff-confirmed events are kept. Tracks and unconfirmed events are replaced.
+    """
+    events = db.query(MatchEvent).filter(MatchEvent.match_id == match_id).all()
+    for event in events:
+        if event.confirmation == ConfirmationState.confirmed:
+            continue
+        db.query(EventParticipant).filter(EventParticipant.event_id == event.id).delete(synchronize_session=False)
+        db.query(EventObservation).filter(EventObservation.event_id == event.id).delete(synchronize_session=False)
+        db.query(HighlightClip).filter(HighlightClip.event_id == event.id).delete(synchronize_session=False)
+        db.delete(event)
+
+    tracks = db.query(PlayerTrack).filter(PlayerTrack.match_id == match_id).all()
+    track_ids = [t.id for t in tracks]
+    if track_ids:
+        db.query(TrackIdentityLink).filter(TrackIdentityLink.track_id.in_(track_ids)).delete(
+            synchronize_session=False
+        )
+        for t in tracks:
+            db.delete(t)
+    db.commit()
+
+
+def _participant_roles(
+    event_type: str, track_keys: list[str], evidence: dict | None
+) -> list[tuple[str, str]]:
+    evidence = evidence or {}
+    if event_type == "pass":
+        passer = evidence.get("passer") or (track_keys[0] if track_keys else None)
+        receiver = evidence.get("receiver") or (track_keys[1] if len(track_keys) > 1 else None)
+        roles: list[tuple[str, str]] = []
+        if passer:
+            roles.append((passer, "passer"))
+        if receiver and receiver != passer:
+            roles.append((receiver, "receiver"))
+        return roles
+    if event_type == "shot":
+        shooter = evidence.get("shooter") or (track_keys[0] if track_keys else None)
+        return [(shooter, "shooter")] if shooter else []
+    if event_type == "goal":
+        scorer = evidence.get("shooter") or (track_keys[0] if track_keys else None)
+        return [(scorer, "scorer")] if scorer else []
+    return [(k, "primary" if i == 0 else "secondary") for i, k in enumerate(track_keys)]
+
+
 def process_job(db: Session, job_id: UUID) -> None:
     job = db.get(ProcessingJob, job_id)
     if not job:
@@ -219,15 +266,19 @@ def process_job(db: Session, job_id: UUID) -> None:
             db.commit()
             _finish_run(db, run, JobStatus.succeeded, {"offset_ms": offset_ms, "confidence": confidence})
 
-            # 4. Detect / track
+            # 4. Detect / track (replace prior auto tracks/events for this match)
             run = _start_run(db, job, JobStage.detect_track, model.id)
             job_service.mark_job_progress(db, job, JobStage.detect_track, 55)
+            _clear_auto_analysis(db, job.match_id)
             all_detections = []
             vision_stats = []
             for label, path in local.items():
                 dets = backend.detect_and_track(str(path), label.value)
                 vision_stats.append(getattr(backend, "last_run_stats", {}))
                 for d in dets:
+                    feats = dict(d.features or {})
+                    feats["class"] = d.class_name
+                    feats["bbox_series"] = d.bbox_series
                     db.add(
                         PlayerTrack(
                             match_id=job.match_id,
@@ -237,7 +288,7 @@ def process_job(db: Session, job_id: UUID) -> None:
                             start_ms=d.start_ms,
                             end_ms=d.end_ms,
                             confidence=d.confidence,
-                            features={"class": d.class_name, "bbox_series": d.bbox_series},
+                            features=feats,
                         )
                     )
                 all_detections.extend(dets)
@@ -311,7 +362,8 @@ def process_job(db: Session, job_id: UUID) -> None:
                             payload=obs.evidence,
                         )
                     )
-                for i, tkey in enumerate(primary.track_keys):
+                roles = _participant_roles(primary.event_type, primary.track_keys, primary.evidence)
+                for tkey, role in roles:
                     track = track_by_key.get(tkey)
                     player_id = None
                     if track:
@@ -328,7 +380,7 @@ def process_job(db: Session, job_id: UUID) -> None:
                             event_id=event.id,
                             player_id=player_id,
                             track_id=track.id if track else None,
-                            role="primary" if i == 0 else "secondary",
+                            role=role,
                             confidence=primary.confidence,
                         )
                     )

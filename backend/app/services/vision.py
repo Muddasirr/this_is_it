@@ -18,6 +18,7 @@ class Detection:
     confidence: float
     bbox_series: list[dict[str, Any]] | None = None
     class_name: str = "person"
+    features: dict[str, Any] | None = None
 
 
 @dataclass

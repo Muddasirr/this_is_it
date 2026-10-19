@@ -22,7 +22,11 @@ Cloud-based, asynchronous, post-match processing. Live analytics deferred.
 
 Player identification
 
-Staff enter a roster and shirt numbers; AI proposes identities, and staff correct mismatches.
+AI auto-detects logical players via tracking + jersey-region appearance clustering and creates proposed roster entries when staff have not pre-registered a squad. When a roster/shirt numbers exist, AI proposes mappings; staff always correct mismatches before publish. See `ARCHITECTURE.md`.
+
+Events and player stats
+
+Passes, shots and goals are inferred from **ball possession changes** (league-style), not from “two people on screen.” Match totals and per-player reports are derived only from canonical events. Labels remain estimated / confirmed / unavailable. Detailed definitions and the top-five-league research baseline live in `ARCHITECTURE.md`.
 
 Quality policy
 
@@ -73,7 +77,7 @@ Generate match dashboard, player reports, and shareable highlight clips.
 | P1 — after pilot | More reliable assists, possession estimates, defensive actions, goalkeeper saves and distribution, calibrated movement maps, historical player comparisons, exports and facility integrations                                                                                                                                                               |
 | Deferred         | Live analysis, automatic tactical coaching, 3D reconstruction, guaranteed cross-camera re-identification, 11-a-side football, mobile apps and advanced automated highlight editing                                                                                                                                                                          |
 
-Important scope constraint: “Passes” in P0 means a limited, evaluated pass-event capability. Do not promise complete pass networks or precise possession statistics until footage tests establish that the models can deliver them consistently.
+Important scope constraint: “Passes” in P0 means possession-change candidates suitable for review — not Opta-complete pass networks. Do not promise precise possession percentages or progressive-pass taxonomies until footage tests establish consistent precision/recall. Always surface **player-wise** estimated stats from attributed events so staff can correct identity and counts.
 
 ## 3. Final architecture decisions
 
@@ -536,7 +540,7 @@ Resolution: benchmark two full camera feeds on the intended pipeline. Record act
 - Footage permission: facility ownership does not automatically resolve every privacy or player-consent obligation. Confirm applicable requirements, permitted use, retention and deletion before launch.
 - Existing-camera export: verify the facility can export usable recordings in a supported format without manual work that becomes a bottleneck.
 - Operational review: estimate the human time required to correct identities and event labels. If each match needs extensive manual work, the economics may not support the proposed service.
-- Statistics definitions: document exactly what counts as a pass, shot, goal and assist. Define how disputed or invisible events are handled.
+- Statistics definitions: locked for MVP in `ARCHITECTURE.md` §4 (pass / shot / goal / player-wise attribution). Disputed or invisible events stay `estimated` or `unavailable` until staff confirm or reject.
 
 ## 10. Final recommendation
 

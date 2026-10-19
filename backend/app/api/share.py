@@ -1,8 +1,12 @@
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import HighlightClip, VideoAsset
+from app.models import Facility, HighlightClip, Match, MatchShare, VideoAsset
+from app.models.entities import MatchStatus
+from app.services.match_stats import build_match_stats
 from app.services.storage import presign_download
 
 router = APIRouter()
@@ -22,3 +26,55 @@ def shared_clip(share_token: str, db: Session = Depends(get_db)) -> dict:
         "end_ms": clip.end_ms,
         "playback_url": presign_download(asset.object_key),
     }
+
+
+@router.get("/matches/{share_token}")
+def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict:
+    share = db.query(MatchShare).filter(MatchShare.share_token == share_token).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Report not found")
+    match = db.get(Match, share.match_id)
+    if not match or match.status == MatchStatus.deleted:
+        raise HTTPException(status_code=404, detail="Match not found")
+    facility = db.get(Facility, match.facility_id)
+    stats = build_match_stats(db, match.id)
+    # Public report: drop bulky per-player heatmaps, keep match heatmap + summary
+    players = []
+    for row in stats["by_player"]:
+        players.append(
+            {
+                "display_name": row["display_name"],
+                "goal": row["goal"],
+                "shot": row["shot"],
+                "pass": row["pass"],
+                "possession_pct": row.get("possession_pct", 0),
+                "touches": row.get("touches", 0),
+                "distance": row.get("distance", 0),
+                "attribution": row.get("attribution", "estimated"),
+            }
+        )
+    return {
+        "title": match.title,
+        "facility_name": facility.name if facility else "Court",
+        "status": match.status.value,
+        "totals": stats["totals"],
+        "by_player": players,
+        "heatmap": {
+            "width": stats["heatmap"]["width"],
+            "height": stats["heatmap"]["height"],
+            "match": stats["heatmap"]["match"],
+            "note": stats["heatmap"].get("note"),
+        },
+        "labels": stats["labels"],
+    }
+
+
+def ensure_match_share(db: Session, match_id) -> MatchShare:
+    existing = db.query(MatchShare).filter(MatchShare.match_id == match_id).first()
+    if existing:
+        return existing
+    share = MatchShare(match_id=match_id, share_token=secrets.token_urlsafe(16))
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+    return share

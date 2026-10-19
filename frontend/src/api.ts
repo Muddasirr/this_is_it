@@ -79,8 +79,20 @@ export type MatchStats = {
     goal: number;
     shot: number;
     pass: number;
+    assist?: number;
+    possession_pct?: number;
+    touches?: number;
+    distance?: number;
+    heatmap?: number[][];
     attribution: string;
   }[];
+  heatmap?: {
+    width: number;
+    height: number;
+    match: number[][];
+    unit?: string;
+    note?: string;
+  };
   labels: Record<string, string>;
 };
 
@@ -203,7 +215,37 @@ export const api = {
   getStats: (facilityId: string, matchId: string) =>
     request<MatchStats>(`/api/v1/facilities/${facilityId}/matches/${matchId}/stats`),
   publishMatch: (facilityId: string, matchId: string) =>
-    request(`/api/v1/facilities/${facilityId}/matches/${matchId}/publish`, { method: "POST" }),
+    request<{
+      match_id: string;
+      status: string;
+      share_token?: string;
+      report_path?: string;
+      api_report?: string;
+    }>(`/api/v1/facilities/${facilityId}/matches/${matchId}/publish`, { method: "POST" }),
+  renamePlayer: (facilityId: string, playerId: string, display_name: string) =>
+    request<Player>(`/api/v1/facilities/${facilityId}/players/${playerId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ display_name }),
+    }),
+  getPublicReport: (shareToken: string) =>
+    request<{
+      title: string;
+      facility_name: string;
+      status: string;
+      totals: Record<string, number>;
+      by_player: {
+        display_name: string;
+        goal: number;
+        shot: number;
+        pass: number;
+        possession_pct: number;
+        touches: number;
+        distance: number;
+        attribution: string;
+      }[];
+      heatmap: { width: number; height: number; match: number[][]; note?: string };
+      labels: Record<string, string>;
+    }>(`/api/v1/share/matches/${shareToken}`),
   runFeasibility: async (file: File) => {
     const body = new FormData();
     body.append("file", file);

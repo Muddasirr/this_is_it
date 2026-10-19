@@ -16,10 +16,14 @@ logger = logging.getLogger(__name__)
 PERSON = 0
 SPORTS_BALL = 32
 
+# Keep dense enough series for possession events without huge JSON rows
+MAX_PERSON_SERIES = 400
+MAX_BALL_SERIES = 2000
+
 
 class YoloTrackBackend(VisionBackend):
     name = "yolov8n-bytetrack"
-    version = "0.1.0"
+    version = "0.3.0"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -43,6 +47,7 @@ class YoloTrackBackend(VisionBackend):
 
     def detect_and_track(self, video_path: str, camera_label: str) -> list[Detection]:
         import cv2
+        import numpy as np
 
         model = self._load()
         cap = cv2.VideoCapture(video_path)
@@ -52,12 +57,15 @@ class YoloTrackBackend(VisionBackend):
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        # track_id -> accumulated observations
         person_tracks: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        color_sums: dict[int, Any] = {}
+        color_counts: dict[int, int] = defaultdict(int)
+        jersey_votes: dict[int, list[tuple[int, float]]] = defaultdict(list)
         ball_hits = 0
         frames_processed = 0
         t0 = time.perf_counter()
         frame_idx = 0
+        ocr_every = max(4, 12 // max(1, self.frame_stride))  # ~sparse OCR for CPU
 
         try:
             while True:
@@ -115,6 +123,20 @@ class YoloTrackBackend(VisionBackend):
                         person_tracks[tid + 100000].append(obs)
                     elif cls_id == PERSON:
                         person_tracks[tid].append(obs)
+                        hist = _upper_body_hsv_hist(frame, xyxy)
+                        if hist is not None:
+                            if tid not in color_sums:
+                                color_sums[tid] = hist
+                            else:
+                                color_sums[tid] = color_sums[tid] + hist
+                            color_counts[tid] += 1
+                        # Occasional jersey OCR when box is large enough
+                        if frames_processed % ocr_every == 0 and (xyxy[2] - xyxy[0]) >= 36:
+                            from app.services.jersey_ocr import read_jersey_number
+
+                            hit = read_jersey_number(frame, xyxy)
+                            if hit:
+                                jersey_votes[tid].append((int(hit["number"]), float(hit["confidence"])))
                 frame_idx += 1
         finally:
             cap.release()
@@ -127,8 +149,23 @@ class YoloTrackBackend(VisionBackend):
             class_name = obs[0].get("class_name", "person")
             prefix = "b" if class_name == "sports_ball" else "p"
             key_id = tid - 100000 if class_name == "sports_ball" else tid
-            # keep a sparse bbox series (first, mid, last) to avoid huge rows
-            series = [obs[0], obs[len(obs) // 2], obs[-1]] if len(obs) >= 3 else obs
+            series_obs = _downsample_series(
+                obs, MAX_BALL_SERIES if class_name == "sports_ball" else MAX_PERSON_SERIES
+            )
+            feats: dict[str, Any] = {"class": class_name}
+            if class_name == "person" and tid in color_sums and color_counts[tid]:
+                mean_hist = (color_sums[tid] / max(1, color_counts[tid])).astype(float)
+                # L2 normalize for cosine similarity later
+                norm = float(np.linalg.norm(mean_hist)) or 1.0
+                feats["color_hist"] = (mean_hist / norm).tolist()
+                feats["color_samples"] = color_counts[tid]
+            if class_name == "person" and jersey_votes.get(tid):
+                number, jconf = _majority_jersey(jersey_votes[tid])
+                if number is not None:
+                    feats["jersey_number"] = number
+                    feats["jersey_confidence"] = jconf
+                    feats["jersey_votes"] = len(jersey_votes[tid])
+
             detections.append(
                 Detection(
                     track_key=f"{camera_label}-{prefix}{key_id}",
@@ -144,9 +181,10 @@ class YoloTrackBackend(VisionBackend):
                             "frame_h": o.get("frame_h"),
                             "frame_w": o.get("frame_w"),
                         }
-                        for o in series
+                        for o in series_obs
                     ],
                     class_name=class_name,
+                    features=feats,
                 )
             )
 
@@ -162,11 +200,14 @@ class YoloTrackBackend(VisionBackend):
             "elapsed_sec": round(elapsed, 3),
             "processing_fps": round(frames_processed / elapsed, 3) if elapsed else 0,
             "realtime_factor": round(video_seconds / elapsed, 3) if elapsed and video_seconds else None,
-            "person_tracks": len(detections),
+            "person_tracks": sum(1 for d in detections if d.class_name == "person"),
+            "ball_tracks": sum(1 for d in detections if d.class_name == "sports_ball"),
             "ball_detections": ball_hits,
             "ball_visible": ball_hits > 0,
-            "player_visible": len(detections) > 0,
+            "player_visible": any(d.class_name == "person" for d in detections),
             "video_seconds_probed": round(video_seconds, 2),
+            "event_engine": "possession_v1",
+            "jersey_ocr_tracks": sum(1 for d in detections if (d.features or {}).get("jersey_number")),
         }
         logger.info("YOLO track done: %s", self.last_run_stats)
         return detections
@@ -175,6 +216,48 @@ class YoloTrackBackend(VisionBackend):
         from app.services.events import infer_event_candidates
 
         return infer_event_candidates(detections, camera_label)
+
+
+def _majority_jersey(votes: list[tuple[int, float]]) -> tuple[int | None, float]:
+    if not votes:
+        return None, 0.0
+    scores: dict[int, float] = defaultdict(float)
+    counts: dict[int, int] = defaultdict(int)
+    for num, conf in votes:
+        scores[num] += conf
+        counts[num] += 1
+    best = max(scores.keys(), key=lambda n: (scores[n], counts[n]))
+    return best, round(scores[best] / max(1, counts[best]), 3)
+
+
+def _downsample_series(obs: list[dict[str, Any]], max_n: int) -> list[dict[str, Any]]:
+    if len(obs) <= max_n:
+        return obs
+    step = max(1, len(obs) // max_n)
+    sampled = obs[::step]
+    if sampled[-1] is not obs[-1]:
+        sampled = sampled + [obs[-1]]
+    return sampled[:max_n]
+
+
+def _upper_body_hsv_hist(frame, xyxy: list[float]):
+    import cv2
+    import numpy as np
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in xyxy]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+    if x2 <= x1 + 2 or y2 <= y1 + 2:
+        return None
+    # jersey-ish upper half of the person box
+    y_mid = y1 + max(1, (y2 - y1) // 2)
+    crop = frame[y1:y_mid, x1:x2]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
+    return hist.flatten().astype(np.float32)
 
 
 def run_feasibility_on_video(video_path: str, camera_label: str = "A") -> dict[str, Any]:
