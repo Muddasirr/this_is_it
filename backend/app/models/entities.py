@@ -78,6 +78,7 @@ class VideoKind(str, enum.Enum):
 class CameraLabel(str, enum.Enum):
     A = "A"
     B = "B"
+    C = "C"  # 2–3 cam ready; v1 may use A only
 
 
 class EventType(str, enum.Enum):

@@ -34,8 +34,9 @@ def attach_player_avatars(db: Session, match: Match, tracks: list[PlayerTrack]) 
         if link.player_id:
             player_of[link.track_id] = link.player_id
 
-    # Best thumb per player: prefer larger area * confidence from features
-    best: dict[UUID, tuple[float, Path]] = {}
+    # Best thumb per player. Never reuse the same source image for two players
+    # (that made MANAV #23 appear as both Kit A #2 and Kit B #2).
+    candidates: list[tuple[float, UUID, Path]] = []
     for track in tracks:
         pid = player_of.get(track.id)
         if not pid:
@@ -47,15 +48,37 @@ def attach_player_avatars(db: Session, match: Match, tracks: list[PlayerTrack]) 
         path = Path(path_str)
         if not path.is_file():
             continue
-        score = float(feats.get("thumb_score") or track.confidence or 0.5) * max(
-            1.0, (track.end_ms - track.start_ms) / 1000.0
+        # Skip remapped offline kit*.jpg stamps shared across many tracks
+        if "thumbs/kit" in path_str.replace("\\", "/").lower() and path_str.count("kit") >= 1:
+            name = path.name.lower()
+            if name.startswith("kita_") or name.startswith("kitb_") or name.startswith("kit"):
+                # Still allow, but down-rank heavily so unique track crops win
+                score_scale = 0.05
+            else:
+                score_scale = 1.0
+        else:
+            score_scale = 1.0
+        score = (
+            float(feats.get("thumb_score") or track.confidence or 0.5)
+            * max(1.0, (track.end_ms - track.start_ms) / 1000.0)
+            * score_scale
         )
-        prev = best.get(pid)
-        if prev is None or score > prev[0]:
-            best[pid] = (score, path)
+        candidates.append((score, pid, path))
+
+    candidates.sort(key=lambda x: -x[0])
+    best: dict[UUID, Path] = {}
+    used_paths: set[str] = set()
+    for score, pid, path in candidates:
+        if pid in best:
+            continue
+        resolved = str(path.resolve()) if path.exists() else str(path)
+        if resolved in used_paths:
+            continue
+        best[pid] = path
+        used_paths.add(resolved)
 
     updated = 0
-    for pid, (_score, path) in best.items():
+    for pid, path in best.items():
         player = db.get(Player, pid)
         if not player:
             continue

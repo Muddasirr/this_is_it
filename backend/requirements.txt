@@ -28,3 +28,4 @@ ultralytics-thop>=2.2.2
 ultralytics-platform>=0.1.45
 lap>=0.5.12
 pytesseract>=0.3.10
+torchreid>=0.2.5

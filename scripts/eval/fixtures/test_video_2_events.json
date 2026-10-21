@@ -1,0 +1,10 @@
+{
+  "video": "testing_videos/test_video_2.mp4",
+  "notes": "Seed GT for Phase 4. Expand by watching the match: add clear goals/shots/passes with approx ts_ms. Empty lists mean score_events reports n/a until filled.",
+  "tolerance_ms": 3000,
+  "events": [
+    {"ts_ms": 120000, "type": "shot", "note": "placeholder — replace after manual review"},
+    {"ts_ms": 300000, "type": "pass", "note": "placeholder"},
+    {"ts_ms": 450000, "type": "shot", "note": "placeholder"}
+  ]
+}

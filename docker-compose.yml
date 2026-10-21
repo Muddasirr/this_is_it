@@ -5,8 +5,9 @@ services:
       POSTGRES_USER: futsal
       POSTGRES_PASSWORD: futsal
       POSTGRES_DB: futsal
-    ports:
-      - "5433:5432"
+    # Host 5434 may already be bound — DB stays on the compose network.
+    # ports:
+    #   - "5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,8 +18,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    # Host 6379 often already taken by a local Redis — keep Redis internal-only.
+    # ports:
+    #   - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -39,20 +41,23 @@ services:
       REDIS_URL: redis://redis:6379/0
       STORAGE_BACKEND: local
       LOCAL_STORAGE_PATH: /data/videos
-      API_PUBLIC_URL: http://localhost:8000
+      API_PUBLIC_URL: http://localhost:8001
       JWT_SECRET: dev-change-me
-      CORS_ORIGINS: http://localhost:5173
+      CORS_ORIGINS: http://localhost:5173,http://localhost:5174
       VISION_BACKEND: yolo
       YOLO_MODEL: yolov8n.pt
       VISION_DEVICE: cpu
       VISION_FRAME_STRIDE: "5"
+      COURT_FORMAT: "5v5"
       ALLOW_SINGLE_CAMERA: "true"
     ports:
-      - "8000:8000"
+      - "8001:8000"
     volumes:
       - ./backend:/app
       - video_data:/data/videos
       - yolo_weights:/root/.cache/torch
+      - ./yolov8n.pt:/app/yolov8n.pt:ro
+      - ./yolov8n_futsal.pt:/app/yolov8n_futsal.pt:ro
     depends_on:
       db:
         condition: service_healthy
@@ -69,18 +74,22 @@ services:
       REDIS_URL: redis://redis:6379/0
       STORAGE_BACKEND: local
       LOCAL_STORAGE_PATH: /data/videos
-      API_PUBLIC_URL: http://localhost:8000
+      API_PUBLIC_URL: http://localhost:8001
       JWT_SECRET: dev-change-me
       VISION_BACKEND: yolo
       YOLO_MODEL: yolov8n.pt
       VISION_DEVICE: cpu
-      VISION_FRAME_STRIDE: "15"
+      VISION_FRAME_STRIDE: "5"
       VISION_MAX_FRAMES: "0"
+      VISION_JERSEY_OCR: "1"
+      COURT_FORMAT: "5v5"
       ALLOW_SINGLE_CAMERA: "true"
     volumes:
       - ./backend:/app
       - video_data:/data/videos
       - yolo_weights:/root/.cache/torch
+      - ./yolov8n.pt:/app/yolov8n.pt:ro
+      - ./yolov8n_futsal.pt:/app/yolov8n_futsal.pt:ro
     depends_on:
       db:
         condition: service_healthy
@@ -92,9 +101,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
-      VITE_API_URL: http://localhost:8000
+      VITE_API_URL: http://localhost:8001
     ports:
-      - "5173:5173"
+      - "5174:5173"
     volumes:
       - ./frontend:/app
       - /app/node_modules

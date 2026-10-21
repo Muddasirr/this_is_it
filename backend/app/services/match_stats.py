@@ -99,6 +99,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             _add_heat(r["heatmap"], heat)
 
     poss_ms, touches = _possession_and_touches(persons, balls, track_player)
+    event_touches = _event_touch_counts(db, events)
     # Blend ball-control with on-camera presence so sparse ball tracking
     # does not give one player ~100% possession.
     presence_ms: dict[str, int] = defaultdict(int)
@@ -118,7 +119,8 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         w_ball = 0.35 + 0.55 * coverage
         blended = w_ball * ball_share + (1 - w_ball) * pres_share
         r["possession_pct"] = round(100.0 * blended, 1)
-        r["touches"] = touches.get(pid, 0)
+        ball_t = int(touches.get(pid, 0))
+        r["touches"] = ball_t if ball_t > 0 else int(event_touches.get(pid, 0))
     # Renormalize possession to ~100%
     poss_sum = sum(by_player[p]["possession_pct"] for p in by_player) or 1.0
     for pid in by_player:
@@ -177,7 +179,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             "possession": "Share of ball-control samples attributed to this player",
             "distance": "Relative path length in image space (not metres)",
             "heatmap": "Where the player was detected most often in the camera frame",
-            "touches": "Times the player was nearest to the ball within possession range",
+            "touches": "Ball-holder changes when ball is tracked; else pass/shot involvement count",
         },
     }
 
@@ -268,6 +270,29 @@ def _ball_to_player_dist(ball: dict[str, Any], person: dict[str, Any]) -> float:
     cx = min(max(bx, x1), x2)
     cy = min(max(by, y1), y2)
     return ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
+
+
+def _event_touch_counts(db: Session, events: list[MatchEvent]) -> dict[str, int]:
+    """When ball timeline is empty, count primary pass/shot/goal roles as touches."""
+    counts: dict[str, int] = defaultdict(int)
+    for e in events:
+        if e.confirmation == ConfirmationState.rejected:
+            continue
+        et = _event_type_value(e.event_type)
+        if et not in {"pass", "shot", "goal"}:
+            continue
+        parts = db.query(EventParticipant).filter(EventParticipant.event_id == e.id).all()
+        for p in parts:
+            if not p.player_id:
+                continue
+            if et == "pass" and p.role not in {"passer", "primary"}:
+                continue
+            if et == "shot" and p.role not in {"shooter", "primary"}:
+                continue
+            if et == "goal" and p.role not in {"scorer", "primary"}:
+                continue
+            counts[str(p.player_id)] += 1
+    return dict(counts)
 
 
 def _possession_and_touches(

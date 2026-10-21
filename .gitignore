@@ -1,7 +1,6 @@
 .env
 .venv/
 venv/
-testing_videos
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -22,3 +21,38 @@ uploads/
 backend/data/
 backend/wheels/
 data/
+
+# Local test clips (keep README if present)
+/testing_videos/*
+!/testing_videos/README.md
+
+# Video / media binaries
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
+
+# Python wheels (Kaggle offline deps, local caches)
+*.whl
+scripts/kaggle/offline_wheels/
+
+# Large papers / binary docs
+*.pdf
+
+# Keep eval GT / reports structure trackable
+!data/eval/
+!data/eval/gt/
+!data/eval/gt/**
+!data/eval/fixture_detection/
+!data/eval/fixture_detection/**
+!data/eval/roboflow_futsal/
+!data/eval/roboflow_futsal/DOWNLOAD_INSTRUCTIONS.txt

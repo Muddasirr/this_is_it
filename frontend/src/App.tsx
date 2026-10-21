@@ -124,8 +124,8 @@ function FacilitiesPage() {
         </div>
         <div className="inline">
           <Link to="/phase0">Phase 0 feasibility</Link>
-          <button
-            type="button"
+        <button
+          type="button"
             className="ghost"
             onClick={() => {
               localStorage.removeItem("token");
@@ -261,7 +261,7 @@ function FacilityHome() {
               </Link>
             </li>
           ))}
-        </ul>
+          </ul>
       </section>
     </div>
   );
@@ -912,7 +912,7 @@ function MatchPage() {
                   <li key={v.id}>
                     {v.kind} · {v.validation_status}
                     {v.width ? ` · ${v.width}×${v.height}` : ""}
-                  </li>
+            </li>
                 ))}
               </ul>
             </div>
@@ -989,7 +989,7 @@ function MatchPage() {
                 <li key={j.id}>
                   {j.status} {j.stage ? `· ${j.stage}` : ""} · {j.progress_pct}%
                   {j.error_message ? ` · ${j.error_message}` : ""}
-                </li>
+            </li>
               ))}
             </ul>
           </section>
@@ -1035,7 +1035,7 @@ function MatchPage() {
                       Save
                     </button>
                   </form>
-                </li>
+            </li>
               ))}
             </ul>
           </section>
@@ -1069,9 +1069,9 @@ function MatchPage() {
                         </option>
                       ))}
                     </select>
-                  </li>
+            </li>
                 ))}
-            </ul>
+          </ul>
             {!tracks.length && <p className="bc-empty">No tracks yet — process a match first.</p>}
           </section>
         </>
@@ -1140,6 +1140,7 @@ function PublicReportPage() {
   const [data, setData] = useState<Awaited<ReturnType<typeof api.getPublicReport>> | null>(null);
   const [error, setError] = useState("");
   const [photoModal, setPhotoModal] = useState<{ src: string; title: string } | null>(null);
+  const [heatPlayerId, setHeatPlayerId] = useState("match");
 
   useEffect(() => {
     api
@@ -1168,6 +1169,14 @@ function PublicReportPage() {
   const board = [...data.by_player].sort(
     (a, b) => (b.possession_pct ?? 0) + b.pass - ((a.possession_pct ?? 0) + a.pass),
   );
+  const selectedHeat =
+    heatPlayerId === "match"
+      ? data.heatmap?.match
+      : board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.heatmap;
+  const heatLabel =
+    heatPlayerId === "match"
+      ? "Match movement heatmap"
+      : `${board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.display_name || "Player"} movement`;
 
   return (
     <div className="page broadcast">
@@ -1265,12 +1274,22 @@ function PublicReportPage() {
             </tbody>
           </table>
         </section>
-        <section className="bc-board">
+        <section className="bc-board bc-heat-board">
           <div className="bc-board-head">
             <h2>Heatmap</h2>
-            <span>Full match</span>
+            <label className="bc-heat-select">
+              Player
+              <select value={heatPlayerId} onChange={(e) => setHeatPlayerId(e.target.value)}>
+                <option value="match">Whole match</option>
+                {board.map((p, idx) => (
+                  <option key={p.player_id || `${p.display_name}-${idx}`} value={p.player_id || p.display_name}>
+                    {p.display_name}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-          <PitchHeatmap grid={data.heatmap?.match} label="Match movement heatmap" />
+          <PitchHeatmap grid={selectedHeat} label={heatLabel} />
           {data.heatmap?.note && <p className="bc-table-note">{data.heatmap.note}</p>}
         </section>
       </div>

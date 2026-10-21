@@ -1,29 +1,54 @@
-"""Possession-centric event inference (league-style, image-plane).
+"""Possession-centric event inference (image-plane CCTV).
 
-Adapted from optical-tracking event literature (possession zones → gains/losses
-→ classify as pass/shot/goal). Operates on YOLO/ByteTrack image coordinates —
-not calibrated pitch meters. See ARCHITECTURE.md.
+Aligned with Vidal-Codina et al. 2022 (arXiv:2202.00804):
+  1) Assign ball possession per sample (possession zone).
+  2) Events from possession changes + ball kinematics — not raw motion bursts.
+
+Pass  = sustained holder A → flight → sustained holder B ≠ A (not a shot).
+Shot  = sustained holder releases ball goalward at high speed with no receiver
+        gaining possession in the flight window (paper: shot precedes goal/save/
+        dead-ball; we approximate without GK tracks).
+Goal  = after a shot, ball lingers in the extreme goal band (strict; review gate).
+
+Supplements that flooded v16 stats (sparse_ball_strike, kick_motion, proximity
+handoffs) are disabled when ball coverage is usable.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from app.services.possession import (
+    MIN_POSSESSION_MS,
+    build_possession_timeline,
+    frame_diag,
+    merge_ball_series,
+)
 from app.services.vision import Detection, EventCandidate
 
-# Relative to frame diagonal — generous for wide CCTV / YOLO foot-ball offset
-POSSESSION_RADIUS_FRAC = 0.18
-MIN_POSSESSION_SAMPLES = 2
-MAX_FLIGHT_MS = 5000
-MIN_FLIGHT_MS = 80
-SHOT_SPEED_FRAC_PER_MS = 0.00008  # sparse ball samples undershoot true speed
-SHOT_SPEED_SOFT_FRAC_PER_MS = 0.000035
-SHOT_MIN_DISP_FRAC = 0.07  # min diagonal travel to count as a strike
-GOAL_BAND_FRAC = 0.16
-PASS_DEDUP_MS = 1200
-MAX_PASSES = 400
-MAX_SHOTS = 200
-PERSON_TIME_WINDOW_MS = 2500
+MAX_FLIGHT_MS = 3200
+# Sparse ball (highlights / occlusions): allow longer A→B gaps so we don't
+# zero-out every pass when the ball drops offline between touches.
+MAX_FLIGHT_SPARSE_MS = 25000  # highlights often have 5–20s ball dropouts between touches
+MIN_FLIGHT_MS = 0  # adjacent handoff (flight==0) is a completed short pass
+# ISVP.AI futsal shot detector (icSPORTS 2023): high acceleration + near player
+# + goalward factor + no direction change. Tuned for wide CCTV (frac of diag).
+SHOT_SPEED_FRAC_PER_MS = 0.00012
+SHOT_MIN_DISP_FRAC = 0.08
+SHOT_ACCEL_FRAC_PER_MS2 = 0.00000018
+SHOT_KIN_WINDOW_MS = 1800  # evaluate strike over fixed window (not clipped to next touch)
+GOAL_BAND_FRAC = 0.10
+GOAL_LINGER_SAMPLES = 4
+# Quick takeover ⇒ pass/block unless ball already entered goal band (ISVP on-target)
+SHOT_MAX_RECEIVER_MS = 850
+PASS_DEDUP_MS = 1800
+SHOT_DEDUP_MS = 3500
+GOAL_DEDUP_MS = 10000
+MAX_PASSES = 120
+MAX_SHOTS = 18
+MAX_GOALS = 8
+# Need this many ball samples before trusting possession events alone
+MIN_BALL_FOR_STRICT = 80
 
 
 def infer_event_candidates(
@@ -32,231 +57,52 @@ def infer_event_candidates(
 ) -> list[EventCandidate]:
     persons = [d for d in detections if d.class_name == "person"]
     balls = [d for d in detections if d.class_name == "sports_ball"]
-
-    ball_series = _merge_ball_series(balls)
+    ball_series = merge_ball_series(balls)
     if not persons:
         return []
 
-    if len(ball_series) < 3:
-        cands = _fallback_without_ball(persons, camera_label)
-        cands.extend(_kick_motion_shots(persons, camera_label))
-        return _dedupe(cands)
+    # Without enough ball, do NOT invent shot/pass floods — return empty estimated set
+    if len(ball_series) < MIN_BALL_FOR_STRICT:
+        return []
 
-    person_index = _build_person_index(persons)
-    diag = _frame_diag(ball_series[0])
-    radius = max(80.0, POSSESSION_RADIUS_FRAC * diag)
+    poss = build_possession_timeline(detections)
+    segments = [
+        (s["holder"], int(s["start_ms"]), int(s["end_ms"])) for s in (poss.get("segments") or [])
+    ]
+    diag = float(poss.get("diag") or frame_diag(ball_series[0]))
 
-    holders = _possession_timeline(ball_series, person_index, radius)
-    holders = _smooth_holders(holders, min_run=MIN_POSSESSION_SAMPLES)
-
+    flight_limit = _pass_flight_limit_ms(ball_series)
+    # Shots first, then passes — a release that finds a teammate is a pass, not a shot.
+    shots = _shots_from_segments(
+        segments, ball_series, camera_label, diag, receiver_window_ms=flight_limit
+    )
+    passes = _passes_from_segments(segments, ball_series, camera_label, diag, flight_limit)
+    shot_ts = {s.camera_ts_ms for s in shots}
+    # Drop pass that double-counts the same release already labeled a shot
+    passes = [p for p in passes if p.camera_ts_ms not in shot_ts]
     candidates: list[EventCandidate] = []
-    candidates.extend(_passes_from_holders(holders, ball_series, camera_label, diag))
-    candidates.extend(_shots_and_goals(holders, ball_series, camera_label, diag))
-    candidates.extend(_sparse_ball_shots(ball_series, person_index, camera_label, diag))
-    candidates.extend(_kick_motion_shots(persons, camera_label))
-
-    # Sparse ball tracks (common on facility CCTV): supplement with proximity handoffs
-    passes = [c for c in candidates if c.event_type == "pass"]
-    if len(passes) < 15:
-        candidates.extend(_fallback_without_ball(persons, camera_label))
+    candidates.extend(passes)
+    candidates.extend(shots)
+    candidates.extend(_goals_after_shots(shots, ball_series, camera_label))
     return _dedupe(candidates)
 
 
-def _merge_ball_series(balls: list[Detection]) -> list[dict[str, Any]]:
-    points: list[dict[str, Any]] = []
-    for b in balls:
-        for pt in b.bbox_series or []:
-            points.append({**pt, "track_key": b.track_key})
-    points.sort(key=lambda p: p.get("ts_ms", 0))
-    # collapse same timestamp
-    out: list[dict[str, Any]] = []
-    for pt in points:
-        if out and out[-1].get("ts_ms") == pt.get("ts_ms"):
-            if pt.get("confidence", 0) > out[-1].get("confidence", 0):
-                out[-1] = pt
-            continue
-        out.append(pt)
-    return out
-
-
-def _build_person_index(persons: list[Detection]) -> dict[str, list[dict[str, Any]]]:
-    index: dict[str, list[dict[str, Any]]] = {}
-    for p in persons:
-        series = sorted(p.bbox_series or [], key=lambda s: s.get("ts_ms", 0))
-        if series:
-            index[p.track_key] = series
-    return index
-
-
-def _frame_diag(pt: dict[str, Any]) -> float:
-    w = float(pt.get("frame_w") or 1280)
-    h = float(pt.get("frame_h") or 720)
-    return (w * w + h * h) ** 0.5
+def _pass_flight_limit_ms(ball_series: list[dict[str, Any]]) -> int:
+    """Widen pass flight window when ball tracking is sparse (highlights/CCTV gaps)."""
+    if len(ball_series) < 2:
+        return MAX_FLIGHT_MS
+    t0 = min(int(p.get("ts_ms", 0)) for p in ball_series)
+    t1 = max(int(p.get("ts_ms", 0)) for p in ball_series)
+    span_s = max(1.0, (t1 - t0) / 1000.0)
+    density = len(ball_series) / span_s  # samples / second
+    # Facility denser ball ≈ 3–8/s; highlights often < 2/s
+    if density < 2.0:
+        return MAX_FLIGHT_SPARSE_MS
+    return MAX_FLIGHT_MS
 
 
 def _center(pt: dict[str, Any]) -> tuple[float, float]:
     return ((pt.get("x1", 0) + pt.get("x2", 0)) / 2, (pt.get("y1", 0) + pt.get("y2", 0)) / 2)
-
-
-def _person_at(series: list[dict[str, Any]], ts_ms: int) -> dict[str, Any] | None:
-    if not series:
-        return None
-    best = min(series, key=lambda s: abs(s.get("ts_ms", 0) - ts_ms))
-    if abs(best.get("ts_ms", 0) - ts_ms) > PERSON_TIME_WINDOW_MS:
-        return None
-    return best
-
-
-def _ball_to_player_dist(ball: dict[str, Any], person: dict[str, Any]) -> float:
-    """Distance from ball center to player foot/body (expanded bbox), not torso center.
-
-    League systems use calibrated XY; we approximate contact with the lower body.
-    """
-    bx, by = _center(ball)
-    x1, y1 = float(person.get("x1", 0)), float(person.get("y1", 0))
-    x2, y2 = float(person.get("x2", 0)), float(person.get("y2", 0))
-    # expand box slightly; prefer bottom-third (feet / ball contact)
-    pad_x = 0.15 * max(1.0, x2 - x1)
-    pad_y = 0.1 * max(1.0, y2 - y1)
-    x1, x2 = x1 - pad_x, x2 + pad_x
-    y1 = y1 + 0.45 * (y2 - y1)  # ignore head/shoulders
-    y2 = y2 + pad_y
-    cx = min(max(bx, x1), x2)
-    cy = min(max(by, y1), y2)
-    return ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
-
-
-def _possession_timeline(
-    ball_series: list[dict[str, Any]],
-    person_index: dict[str, list[dict[str, Any]]],
-    radius: float,
-) -> list[dict[str, Any]]:
-    timeline: list[dict[str, Any]] = []
-    for ball in ball_series:
-        ts = int(ball.get("ts_ms", 0))
-        best_key = None
-        best_dist = radius
-        for key, series in person_index.items():
-            sample = _person_at(series, ts)
-            if not sample:
-                continue
-            dist = _ball_to_player_dist(ball, sample)
-            if dist <= best_dist:
-                best_dist = dist
-                best_key = key
-        timeline.append(
-            {
-                "ts_ms": ts,
-                "holder": best_key,
-                "ball": ball,
-                "dist": best_dist if best_key else None,
-            }
-        )
-    return timeline
-
-
-def _smooth_holders(timeline: list[dict[str, Any]], min_run: int) -> list[dict[str, Any]]:
-    """Require min_run consecutive same-holder samples; else treat as None (flight)."""
-    if not timeline:
-        return timeline
-    # forward-fill short gaps of same neighbors
-    holders = [t.get("holder") for t in timeline]
-    n = len(holders)
-    i = 0
-    while i < n:
-        h = holders[i]
-        j = i
-        while j < n and holders[j] == h:
-            j += 1
-        run = j - i
-        if h is not None and run < min_run:
-            for k in range(i, j):
-                holders[k] = None
-        i = j
-    out = []
-    for t, h in zip(timeline, holders):
-        out.append({**t, "holder": h})
-    return out
-
-
-def _passes_from_holders(
-    timeline: list[dict[str, Any]],
-    ball_series: list[dict[str, Any]],
-    camera_label: str,
-    diag: float,
-) -> list[EventCandidate]:
-    candidates: list[EventCandidate] = []
-    # compress into possession segments
-    segments: list[tuple[str, int, int]] = []  # holder, start_ms, end_ms
-    cur: str | None = None
-    start = 0
-    for t in timeline:
-        h = t.get("holder")
-        ts = int(t["ts_ms"])
-        if h is None:
-            if cur is not None:
-                segments.append((cur, start, ts))
-                cur = None
-            continue
-        if h != cur:
-            if cur is not None:
-                segments.append((cur, start, ts))
-            cur = h
-            start = ts
-    if cur is not None and timeline:
-        segments.append((cur, start, int(timeline[-1]["ts_ms"])))
-
-    for i in range(len(segments) - 1):
-        a_key, a_start, a_end = segments[i]
-        b_key, b_start, b_end = segments[i + 1]
-        if a_key == b_key:
-            continue
-        flight = b_start - a_end
-        if flight < MIN_FLIGHT_MS or flight > MAX_FLIGHT_MS:
-            continue
-        # skip if this release looks like a shot toward goal
-        if _is_shot_release(ball_series, a_end, b_start, diag):
-            continue
-        conf = 0.55
-        if flight < 2500:
-            conf += 0.1
-        if (b_end - b_start) >= 200:
-            conf += 0.05
-        candidates.append(
-            EventCandidate(
-                event_type="pass",
-                camera_label=camera_label,
-                camera_ts_ms=a_end,
-                confidence=min(0.85, conf),
-                track_keys=[a_key, b_key],
-                evidence={
-                    "heuristic": "possession_change",
-                    "passer": a_key,
-                    "receiver": b_key,
-                    "flight_ms": flight,
-                    "possession_a_ms": a_end - a_start,
-                    "possession_b_ms": b_end - b_start,
-                },
-            )
-        )
-        if len(candidates) >= MAX_PASSES:
-            break
-    return candidates
-
-
-def _ball_speed(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> float:
-    pts = [p for p in ball_series if t0 <= int(p.get("ts_ms", 0)) <= t1]
-    if len(pts) < 2:
-        # nearest neighbors
-        before = [p for p in ball_series if int(p.get("ts_ms", 0)) <= t0]
-        after = [p for p in ball_series if int(p.get("ts_ms", 0)) >= t1]
-        if not before or not after:
-            return 0.0
-        pts = [before[-1], after[0]]
-    a, b = pts[0], pts[-1]
-    dist = _center_delta(a, b)
-    dt = max(1, int(b.get("ts_ms", 0)) - int(a.get("ts_ms", 0)))
-    return (dist / diag) / dt
 
 
 def _center_delta(a: dict[str, Any], b: dict[str, Any]) -> float:
@@ -265,19 +111,17 @@ def _center_delta(a: dict[str, Any], b: dict[str, Any]) -> float:
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
-def _toward_goal(ball_series: list[dict[str, Any]], t0: int, t1: int) -> bool:
+def _ball_speed(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> float:
     pts = [p for p in ball_series if t0 <= int(p.get("ts_ms", 0)) <= t1]
     if len(pts) < 2:
-        return False
+        before = [p for p in ball_series if int(p.get("ts_ms", 0)) <= t0]
+        after = [p for p in ball_series if int(p.get("ts_ms", 0)) >= t1]
+        if not before or not after:
+            return 0.0
+        pts = [before[-1], after[0]]
     a, b = pts[0], pts[-1]
-    _, ay = _center(a)
-    _, by = _center(b)
-    h = float(b.get("frame_h") or a.get("frame_h") or 720)
-    # moving into top or bottom goal band
-    band = GOAL_BAND_FRAC * h
-    entering_top = by < band and ay > by
-    entering_bottom = by > h - band and by > ay
-    return entering_top or entering_bottom
+    dt = max(1, int(b.get("ts_ms", 0)) - int(a.get("ts_ms", 0)))
+    return (_center_delta(a, b) / diag) / dt
 
 
 def _flight_disp_frac(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> float:
@@ -291,280 +135,307 @@ def _flight_disp_frac(ball_series: list[dict[str, Any]], t0: int, t1: int, diag:
     return _center_delta(pts[0], pts[-1]) / max(diag, 1.0)
 
 
-def _is_shot_release(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> bool:
-    """Hard strike = shot; softer / goalward / long flight also counts on sparse CCTV."""
+def _toward_goal(ball_series: list[dict[str, Any]], t0: int, t1: int) -> bool:
+    """Facility CCTV goals may sit on any frame edge — check all four bands."""
+    pts = [p for p in ball_series if t0 <= int(p.get("ts_ms", 0)) <= t1]
+    if len(pts) < 2:
+        before = [p for p in ball_series if int(p.get("ts_ms", 0)) <= t0]
+        after = [p for p in ball_series if int(p.get("ts_ms", 0)) >= t1]
+        if not before or not after:
+            return False
+        pts = [before[-1], after[0]]
+    a, b = pts[0], pts[-1]
+    ax, ay = _center(a)
+    bx, by = _center(b)
+    h = float(b.get("frame_h") or a.get("frame_h") or 720)
+    w = float(b.get("frame_w") or a.get("frame_w") or 1280)
+    by_band = GOAL_BAND_FRAC * h
+    bx_band = GOAL_BAND_FRAC * w
+    top = by < by_band and ay > by
+    bottom = by > h - by_band and by > ay
+    left = bx < bx_band and ax > bx
+    right = bx > w - bx_band and bx > ax
+    return top or bottom or left or right
+
+
+def _ball_accel(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> float:
+    """Peak |Δspeed| over consecutive samples in [t0,t1] (frac diag / ms²)."""
+    pts = [p for p in ball_series if t0 - 200 <= int(p.get("ts_ms", 0)) <= t1]
+    if len(pts) < 3:
+        return 0.0
+    best = 0.0
+    for i in range(len(pts) - 2):
+        a, b, c = pts[i], pts[i + 1], pts[i + 2]
+        dt1 = max(1, int(b.get("ts_ms", 0)) - int(a.get("ts_ms", 0)))
+        dt2 = max(1, int(c.get("ts_ms", 0)) - int(b.get("ts_ms", 0)))
+        v1 = (_center_delta(a, b) / diag) / dt1
+        v2 = (_center_delta(b, c) / diag) / dt2
+        best = max(best, abs(v2 - v1) / max(dt1, dt2))
+    return best
+
+
+def _flight_straight(ball_series: list[dict[str, Any]], t0: int, t1: int) -> bool:
+    """ISVP: no direction change over early flight samples (≈3 frames)."""
+    pts = [p for p in ball_series if t0 <= int(p.get("ts_ms", 0)) <= t1]
+    if len(pts) < 4:
+        return True
+    pts = pts[:6]
+    angles: list[float] = []
+    for i in range(len(pts) - 1):
+        ax, ay = _center(pts[i])
+        bx, by = _center(pts[i + 1])
+        dx, dy = bx - ax, by - ay
+        if abs(dx) + abs(dy) < 1.0:
+            continue
+        angles.append(_atan2(dy, dx))
+    if len(angles) < 2:
+        return True
+    for i in range(len(angles) - 1):
+        d = abs(angles[i + 1] - angles[i])
+        if d > 3.14159265:
+            d = 6.2831853 - d
+        if d > 0.85:  # ~50° turn ⇒ pass/deflection, not clean shot
+            return False
+    return True
+
+
+def _atan2(y: float, x: float) -> float:
+    import math
+
+    return math.atan2(y, x)
+
+
+def _is_shot_kinematics(ball_series: list[dict[str, Any]], t0: int, t1: int, diag: float) -> bool:
+    """Hard strike: speed + displacement; accel OR very high speed (ISVP-inspired)."""
     speed = _ball_speed(ball_series, t0, t1, diag)
     disp = _flight_disp_frac(ball_series, t0, t1, diag)
-    if speed >= SHOT_SPEED_FRAC_PER_MS and disp >= SHOT_MIN_DISP_FRAC * 0.5:
-        return True
-    if speed >= SHOT_SPEED_SOFT_FRAC_PER_MS and (
-        _toward_goal(ball_series, t0, t1) or disp >= SHOT_MIN_DISP_FRAC
-    ):
-        return True
-    return False
+    if speed < SHOT_SPEED_FRAC_PER_MS or disp < SHOT_MIN_DISP_FRAC:
+        return False
+    accel = _ball_accel(ball_series, t0, min(t0 + 600, t1), diag)
+    if accel < SHOT_ACCEL_FRAC_PER_MS2 and speed < SHOT_SPEED_FRAC_PER_MS * 1.5:
+        return False
+    # Prefer straight flights; allow mild turns if clearly on-target speed
+    if not _flight_straight(ball_series, t0, t1) and speed < SHOT_SPEED_FRAC_PER_MS * 1.8:
+        return False
+    return True
 
 
-def _shots_and_goals(
-    timeline: list[dict[str, Any]],
+def _passes_from_segments(
+    segments: list[tuple[str, int, int]],
     ball_series: list[dict[str, Any]],
     camera_label: str,
     diag: float,
+    flight_limit_ms: int | None = None,
 ) -> list[EventCandidate]:
+    max_flight = MAX_FLIGHT_MS if flight_limit_ms is None else flight_limit_ms
     candidates: list[EventCandidate] = []
-    # look at holder → None → (optional holder) transitions with fast ball flight
-    i = 0
-    while i < len(timeline) - 1:
-        t = timeline[i]
-        if t.get("holder") is None:
-            i += 1
+    for i in range(len(segments) - 1):
+        a_key, a_start, a_end = segments[i]
+        b_key, b_start, b_end = segments[i + 1]
+        if a_key == b_key:
             continue
-        # find end of this possession
-        j = i
-        while j < len(timeline) and timeline[j].get("holder") == t["holder"]:
-            j += 1
-        release_ts = int(timeline[j - 1]["ts_ms"])
-        # flight window
-        k = j
-        while k < len(timeline) and timeline[k].get("holder") is None:
-            k += 1
-        if k == j:
-            i = j
+        flight = b_start - a_end
+        # flight 0 / small overlap = handoff; large negative is messy ordering — skip
+        if flight < -250:
             continue
-        flight_end = int(timeline[min(k, len(timeline) - 1)]["ts_ms"])
-        if not _is_shot_release(ball_series, release_ts, flight_end, diag):
-            i = j
+        if flight > max_flight:
             continue
-        shooter = t["holder"]
-        speed = _ball_speed(ball_series, release_ts, flight_end, diag)
-        goalward = _toward_goal(ball_series, release_ts, flight_end)
+        # Hard strike veto — only when ball tracking is dense enough for kinematics.
+        # On highlights (sparse ball) this falsely kills every handoff.
+        if max_flight <= MAX_FLIGHT_MS:
+            if _is_shot_kinematics(ball_series, a_end, a_end + SHOT_KIN_WINDOW_MS, diag):
+                continue
+        # Require both sides held briefly (completed pass)
+        if (a_end - a_start) < MIN_POSSESSION_MS:
+            continue
+        if (b_end - b_start) < MIN_POSSESSION_MS:
+            continue
+        conf = 0.62
+        if flight < 2000:
+            conf += 0.08
+        if flight > MAX_FLIGHT_MS:
+            conf -= 0.08  # sparse-ball / long-gap pass — lower trust
+        candidates.append(
+            EventCandidate(
+                event_type="pass",
+                camera_label=camera_label,
+                camera_ts_ms=a_end,
+                confidence=min(0.88, max(0.45, conf)),
+                track_keys=[a_key, b_key],
+                evidence={
+                    "heuristic": "possession_change",
+                    "passer": a_key,
+                    "receiver": b_key,
+                    "flight_ms": flight,
+                    "possession_a_ms": a_end - a_start,
+                    "possession_b_ms": b_end - b_start,
+                    "flight_limit_ms": max_flight,
+                    "method": "vidal_codina_pass",
+                },
+            )
+        )
+        if len(candidates) >= MAX_PASSES:
+            break
+    return candidates
+
+
+def _shots_from_segments(
+    segments: list[tuple[str, int, int]],
+    ball_series: list[dict[str, Any]],
+    camera_label: str,
+    diag: float,
+    receiver_window_ms: int | None = None,
+) -> list[EventCandidate]:
+    """Shot ≈ ISVP futsal detector + Vidal-Codina possession release.
+
+    Count when: hard goalward release AND (no teammate gains possession in the
+    pass-flight window OR ball reaches goal band — on-target / save / goal).
+    A completed pass to a teammate is never also a shot.
+    """
+    rx_window = SHOT_MAX_RECEIVER_MS if receiver_window_ms is None else max(
+        SHOT_MAX_RECEIVER_MS, receiver_window_ms
+    )
+    candidates: list[EventCandidate] = []
+    for i, (holder, start, end) in enumerate(segments):
+        if (end - start) < MIN_POSSESSION_MS:
+            continue
+        if i + 1 < len(segments):
+            next_holder, next_start, _ = segments[i + 1]
+            teammate_rx = next_holder != holder and 0 <= (next_start - end) <= rx_window
+        else:
+            teammate_rx = False
+
+        kin_end = end + SHOT_KIN_WINDOW_MS
+        if not _is_shot_kinematics(ball_series, end, kin_end, diag):
+            continue
+        if not _toward_goal(ball_series, end, kin_end):
+            continue
+
+        on_target = _ball_enters_goal_band(ball_series, end)
+        if teammate_rx:
+            # Another on-court player gained the ball → pass / block / rebound
+            # chain, not a shot. (Edge "goal band" fires too often on TV cuts.)
+            continue
+
+
+        speed = _ball_speed(ball_series, end, kin_end, diag)
         candidates.append(
             EventCandidate(
                 event_type="shot",
                 camera_label=camera_label,
-                camera_ts_ms=release_ts,
-                confidence=0.55 if goalward else 0.45,
-                track_keys=[shooter],
+                camera_ts_ms=end,
+                confidence=0.72 if on_target else 0.60,
+                track_keys=[holder],
                 evidence={
-                    "heuristic": "possession_release",
-                    "shooter": shooter,
-                    "goalward": goalward,
+                    "heuristic": "possession_release_shot",
+                    "shooter": holder,
+                    "goalward": True,
+                    "on_target_band": on_target,
                     "speed_diag_per_ms": speed,
+                    "method": "vidal_codina_isvp_shot",
+                    "possession_ms": end - start,
                 },
             )
         )
-        # goal if ball ends in extreme band
-        end_pt = min(ball_series, key=lambda p: abs(int(p.get("ts_ms", 0)) - flight_end))
-        cy = _center(end_pt)[1]
-        h = float(end_pt.get("frame_h") or 720)
-        if cy < GOAL_BAND_FRAC * h or cy > (1 - GOAL_BAND_FRAC) * h:
-            candidates.append(
-                EventCandidate(
-                    event_type="goal",
-                    camera_label=camera_label,
-                    camera_ts_ms=flight_end,
-                    confidence=0.4,
-                    track_keys=[shooter],
-                    evidence={"heuristic": "ball_in_goal_band", "shooter": shooter, "point": end_pt},
-                )
-            )
-        if len([c for c in candidates if c.event_type == "shot"]) >= MAX_SHOTS:
+        if len(candidates) >= MAX_SHOTS:
             break
-        i = k if k > j else j
     return candidates
 
 
-def _nearest_shooter(
-    person_index: dict[str, list[dict[str, Any]]],
-    ball_pt: dict[str, Any],
-    t0: int,
-    diag: float,
-    max_frac: float = 0.35,
-) -> str | None:
-    shooter = None
-    best = 1e9
-    for key, series in person_index.items():
-        sample = _person_at(series, t0)
-        if not sample:
+def _ball_enters_goal_band(
+    ball_series: list[dict[str, Any]], t0: int, window_ms: int = 2200
+) -> bool:
+    """True if ball reaches a deep edge band soon after release (on-target)."""
+    deep = GOAL_BAND_FRAC * 0.75
+    for p in ball_series:
+        ts = int(p.get("ts_ms", 0))
+        if ts < t0 or ts > t0 + window_ms:
             continue
-        dist = _ball_to_player_dist(ball_pt, sample)
-        if dist < best:
-            best = dist
-            shooter = key
-    if not shooter or best > max_frac * diag:
-        return None
-    return shooter
+        cx, cy = _center(p)
+        h = float(p.get("frame_h") or 720)
+        w = float(p.get("frame_w") or 1280)
+        if (
+            cy < deep * h
+            or cy > (1 - deep) * h
+            or cx < deep * w
+            or cx > (1 - deep) * w
+        ):
+            return True
+    return False
 
 
-def _sparse_ball_shots(
+def _ball_lingers_in_goal(
+    ball_series: list[dict[str, Any]], t0: int, window_ms: int = 2500
+) -> bool:
+    band_hits = 0
+    for p in ball_series:
+        ts = int(p.get("ts_ms", 0))
+        if ts < t0 or ts > t0 + window_ms:
+            continue
+        cx, cy = _center(p)
+        h = float(p.get("frame_h") or 720)
+        w = float(p.get("frame_w") or 1280)
+        in_band = (
+            cy < GOAL_BAND_FRAC * h
+            or cy > (1 - GOAL_BAND_FRAC) * h
+            or cx < GOAL_BAND_FRAC * w
+            or cx > (1 - GOAL_BAND_FRAC) * w
+        )
+        if in_band:
+            band_hits += 1
+            if band_hits >= GOAL_LINGER_SAMPLES:
+                return True
+    return False
+
+
+def _goals_after_shots(
+    shots: list[EventCandidate],
     ball_series: list[dict[str, Any]],
-    person_index: dict[str, list[dict[str, Any]]],
     camera_label: str,
-    diag: float,
 ) -> list[EventCandidate]:
-    """Detect shots from ball kinematics alone when possession chains are thin."""
+    """Goal only after a goalward shot with ball lingering in goal band (strict)."""
     candidates: list[EventCandidate] = []
-    if len(ball_series) < 2:
-        return candidates
-    # Skip across gaps — facility CCTV often drops the ball for several frames
-    for gap in (1, 2, 3, 4):
-        for i in range(len(ball_series) - gap):
-            a, b = ball_series[i], ball_series[i + gap]
-            t0, t1 = int(a.get("ts_ms", 0)), int(b.get("ts_ms", 0))
-            dt = max(1, t1 - t0)
-            if dt > 4500:
-                continue
-            dist_frac = _center_delta(a, b) / diag
-            speed = dist_frac / dt
-            goalward = _toward_goal([a, b], t0, t1)
-            hard = speed >= SHOT_SPEED_FRAC_PER_MS and dist_frac >= SHOT_MIN_DISP_FRAC * 0.45
-            soft = speed >= SHOT_SPEED_SOFT_FRAC_PER_MS and (
-                goalward or dist_frac >= SHOT_MIN_DISP_FRAC
-            )
-            if not hard and not soft:
-                continue
-            shooter = _nearest_shooter(person_index, a, t0, diag, max_frac=0.45)
-            if not shooter:
-                continue
-            candidates.append(
-                EventCandidate(
-                    event_type="shot",
-                    camera_label=camera_label,
-                    camera_ts_ms=t0,
-                    confidence=0.48 if goalward else 0.38,
-                    track_keys=[shooter],
-                    evidence={
-                        "heuristic": "sparse_ball_strike",
-                        "shooter": shooter,
-                        "goalward": goalward,
-                        "gap": gap,
-                        "speed_diag_per_ms": speed,
-                        "disp_frac": dist_frac,
-                    },
-                )
-            )
-            cy = _center(b)[1]
-            h = float(b.get("frame_h") or 720)
-            if cy < GOAL_BAND_FRAC * h or cy > (1 - GOAL_BAND_FRAC) * h:
-                candidates.append(
-                    EventCandidate(
-                        event_type="goal",
-                        camera_label=camera_label,
-                        camera_ts_ms=t1,
-                        confidence=0.35,
-                        track_keys=[shooter],
-                        evidence={"heuristic": "sparse_ball_goal_band", "shooter": shooter},
-                    )
-                )
-            if len([c for c in candidates if c.event_type == "shot"]) >= MAX_SHOTS:
-                return candidates
-    return candidates
-
-
-def _kick_motion_shots(persons: list[Detection], camera_label: str) -> list[EventCandidate]:
-    """Last-resort: rapid player bursts toward a goal band (no reliable ball track)."""
-    candidates: list[EventCandidate] = []
-    # Prefer longer-lived tracks (real players over fragments)
-    ranked = sorted(persons, key=lambda p: p.end_ms - p.start_ms, reverse=True)[:40]
-    for p in ranked:
-        series = p.bbox_series or []
-        if len(series) < 4:
+    for shot in shots:
+        if not (shot.evidence or {}).get("goalward"):
             continue
-        h = float(series[0].get("frame_h") or 720)
-        w = float(series[0].get("frame_w") or 1280)
-        diag = (h * h + w * w) ** 0.5 or 1.0
-        for step in (2, 3, 4):
-            for i in range(0, len(series) - step, 2):
-                a, b = series[i], series[i + step]
-                t0, t1 = int(a.get("ts_ms", 0)), int(b.get("ts_ms", 0))
-                dt = max(1, t1 - t0)
-                if dt > 1400:
-                    continue
-                dist = _center_delta(a, b)
-                speed = (dist / diag) / dt
-                if speed < 0.00018:
-                    continue
-                _, ay = _center(a)
-                _, by = _center(b)
-                band = GOAL_BAND_FRAC * h
-                toward_top = by < ay and by < band * 2.8
-                toward_bottom = by > ay and by > h - band * 2.8
-                if not (toward_top or toward_bottom):
-                    continue
-                candidates.append(
-                    EventCandidate(
-                        event_type="shot",
-                        camera_label=camera_label,
-                        camera_ts_ms=t0,
-                        confidence=0.26,
-                        track_keys=[p.track_key],
-                        evidence={
-                            "heuristic": "player_goalward_burst",
-                            "shooter": p.track_key,
-                            "speed_diag_per_ms": speed,
-                        },
-                    )
-                )
-                if len(candidates) >= 80:
-                    return candidates
+        t0 = shot.camera_ts_ms
+        if not _ball_lingers_in_goal(ball_series, t0):
+            continue
+        # Extra gate: must reach deep band (reduces sideline false goals)
+        if not _ball_enters_goal_band(ball_series, t0, window_ms=2000):
+            continue
+        candidates.append(
+            EventCandidate(
+                event_type="goal",
+                camera_label=camera_label,
+                camera_ts_ms=t0 + 400,
+                confidence=0.40,
+                track_keys=list(shot.track_keys),
+                evidence={
+                    "heuristic": "shot_then_goal_band_linger",
+                    "shooter": shot.track_keys[0] if shot.track_keys else None,
+                    "method": "vidal_codina_goal_approx",
+                    "note": "estimated — confirm in review",
+                },
+            )
+        )
+        if len(candidates) >= MAX_GOALS:
+            break
     return candidates
-
-
-def _fallback_without_ball(persons: list[Detection], camera_label: str) -> list[EventCandidate]:
-    """When ball is barely detected: proximity handoffs between person tracks over time."""
-    candidates: list[EventCandidate] = []
-    # sample centers over time per track
-    samples: list[tuple[int, str, float, float]] = []
-    for p in persons:
-        for pt in p.bbox_series or []:
-            cx, cy = _center(pt)
-            samples.append((int(pt.get("ts_ms", 0)), p.track_key, cx, cy))
-    samples.sort()
-    # for each time bucket, find two closest players — weak pass signal when they swap closeness to a midpoint
-    # Simpler: when two tracks come within radius then separate, count pass once
-    for i, a in enumerate(persons):
-        for b in persons[i + 1 :]:
-            sa = a.bbox_series or []
-            sb = b.bbox_series or []
-            if len(sa) < 2 or len(sb) < 2:
-                continue
-            close_ts = None
-            for pa in sa:
-                pb = _person_at(sb, int(pa.get("ts_ms", 0)))
-                if not pb:
-                    continue
-                if _center_delta(pa, pb) < 120:
-                    close_ts = int(pa.get("ts_ms", 0))
-                    break
-            if close_ts is None:
-                continue
-            # later separation
-            for pa in sa:
-                ts = int(pa.get("ts_ms", 0))
-                if ts < close_ts + 400:
-                    continue
-                pb = _person_at(sb, ts)
-                if pb and _center_delta(pa, pb) > 200:
-                    candidates.append(
-                        EventCandidate(
-                            event_type="pass",
-                            camera_label=camera_label,
-                            camera_ts_ms=close_ts,
-                            confidence=0.28,
-                            track_keys=[a.track_key, b.track_key],
-                            evidence={"heuristic": "proximity_handoff_no_ball"},
-                        )
-                    )
-                    break
-            if len(candidates) >= 80:
-                return _dedupe(candidates)
-    return _dedupe(candidates)
 
 
 def _dedupe(candidates: list[EventCandidate]) -> list[EventCandidate]:
     seen: set[tuple] = set()
     out: list[EventCandidate] = []
     for c in sorted(candidates, key=lambda x: (-x.confidence, x.camera_ts_ms)):
-        bucket = c.camera_ts_ms // PASS_DEDUP_MS
+        if c.event_type == "pass":
+            bucket = c.camera_ts_ms // PASS_DEDUP_MS
+        elif c.event_type == "shot":
+            bucket = c.camera_ts_ms // SHOT_DEDUP_MS
+        elif c.event_type == "goal":
+            bucket = c.camera_ts_ms // GOAL_DEDUP_MS
+        else:
+            bucket = c.camera_ts_ms // PASS_DEDUP_MS
         key = (c.event_type, bucket, tuple(sorted(c.track_keys)))
         if key in seen:
             continue

@@ -240,6 +240,9 @@ export const api = {
       totals: Record<string, number>;
       by_player: {
         display_name: string;
+        player_id?: string;
+        shirt_number?: number | null;
+        avatar_url?: string | null;
         goal: number;
         shot: number;
         pass: number;
@@ -247,8 +250,15 @@ export const api = {
         touches: number;
         distance: number;
         attribution: string;
+        heatmap?: number[][];
       }[];
-      heatmap: { width: number; height: number; match: number[][]; note?: string };
+      heatmap: {
+        width: number;
+        height: number;
+        match: number[][];
+        note?: string;
+        by_player?: boolean;
+      };
       labels: Record<string, string>;
     }>(`/api/v1/share/matches/${shareToken}`),
   runFeasibility: async (file: File) => {

@@ -38,12 +38,15 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
         raise HTTPException(status_code=404, detail="Match not found")
     facility = db.get(Facility, match.facility_id)
     stats = build_match_stats(db, match.id)
-    # Public report: drop bulky per-player heatmaps, keep match heatmap + summary
+    # Include per-player heatmaps (image-plane, estimated) for share report
     players = []
     for row in stats["by_player"]:
         players.append(
             {
                 "display_name": row["display_name"],
+                "player_id": row.get("player_id"),
+                "shirt_number": row.get("shirt_number"),
+                "avatar_url": row.get("avatar_url"),
                 "goal": row["goal"],
                 "shot": row["shot"],
                 "pass": row["pass"],
@@ -51,6 +54,7 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
                 "touches": row.get("touches", 0),
                 "distance": row.get("distance", 0),
                 "attribution": row.get("attribution", "estimated"),
+                "heatmap": row.get("heatmap"),
             }
         )
     return {
@@ -64,6 +68,7 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
             "height": stats["heatmap"]["height"],
             "match": stats["heatmap"]["match"],
             "note": stats["heatmap"].get("note"),
+            "by_player": True,
         },
         "labels": stats["labels"],
     }

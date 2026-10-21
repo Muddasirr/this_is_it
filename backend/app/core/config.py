@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     vision_conf: float = 0.25
     vision_imgsz: int = 640
     vision_max_frames: int = 0  # 0 = no cap; use e.g. 300 for quick online-clip tests
+    # Tracker: botsort (default, GMC) | bytetrack (legacy A/B)
+    vision_tracker: str = "botsort"
+    # OSNet appearance ReID — embed crops + merge track fragments post-track
+    vision_reid: bool = True
+    vision_reid_model: str = "osnet_x0_25"
+    vision_reid_every: int = 3  # embed every N processed frames (cost control)
+    court_format: str = "5v5"  # 5v5 | 6v6 | 7v7
     allow_single_camera: bool = True  # Phase 0 public-clip testing
 
     @property

@@ -334,11 +334,15 @@ def process_job(db: Session, job_id: UUID) -> None:
                 label_dets = [d for d in all_detections if d.camera_label == label.value]
                 candidates.extend(backend.infer_events(label_dets, label.value))
 
-            # 7. Fuse — naive: group by type + rounded second
+            # 7. Fuse across cameras A/B/C
             run_fuse = _start_run(db, job, JobStage.fuse, model.id)
             job_service.mark_job_progress(db, job, JobStage.fuse, 90)
+            from app.services.fuse import fuse_event_candidates
+
+            # Cross-cam A/B/C: keep best obs per type+time+player bucket
+            fused_list = fuse_event_candidates(candidates, bucket_ms=1500)
             fused: dict[tuple, list] = {}
-            for c in candidates:
+            for c in fused_list:
                 key = (c.event_type, c.camera_ts_ms // 1000)
                 fused.setdefault(key, []).append(c)
 

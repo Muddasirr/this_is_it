@@ -1,555 +1,356 @@
-# Facility-first futsal analytics — finalized PRD and implementation plan
+# CourtLens — Production PRD
 
-## 1. Executive decision
+**Product:** CourtLens  
+**Domain:** Facility-first futsal analytics (post-match)  
+**Status:** Production requirements (v1.0)  
+**Related:** `ARCHITECTURE.md` (pipeline + stat definitions), `PILOT.md` (single-court pilot constraints)
 
-Build a cloud-based, post-match futsal analytics platform for facilities using two existing cameras with partial overlap. Facilities own the footage, register players through a roster, and upload completed matches for automated analysis. Staff review uncertain events before publishing player reports, statistics, and highlights.
+---
 
-The first release should optimize for reliable match analysis, not the number of AI features. Two-camera synchronization, player identity continuity, and trustworthy event attribution are the main technical risks.
+## 1. Vision and product thesis
 
-## Locked product decisions
+CourtLens turns facility-owned match video into **reviewable, publishable player and match analytics**.
 
-Initial customer and sport
+Facilities upload completed match recordings (1–2 fixed cameras). The platform detects and tracks players and ball, proposes roster identity (kit colour + jersey number), infers possession-centric events, and lets staff confirm uncertain cases before publishing dashboards, player reports, and shareable highlight links.
 
-Futsal facilities; 10–50 matches per facility per month.
+**Production bar:** a facility can run weekly matches with minimal engineer involvement, trust labelled stats enough to share with coaches/players, and the operator can run the service with measured cost, uptime, and data controls.
 
-Video capture
+This is **not** a live broadcast Opta replacement, 3D reconstruction product, or 11-a-side football platform in v1.
 
-Two existing cameras, partially overlapping views. Facility-owned recordings.
+---
 
-Processing
+## 2. Locked product decisions
 
-Cloud-based, asynchronous, post-match processing. Live analytics deferred.
+| Decision | Production choice |
+| -------- | ----------------- |
+| Sport / customer | Futsal facilities (indoor courts); multi-tenant SaaS |
+| Capture | Facility-owned fixed cameras; **1 or 2** views supported (1-cam fully supported) |
+| Timing | **Post-match, asynchronous** cloud processing; live deferred |
+| Identity | Auto: kit colour clustering + jersey OCR when readable; staff override always wins |
+| Events | Pass, shot, goal (and assist when attribution allows) from **possession changes**; see `ARCHITECTURE.md` |
+| Quality labels | Every published metric: `estimated` \| `confirmed` \| `unavailable` |
+| Review | High-confidence classes may auto-accept after validation gates; uncertain → review queue |
+| Sharing | Facility-controlled share links for reports/clips; no public index by default |
+| Compute | On-demand GPU workers for detection/tracking; CPU OK for media/clip jobs; no always-on idle GPU |
+| Single source of truth | Stats derive only from **canonical events** + track metrics linked through identity |
 
-Player identification
+**Still commercial variables (not engineering assumptions):** list pricing, SLA tier packaging, exact GPU vendor. Settle via measured unit economics after production benchmarks.
 
-AI auto-detects logical players via tracking + jersey-region appearance clustering and creates proposed roster entries when staff have not pre-registered a squad. When a roster/shirt numbers exist, AI proposes mappings; staff always correct mismatches before publish. See `ARCHITECTURE.md`.
+---
 
-Events and player stats
+## 3. Users and jobs-to-be-done
 
-Passes, shots and goals are inferred from **ball possession changes** (league-style), not from “two people on screen.” Match totals and per-player reports are derived only from canonical events. Labels remain estimated / confirmed / unavailable. Detailed definitions and the top-five-league research baseline live in `ARCHITECTURE.md`.
+| Persona | Primary jobs |
+| ------- | ------------ |
+| Facility admin | Create facility, invite staff, set retention, manage billing contact |
+| Match operator / coach staff | Create match, upload video(s), start processing, review events/identity, publish |
+| Coach / player (consumer) | Open share link, view match + personal stats and clips (no edit) |
+| Platform operator (CourtLens) | Monitor jobs, costs, failures; manage model versions; support facilities |
 
-Quality policy
+### Primary journey (production)
 
-Auto-accept only validated, high-confidence events; send uncertain cases to review.
+1. **Onboard facility** — workspace, roles, teams, optional pre-registered roster.  
+2. **Create match** — metadata, optional Camera B, retention policy.  
+3. **Upload** — signed URLs; validate codec, duration, FPS, resolution, integrity.  
+4. **Process** — ingest → (optional sync) → detect/track → identity → events → fuse → stats.  
+5. **Review** — fix identity, accept/reject/edit events; audit trail.  
+6. **Publish & share** — match centre + player reports + clips; share token.  
+7. **Retain / delete** — policy enforcement; verified deletion.
 
-Not yet decided: pricing, monthly cloud budget, exact camera models, footage format/quality, and achievable model accuracy. These should be settled through a short technical validation and paid-pilot discussions rather than assumptions.
+---
 
-## 2. Product requirements
+## 4. Production scope
 
-### Primary user journey
+### 4.1 Must ship (P0) — production v1
 
-### 1
+**Multi-tenant product**
 
-Set up facility and match
+- Facility workspaces, staff auth (email/password or SSO-ready design), roles: `admin`, `operator`, `viewer`.
+- Facility-scoped authorization on every API and media URL.
+- Match lifecycle: draft → processing → needs_review → published → archived.
+- Soft-delete + hard-delete with retention jobs.
 
-Create teams, register players and shirt numbers, enter match details.
+**Ingestion & media**
 
-### 2
+- 1 or 2 camera uploads via signed, expiring URLs.
+- Validation: container/codec, duration, FPS, resolution, corruption, incomplete files.
+- Proxy generation for review; originals in private object storage.
+- Job status: queued, running, stage progress %, retry, cancel; idempotent stages.
+- Optional Camera A/B sync offset with manual correction (2-cam).
 
-Upload two recordings
+**Vision & identity**
 
-Attach camera A and B videos; validate duration, frame rate, quality and sync.
+- Player + ball detect/track (stable `VisionBackend` interface).
+- Dense track series, kit colour features, jersey OCR when available.
+- Proposed roster (Kit A/B + shirt number); staff rename / reassign.
+- Unknown / low-confidence identity states preserved — never silently invent certainty.
 
-### 3
+**Events, review, stats**
 
-Process in the cloud
+- Candidate pass / shot / goal (+ assist when roles exist); cross-camera dedupe when 2-cam.
+- Review UI: timeline, evidence clips, accept / reject / edit; full audit log.
+- Match dashboard + per-player reports: goals, shots, passes, possession %, touches, distance, heatmaps.
+- Clear `estimated` / `confirmed` / `unavailable` labelling in UI and exports.
+- Publish + shareable report link (`/report/<token>`).
 
-Detect players and the ball, track movement, infer events, and associate identities.
+**Operations**
 
-### 4
+- Structured logs, error tracking, per-match cost records (GPU seconds, storage GB-days, egress, retries, review minutes).
+- Model / config version stamped on every processing run.
+- Reprocess creates a **new run**; staff-confirmed events are not silently overwritten.
+- Health checks, queue depth alerts, failed-job alerts.
+- Secrets via env / secret manager; no credentials in repo.
 
-Review uncertain events
+### 4.2 Should ship soon after v1 (P1)
 
-Confirm goals, shots, passes and player attribution; fix roster mappings.
+- Calibrated pitch metres (homography) for true distance/speed.
+- Stronger ball model or domain-tuned detector for wide CCTV.
+- Assists as first-class confirmed metric; defensive actions; GK saves.
+- Exports (CSV/PDF), webhook on publish, facility branding on share pages.
+- SSO (Google / Microsoft), audit export for facilities.
+- Batch GPU workers (e.g. Kaggle/Colab only for R&D — not production path).
 
-### 5
+### 4.3 Explicitly out of scope (v1)
 
-Publish results
+- Live / real-time analytics during play.
+- Guaranteed cross-camera re-identification without staff help.
+- 3D reconstruction, automated coaching advice, 11-a-side football.
+- Native mobile apps; full Opta-complete event taxonomy.
+- Free always-on public GPU as production compute.
 
-Generate match dashboard, player reports, and shareable highlight clips.
+---
 
-### MVP scope
+## 5. Quality and trust requirements
 
-| Priority         | Included                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P0 — required    | Facility accounts, match and roster setup, two-video upload, video validation, synchronization and manual offset correction, asynchronous processing, player tracks, roster-based identity correction, review timeline, goals, shots, basic passes, match dashboard, player reports, event clips, share permissions, job status, deletion and cost tracking |
-| P0 — reliability | Confidence scores, event evidence clips, review audit trail, retry-safe processing, duplicate-event prevention, clear “estimated / confirmed / unavailable” labels                                                                                                                                                                                          |
-| P1 — after pilot | More reliable assists, possession estimates, defensive actions, goalkeeper saves and distribution, calibrated movement maps, historical player comparisons, exports and facility integrations                                                                                                                                                               |
-| Deferred         | Live analysis, automatic tactical coaching, 3D reconstruction, guaranteed cross-camera re-identification, 11-a-side football, mobile apps and advanced automated highlight editing                                                                                                                                                                          |
+### 5.1 Labelling contract
 
-Important scope constraint: “Passes” in P0 means possession-change candidates suitable for review — not Opta-complete pass networks. Do not promise precise possession percentages or progressive-pass taxonomies until footage tests establish consistent precision/recall. Always surface **player-wise** estimated stats from attributed events so staff can correct identity and counts.
+| Label | Meaning | May appear in published share? |
+| ----- | ------- | ------------------------------ |
+| `confirmed` | Staff accepted or auto-accepted under validated gate | Yes |
+| `estimated` | Model/heuristic output, not staff-confirmed | Yes, clearly marked |
+| `unavailable` | Insufficient evidence (e.g. no ball) | Yes, as gap — not zero-filled as truth |
 
-## 3. Final architecture decisions
+**Rule:** Player reports must not present estimated counts as official without the label. Wrong identity is worse than missing stats.
 
-### Recommended architecture
+### 5.2 Production quality gates (per event class)
 
-Use a modular monolith for the product API and separate, independently scalable video-processing workers. This is simpler to maintain than microservices for a small team, while allowing GPU-heavy jobs to scale separately.
+Numeric thresholds are **locked after** an evaluation set from real facility footage. Until then, all events default to review or `estimated`.
 
-Web application
+| Class | Gate to allow auto-accept | Until gate met |
+| ----- | ------------------------- | -------------- |
+| Goal | Precision ≥ agreed threshold on held-out matches | Always reviewable |
+| Shot | Precision ≥ agreed threshold | Review or estimated |
+| Pass | Precision/recall band agreed; noisy → review | Estimated + review |
+| Identity (kit+number) | Attribution accuracy ≥ agreed threshold | Staff correction required before trust claims |
 
-React + TypeScript · facility dashboard · match setup · review UI
+Report precision/recall **separately** for goal, shot, pass, and identity. Never a single “accuracy %”.
 
-Application API
+### 5.3 Honesty constraints (product copy & sales)
 
-Authentication · facilities · rosters · matches · signed upload URLs · review actions
+- Do not promise Opta-level pass networks or calibrated metres until homography ships.
+- Do not promise readable jersey OCR on all CCTV; kit clustering + rename is the fallback.
+- Sparse ball ⇒ possession/touches/shots degrade; UI must surface ball coverage.
 
-PostgreSQL
+---
 
-Metadata, events, identities, audit log
+## 6. Non-functional requirements (production)
 
-Private object storage
+### 6.1 Reliability & performance
 
-Original videos, proxies, clips, artifacts
+| Metric | Target (v1) |
+| ------ | ----------- |
+| API availability | 99.5% monthly (excluding planned maintenance) |
+| Upload success | Resumable or retry-safe; clear failure reasons |
+| Processing SLO | p50 ≤ 1.5× realtime on GPU worker for 1×60 min 1080p @ configured stride; document CPU fallback separately |
+| Job durability | Survives worker restart; stage checkpoints; at-most-once side effects via idempotency keys |
+| Review UX | Evidence clip available for each candidate event |
 
-Job queue + workflow orchestrator
+### 6.2 Security & privacy
 
-Retries · checkpoints · progress · cancellation · idempotency
+- TLS everywhere; signed expiring URLs for upload/playback.
+- Facility isolation: no cross-tenant data in queries or URLs.
+- Password hashing (or IdP); session/JWT expiry; role checks on mutations.
+- Footage ownership stays with facility; CourtLens is processor under agreed terms.
+- Retention defaults (e.g. 30 days) + facility-configurable; deletion verified.
+- Player/personal data minimized; share links revocable.
+- Audit trail for identity and event corrections (who/when/what).
 
-CPU workers
+### 6.3 Scalability
 
-FFmpeg · validation · synchronization · clip rendering
+- Design for **10–50 matches / facility / month**, many facilities.
+- Horizontal scale: API replicas, worker pool, object storage.
+- Queue back-pressure; per-facility concurrency limits to protect cost.
+- Cache artifacts by `(video_checksum, model_version, config_hash)`.
 
-GPU workers
+### 6.4 Observability
 
-Detection · tracking · event inference
+- Structured logs with `facility_id`, `match_id`, `job_id`, `run_id`, `stage`.
+- Metrics: queue latency, stage duration, GPU util, failure rate, cost/match.
+- Alerting: job stuck, error spike, spend threshold exceeded.
 
-### Technology choices
+### 6.5 Cost control
 
-| Area             | Decision                                                                | Reason                                                                |
-| ---------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Web              | React + TypeScript                                                      | Fast development of dashboard and review tools                        |
-| API              | Python + FastAPI                                                        | Convenient integration with computer-vision libraries                 |
-| Database         | PostgreSQL                                                              | Relational data, transactions and auditable corrections               |
-| Video storage    | Private S3-compatible object storage                                    | Large files should not live in the relational database                |
-| Media processing | FFmpeg                                                                  | Probe, normalize, synchronize and cut videos                          |
-| Vision           | OpenCV plus evaluated pretrained detection/tracking models              | Start with existing models; fine-tune only when footage justifies it  |
-| Jobs             | Managed queue or Redis-backed queue with durable job state              | Keep uploads and API requests independent from long-running inference |
-| Deployment       | Managed database/storage and on-demand GPU compute                      | Avoid operating a permanently idle GPU server                         |
-| Monitoring       | Structured logs, job metrics, error tracking and per-match cost records | Diagnose failures and measure unit economics                          |
+Per-match cost model:
 
-Specific vendors are intentionally left open until the footage and cost tests. Use a managed PostgreSQL service, private object storage, and a GPU provider that supports short-lived workers. Keep model inference behind a stable internal interface so models and vendors can be changed without redesigning the product.
+\[
+C_{\text{match}} = C_{\text{inference}} + C_{\text{media}} + C_{\text{storage}} + C_{\text{delivery}} + C_{\text{review}} + C_{\text{overhead}}
+\]
 
-### Processing workflow
+Controls:
 
-1. Ingest: verify file type, duration, resolution, frame rate, audio stream, orientation and corruption.
-2. Normalize: generate a low-resolution proxy for review; retain original footage under the facility’s retention policy.
-3. Synchronize: estimate a relative time offset between cameras and store the offset, confidence and correction history.
-4. Detect and track: process each camera independently first; track players and ball within each view.
-5. Resolve identity: map tracks to roster entries using shirt numbers, team/color cues, temporal evidence and staff corrections.
-6. Infer events: identify candidate goals, shots and passes, attaching timestamps, involved tracks, source camera and confidence.
-7. Fuse observations: link the same event observed by both cameras so it is counted once.
-8. Review: auto-accept only event classes whose precision has been validated; put uncertain events into a review queue.
-9. Publish: derive statistics from canonical events, then render clips, player reports and match summaries.
+1. On-demand GPU only.  
+2. Configurable frame stride / imgsz with documented quality trade-offs.  
+3. Retry failed **stages**, not whole pipeline by default.  
+4. Proxies for review; full-quality clips on demand.  
+5. Retention + deletion enforcement.  
+6. Per-match spend ceiling → pause + alert.
 
-### Data and processing rules
+---
 
-Use the following core entities:
+## 7. Architecture (production)
 
-- `facilities`, `facility_users`
-- `teams`, `players`, `match_rosters`
-- `matches`, `camera_sources`, `video_assets`, `camera_syncs`
-- `processing_jobs`, `processing_runs`, `model_versions`
-- `player_tracks`, `track_identity_links`
-- `match_events`, `event_observations`, `event_participants`
-- `event_reviews`, `event_corrections`, `highlight_clips`
-- `usage_records`, `retention_policies`
+### 7.1 Shape
 
-Non-negotiable rules:
+**Modular monolith API** + **independently scalable workers** (media CPU workers, vision GPU workers). Avoid microservice sprawl until team/size demands it.
 
-- Keep timestamps in a canonical match timeline; preserve each camera’s original timestamps and applied offset.
-- A track ID is scoped to its camera and processing run. It is not automatically a globally unique player identity.
-- One real-world event must have one canonical event record, even if both cameras observe it.
-- Every published statistic must be traceable to its source event and any staff correction.
-- Model or configuration changes must not silently overwrite staff-reviewed results. Reprocessing should create a new run and reconcile reviewed events.
-- Store confidence and provenance separately from a simple “confirmed” flag.
-- Use signed, expiring URLs for uploads and video playback; enforce facility-level access on every API request.
+| Layer | Production choice |
+| ----- | ----------------- |
+| Web | React + TypeScript |
+| API | Python + FastAPI |
+| DB | Managed PostgreSQL |
+| Queue | Redis or managed queue; durable job state in Postgres |
+| Storage | Private S3-compatible object storage |
+| Media | FFmpeg |
+| Vision | Ultralytics YOLO + ByteTrack (swappable via `VisionBackend`) |
+| Events / identity | Possession heuristics + kit/jersey clustering (`ARCHITECTURE.md`) |
+| Deploy | Containerized API/workers; managed DB/storage; on-demand GPU |
 
-## 4. Camera installation and recording requirements
+### 7.2 Processing stages (canonical)
 
-The facility already has two cameras, so the first step is a camera suitability audit, not an immediate hardware purchase. Existing CCTV may be designed for security coverage rather than sports analysis.
+1. **Ingest** — validate media.  
+2. **Normalize** — proxy + metadata.  
+3. **Synchronize** — A/B offset (if 2-cam).  
+4. **Detect & track** — persons + ball; colour hist; OCR; thumbs.  
+5. **Identity** — cluster → Kit A/B + shirt → roster links.  
+6. **Events** — possession-centric candidates.  
+7. **Fuse** — dedupe across cameras.  
+8. **Stats** — canonical events + track metrics.  
+9. **Review / publish** — staff gate → share artifacts.
 
-### Placement and coverage
+### 7.3 Core entities
 
-[Loreto FESD Arcadi (@cd_arcadi) on X](https://images.openai.com/static-rsc-4/Pl9WyjdXeyijgTu7kp8569-KTNcFbPjMW1dD_3ae6mUpWrmOSPujBFDcISivV1D9mUhRVHmkCpFFCKL0tPP5jxmIDdPJja0fWwqFm9ZaE3p6HKllZRGq2zByez0KzPHib_VFGA-IRQIu7Odv4E_fqxlFJbCiM8Ftk5hJZaBtlfI?purpose=inline)
+`facilities`, `facility_users`, `teams`, `players`, `match_rosters`,  
+`matches`, `camera_sources`, `video_assets`, `camera_syncs`,  
+`processing_jobs`, `processing_runs`, `model_versions`,  
+`player_tracks`, `track_identity_links`,  
+`match_events`, `event_observations`, `event_participants`,  
+`event_reviews`, `event_corrections`, `highlight_clips`,  
+`usage_records`, `retention_policies`, `share_tokens`.
 
-[Checking your browser - reCAPTCHA](https://images.openai.com/static-rsc-4/d7F2-agi7k_4ej3Ew0Il0h6lXDJ3MQXsPRFjtbASrIS3ZvrGhep--n_sTBTOezEHlYUdvKrE_qD54C-e4TmlZE9UJc7dwkWxLmE556EKzYDiispVRdX_BcLhKydr_7nqvI3OA3eLwA91qXQNEOOTEW-kqSYrN3zSSmtNA5WGUf8?purpose=inline)
+### 7.4 Non-negotiable data rules
 
-[O nosso 𝗖𝗔𝗡𝗔𝗟 com as nossas 𝗖𝗢𝐑𝐄𝐒 💛❤️💙 Atlético Clube de Portugal - Site Oficial](https://images.openai.com/static-rsc-4/DSaGi2V7ANFSbFs7bh90GWOmaJH38XARdD6WxeTeY-alLKoYBK-g3Z67yMEgkoMBgMUcKua_hiDf-3lfM89QfbnMjlYHZt_T9bK3_jOZzRvXdGrT1XcHUie6OEnCqNNKHEMa1KbUCmxYWw0iASS_v3KhxClaSJ5I9tA13fJwYQU?purpose=inline)
+1. Canonical match timeline; preserve per-camera timestamps + applied offset.  
+2. Track IDs are scoped to camera + processing run — not global player IDs.  
+3. One real-world event → one canonical event (even if seen on both cameras).  
+4. Every published statistic traces to source event(s) and corrections.  
+5. Reprocess = new `processing_run`; do not erase confirmed staff work.  
+6. Confidence and provenance stored separately from confirmation state.  
+7. Facility ACL on every read/write of media and match data.
 
-8
+---
 
-The images are examples of the intended coverage concept, not a prescribed installation layout.
+## 8. Capture requirements (production guidance)
 
-- Camera A: primary wide view of as much of the court as possible.
-- Camera B: complementary angle that covers important areas obscured in Camera A, particularly goal areas and zones where players overlap.
-- Mount cameras securely, high enough to reduce player-to-player occlusion, and outside ball/player impact zones.
-- Prefer a stable, wide view over frequent PTZ movement. If a camera pans, tilts, or zooms, its changing field of view adds tracking complexity.
-- Minimize glare, flicker, motion blur and extreme backlighting. Check image quality under actual match lighting.
-- Keep both goal areas and boundary lines visible where feasible.
-- Partial overlap is acceptable for the first version, but the cameras must share enough visible action to support synchronization and event cross-checking.
+Facilities use existing CCTV; CourtLens does not sell cameras in v1. Publish a **camera readiness checklist** in onboarding.
 
-Do not require full 3D court reconstruction for the MVP. Begin with independent 2D camera views and a shared timeline. Partial overlap means some players and events will only be visible in one camera; the product must be able to report reduced confidence rather than invent missing evidence.
+| Requirement | Production target | Minimum |
+| ----------- | ----------------- | ------- |
+| Resolution | 1920×1080 | Players/ball visible at far end |
+| Frame rate | 25–30 FPS | 15 FPS fallback (expect missed ball) |
+| Codec | H.264 | H.265 if pipeline-validated |
+| View | Fixed wide; both goals preferred | Stable FOV (no PTZ during match) |
+| Cameras | 1 supported; 2 preferred for goals/occlusion | 1-cam OK with lower confidence |
 
-### Recommended recording profile
+Sync (2-cam): common visible action at start; estimate offset; staff adjust; re-check mid/late match for drift. Do not trust file mtimes alone.
 
-These are pilot targets, not claims that every existing CCTV system can meet them.
+---
 
-| Requirement   | Target for pilot                                               | Minimum validation                                                  |
-| ------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Resolution    | 1920×1080 per camera                                           | Test whether players and ball remain visible at the far end         |
-| Frame rate    | 25–30 FPS preferred                                            | Test 15 FPS only as a fallback; fast ball motion may be missed      |
-| Codec         | H.264 preferred                                                | H.265 is acceptable if the processing pipeline supports it reliably |
-| Recording     | Continuous match recording                                     | Include warm-up/pre-match and post-match buffer where possible      |
-| Camera motion | Fixed view                                                     | Record any PTZ movement or zoom changes                             |
-| Exposure      | Fast enough to limit motion blur                               | Test at peak match speed and actual lighting                        |
-| Time metadata | Preserve timestamps and time zone                              | Confirm both cameras’ clock accuracy and drift                      |
-| File handling | Original recording retained until processing passes validation | Check file completeness and playback before deleting anything       |
+## 9. Workload assumptions
 
-If a camera only produces low-resolution or low-frame-rate footage, don't assume AI enhancement can recover information that was never captured.
+Planning defaults (replace with facility measurements):
 
-### Synchronization requirements
+- 10–50 matches / facility / month  
+- ~60 minutes / camera / match  
+- ~4–8 Mbps average bitrate  
+- Retention 7–90 days (default 30)
 
-With existing cameras, the most likely setup is independent recorders and clocks. Therefore:
+Illustrative raw volume (25 matches × 60 min × 6 Mbps × 2 cams) ≈ **135 GB/month** uploads before proxies/clips/retries. Production capacity planning must include proxies, clips, and multi-tenant peaks.
 
-1. Capture a common visible action at the start, such as a distinctive ball movement, whistle, or synchronized clap.
-2. Estimate the relative time offset using timestamps and visible action.
-3. Allow staff to adjust the offset in the review UI.
-4. Validate the offset again later in the recording to detect clock drift.
-5. Store the offset, method, confidence, and any manual correction.
+---
 
-Do not rely solely on file creation times: camera clocks may be wrong, time zones may differ, and recording systems may start files at different times.
+## 10. Implementation roadmap (production)
 
-A provisional pilot target is to achieve synchronization within approximately 100–200 ms when possible. The acceptable tolerance should be validated against event type and the frame rates of the actual recordings; a goal event may tolerate a different alignment error than ball-contact attribution.
+**Lock:** do not start the next phase until the prior **exit gate** passes. See `EVAL.md`.
 
-### Installation acceptance checklist
+| Phase | Outcome | Exit gate |
+| ----- | ------- | --------- |
+| **0 — Eval + data** | `scripts/eval/*`, GT template, Roboflow download script, corpus list | `run_detection_smoke.py` exits 0 |
+| **1 — Detect/track** | YOLO+ByteTrack+ball; court format 5v5/6v6/7v7; thumbs | Facility smoke: ball + person tracks in `summary.json` |
+| **2 — Identity** | Kit A/B, throttled OCR, **avatar per player** | Every proposed player has thumb; staff rename works |
+| **3 — Possession** | Vidal-Codina PZ + gain/loss (Δv/Δθ when possible) | Possession segments when ball samples ≥ 80 |
+| **4 — Events + stats** | Pass/shot/goal + touches/poss%/**per-player heatmap** | No shot flood; `score_events.py` runs; heatmaps on player rows |
+| **5 — Product** | Upload → process → review → share (avatars + **player heatmaps**) | One docker/local match completes with share report |
+| **6 (later)** | Homography metres, cam B/C fuse quality, SSO/exports | Separate PRD |
 
-- Both cameras can record a complete match without interruption.
-- Files can be exported without proprietary playback software or unsupported encryption.
-- The court and goal areas are sufficiently visible in the actual recordings.
-- The ball is discernible in representative sections of play.
-- The cameras' time offset can be estimated and manually corrected.
-- The pipeline can decode the selected codecs.
-- Recording starts/stops and missing segments are detected.
-- The facility approves processing and retention of the footage.
-- A full test match has passed ingestion, synchronization and playback checks.
+**Court formats:** `COURT_FORMAT=5v5|6v6|7v7` (field players per side). **Cameras:** 1 now; labels A/B/C ready. **Heatmaps:** image-plane grids per player + match aggregate; always `estimated` until calibrated pitch.
 
-## 5. Workload and cloud cost model
+---
 
-The unknown cloud budget should remain a measured variable. Do not select a fixed monthly infrastructure commitment until the first end-to-end benchmark is complete.
+## 11. Acceptance criteria (production v1 launch)
 
-### A. Expected monthly workload
+Launch is allowed only when **all** are true:
 
-Planning assumptions: one match produces 60 minutes of footage per camera, both cameras record continuously, and average recording bitrate is 4–8 Mbps per camera. These assumptions must be replaced with measurements from the facility.
+1. **Facility self-serve:** upload → process → review → publish → share without engineering.  
+2. **Isolation:** penetration-style checks show no cross-facility data leaks.  
+3. **Jobs:** failures retry safely; stuck jobs alert; reprocess preserves confirmed events.  
+4. **Trust UI:** estimated/confirmed/unavailable always visible on share pages.  
+5. **Identity:** staff can fix kit/number/name; reports update accordingly.  
+6. **Economics:** measured \(C_{\text{match}}\) at target volume leaves room for chosen pricing hypothesis.  
+7. **Legal/privacy:** retention, consent language, and deletion path agreed with facility.  
+8. **Eval:** held-out match set exists; per-class metrics published internally before any auto-accept.
 
-### Monthly workload calculator
+---
 
-Matches per month
+## 12. Risks and mitigations
 
-### 25
+| Risk | Impact | Mitigation |
+| ---- | ------ | ---------- |
+| Ball invisible on wide CCTV | Broken shot/goal/possession | Ball-coverage meter; tune detector; camera guidance |
+| Jersey OCR fails | Weak shirt numbers | Kit clustering + staff rename; never block publish |
+| CPU-only processing | Slow / costly UX | On-demand GPU; documented stride trade-offs; queue SLAs |
+| Over-trust of heuristics | Bad player reputation | Labels + review gate + audit |
+| Cost spikes (retries, egress) | Margin failure | Spend ceilings, proxies, retention |
+| Sync drift (2-cam) | Double-count / wrong fuse | Manual offset + mid-match validation |
 
-10
+---
 
-30
+## 13. Success metrics (product)
 
-50
+| Metric | Why |
+| ------ | --- |
+| Matches processed / facility / month | Adoption |
+| Median staff review minutes / match | Ops scalability |
+| % events confirmed vs rejected | Model + UI quality |
+| Share-link opens / match | Downstream value |
+| Job success rate (no engineer) | Production readiness |
+| Gross margin after variable cloud + review | Business viability |
 
-Recording minutes per camera
+---
 
-### 60
+## 14. Recommendation
 
-40 min
+**Ship production v1 as a hardened, multi-tenant version of the current CourtLens pipeline:** reliable upload → GPU-accelerated track/identity/events → staff review → labelled publish/share — with ops, cost, and privacy controls.
 
-60 min
+Do **not** expand into live analytics, full Opta taxonomy, or calibrated metres until §11 acceptance criteria and §5.2 quality gates are met for the core loop.
 
-90 min
-
-Average bitrate per camera
-
-### 6 Mbps
-
-2 Mbps
-
-6
-
-10 Mbps
-
-Retention period
-
-### 30 days
-
-7 days
-
-30 days
-
-90 days
-
-New raw footage/month
-
-# 135 GB
-
-Approx. raw storage at steady state\*
-
-# 135 GB
-
-\*Assumes evenly distributed uploads, no extra proxies or clips, and a retention window expressed in 30-day months. Decimal GB is used; actual container overhead and bitrate variation will change the totals.
-
-For the midpoint scenario of 25 matches, 60 minutes, and 6 Mbps per camera, raw uploads are approximately 135 GB/month. At 50 matches, 90 minutes, and 10 Mbps, uploads rise to about 675 GB/month. Proxies, clips, retries and longer retention add to storage and transfer.
-
-### B. Cost model
-
-Use the following model for every match:
-
-\\[ \begin{aligned} C\_{\text{match}} ={}& C\_{\text{inference}} + C\_{\text{media}}\\\ &+ C\_{\text{storage}} + C\_{\text{delivery}}\\\ &+ C\_{\text{review}} + C\_{\text{overhead}} \end{aligned} \\]
-
-Where:
-
-- Inference: GPU worker time, model loading, and CPU preprocessing.
-- Media: upload processing, transcoding, synchronization and clip generation.
-- Storage: original footage, proxies, clips, model artifacts and logs.
-- Delivery: playback and downloads, especially repeated full-match viewing.
-- Review: staff time spent confirming or correcting events.
-- Overhead: database, queue, monitoring, backups, retries and idle capacity.
-
-A practical compute estimate is:
-
-\\[ C\_{\text{inference}} = H\_{\text{GPU per match}} \times R\_{\text{GPU/hour}} \\]
-
-Measure GPU hours using the actual models, resolution, frame sampling, and two-camera concurrency. Benchmarking a single still image is not sufficient.
-
-### C. Illustrative planning scenarios
-
-The following are initial budget envelopes for planning, not vendor quotes or measured predictions. They assume on-demand compute, limited retention, a small managed application stack, and a pilot that is still being optimized.
-
-| Monthly facility volume | Early-stage cloud envelope | Main risk                                        |
-| ----------------------- | -------------------------- | ------------------------------------------------ |
-| 10 matches              | $50–$200/month             | Minimum managed-service costs dominate           |
-| 25 matches              | $75–$350/month             | Inference efficiency and media delivery          |
-| 50 matches              | $125–$600/month            | GPU utilization, retries, retention and playback |
-
-These envelopes exclude dedicated installation hardware, taxes, engineering salaries, and substantial human review labor. They could be exceeded if models require expensive GPU time, videos are repeatedly downloaded, or storage is retained indefinitely. They could also be lower after optimization and credits. Do not present these figures to a facility as a guaranteed price.
-
-### D. Cost-control decisions
-
-1. Use on-demand GPU workers, not a continuously running GPU instance.
-2. Process the two camera feeds in parallel only if benchmarks show the throughput gain justifies the GPU cost.
-3. Test 5, 10 and 15 FPS sampling on representative footage before selecting a default.
-4. Cache intermediate results by video checksum, model version and configuration.
-5. Retry only failed stages, not the entire match pipeline.
-6. Generate low-resolution proxies for review; create full-quality clips only when needed.
-7. Apply explicit retention defaults and a deletion workflow for original recordings.
-8. Track processing minutes, GPU seconds, storage GB-days, egress, retries and staff review minutes per match.
-9. Set a per-match spending threshold and stop or queue jobs that exceed it pending investigation.
-
-### E. Business-model decision
-
-Pricing remains undecided. Test per-match pricing first as a hypothesis, while comparing it against a facility subscription. With 10–50 matches per month, per-match pricing aligns payment with usage, while a subscription may make revenue more predictable for facilities with regular volume.
-
-Calculate gross margin only after including variable cloud costs and human review:
-
-\\[ \text{Gross margin} = \frac{\text{Revenue} - \text{Variable cost}}{\text{Revenue}}\times100 \\]
-
-The facility pilot should reveal whether customers pay for the analytics, how much staff time the review process consumes, and whether the resulting margin can support the service.
-
-## 6. Implementation plan and realistic workload
-
-For a solo developer or small team, a narrow controlled beta is plausible in 12–16 weeks, but only if existing models are usable on the footage. Reliable cross-camera identity resolution, ball tracking, and event attribution may take substantially longer. This estimate assumes one full-time technical owner, some part-time product/QA help, and access to a facility for testing.
-
-| Phase                  | Duration    | Deliverable and exit gate                                                                                      |
-| ---------------------- | ----------- | -------------------------------------------------------------------------------------------------------------- |
-| 0. Feasibility         | Weeks 1–2   | Test recordings from both cameras; prove decoding, sync, player/ball visibility and basic inference throughput |
-| 1. Facility foundation | Weeks 3–5   | Accounts, roster, match creation, uploads, private storage, job tracking and retention                         |
-| 2. Vision pipeline     | Weeks 6–8   | Player detections/tracks, camera-specific IDs, roster mapping and manual correction                            |
-| 3. Events and review   | Weeks 9–11  | Candidate goals/shots/passes, event clips, review UI, canonical events and basic statistics                    |
-| 4. Controlled pilot    | Weeks 12–14 | Run real matches end-to-end, track quality/cost, fix critical failure modes                                    |
-| 5. Hardening           | Weeks 15–16 | Reliability, security, report polish, pilot feedback and go/no-go decision                                     |
-
-The schedule is a planning baseline, not a promise. Do not start full product implementation before Phase 0 has passed. If ball visibility or player identity is inadequate, revise the capture setup or narrow the MVP.
-
-### Team and effort estimate
-
-A lean implementation is roughly 16–24 person-weeks of engineering effort, plus facility coordination, model evaluation and pilot support. This is a range because model reuse and footage quality dominate the uncertainty.
-
-- Product/full-stack engineering: approximately 8–12 person-weeks.
-- Computer vision and video pipeline: approximately 6–10 person-weeks.
-- QA, security, deployment and operational tooling: approximately 2–4 person-weeks.
-- Facility setup, annotation and match review: additional part-time work throughout.
-
-One person can cover several roles, but the calendar will expand if the developer is also responsible for all data annotation, installation, support and product design.
-
-## 7. Facility pilot plan
-
-Run the first pilot with one cooperative futsal facility, two existing cameras, and real match recordings. The pilot is primarily a feasibility and willingness-to-pay experiment—not a broad commercial launch.
-
-### Pilot stages
-
-1. Week 1 — Camera and footage audit
-
-   Collect 2–3 representative recordings, including fast play, crowded goal areas, occlusions, and both halves. Confirm export access, image quality, synchronization and recording completeness.
-2. Weeks 2–3 — Ground-truth dataset
-
-   Manually annotate a small set of full sequences and event clips. Record goals, shots, selected passes, visible player identities, and ambiguous cases. Split evaluation data by match—not by randomly mixing frames from the same match.
-3. Weeks 4–6 — End-to-end prototype
-
-   Process both camera recordings, generate tracks and event candidates, provide roster correction, and publish a basic report. These are overlapping engineering activities, not additional weeks on top of the implementation schedule.
-4. Weeks 7–10 — Shadow operation
-
-   Process real matches without relying on the AI output for official results. Staff compare AI predictions with manually verified outcomes and log failures, processing time and correction effort.
-5. Weeks 11–14 — Limited user pilot
-
-   Let facility staff use the review and reporting workflow. Test whether players value the output, whether staff can complete reviews quickly, and whether the facility will pay.
-
-### Pilot success criteria
-
-Use the first dataset to establish the measurement protocol, then agree on numeric thresholds before judging the model. Suggested initial gates:
-
-| Dimension       | Measurement                                                  | Go/no-go question                                         |
-| --------------- | ------------------------------------------------------------ | --------------------------------------------------------- |
-| Capture         | Usable footage percentage, missing segments, ball visibility | Can the existing cameras support the intended stats?      |
-| Synchronization | Offset error at start, middle and end                        | Can the two views be aligned reliably?                    |
-| Tracking        | Track continuity, identity switches, player coverage         | Can staff follow players through realistic occlusions?    |
-| Events          | Precision and recall by event type                           | Are goals, shots and passes accurate enough to be useful? |
-| Identity        | Correct roster attribution and unknown-player rate           | Can reports be trusted at player level?                   |
-| Review          | Human correction minutes per match                           | Can the review workflow scale to 50 matches monthly?      |
-| Operations      | Processing time, failed jobs, retries and cost per match     | Can a match be processed economically and reliably?       |
-| Commercial      | Facility usage, repeat usage, willingness to pay             | Is this solving a sufficiently valuable problem?          |
-
-Do not use a single overall accuracy score. A system that detects many events but assigns them to the wrong player may produce attractive yet misleading player reports. Report results separately for goals, shots, passes and identity attribution.
-
-Pilot gate: continue to broader release only when the capture pipeline is stable, the core events meet agreed quality thresholds, staff review is manageable, and projected unit economics work at the facility's expected match volume.
-
-## 8. Final MVP backlog
-
-The backlog below is ordered by dependency. Build the earliest items first; do not start advanced statistics while ingestion, synchronization and identity remain unreliable.
-
-## Implementation checklist
-
-0 / 30 complete
-
-### A. Facility and access
-
-Facility workspace and staff authentication
-
-Facility-scoped roles and permissions
-
-Create matches, teams, roster and shirt-number mapping
-
-Match status, ownership and deletion policy
-
-### B. Video ingestion
-
-Upload two recordings using signed URLs
-
-Validate codec, duration, frame rate and resolution
-
-Private object storage and low-resolution review proxies
-
-Processing job state, progress, retry and cancellation
-
-Camera sync offset, confidence and manual adjustment
-
-Detect incomplete or incompatible recordings
-
-### C. Vision and identity
-
-Run player detection and per-camera tracking
-
-Evaluate ball detection on real match footage
-
-Map tracks to roster entries with manual correction
-
-Preserve unknown-player and uncertain-identity states
-
-Record model versions, confidence and source evidence
-
-### D. Events and review
-
-Generate candidate goal and shot events
-
-Generate limited pass candidates where quality allows
-
-Deduplicate events observed by both cameras
-
-Review timeline with evidence clips and accept/reject/edit actions
-
-Maintain review audit trail and preserve corrections
-
-### E. Reports and sharing
-
-Match dashboard from canonical events
-
-Player reports with attribution confidence
-
-Event-based clip generation and playback
-
-Share reports/clips with authorized users
-
-Clearly label estimates, confirmed events and unavailable metrics
-
-### F. Operations and launch
-
-Per-match compute, storage and review cost tracking
-
-Job logs, error reporting and operational alerts
-
-Retention enforcement and deletion verification
-
-Evaluation dataset and per-event quality report
-
-Facility pilot onboarding and feedback collection
-
-Reset checklistCopy backlog
-
-## 9. Unresolved technical blockers
-
-These are the items that must be investigated before committing to full MVP delivery.
-
-Blocker 1 — Suitability of existing camera footage
-
-Critical
-
-Security footage may not capture the ball, jersey numbers, or distant players clearly enough. Low resolution, blur, glare and occlusion can invalidate downstream analytics.
-
-Resolution: test real footage before model selection or product build-out. If needed, adjust camera settings, reposition cameras, or narrow the supported stats.
-
-Blocker 2 — Partial-overlap cross-camera identity
-
-A player can disappear from one view and appear in the other. Similar uniforms and partial visibility make identity matching difficult. Shirt numbers may not be visible consistently.
-
-Resolution: use camera-specific tracks, roster mapping and manual identity correction first. Do not promise seamless cross-camera re-identification in P0.
-
-Blocker 3 — Camera synchronization and drift
-
-Existing cameras may have unsynchronized clocks or export timestamps. A fixed initial offset may not remain accurate throughout the match.
-
-Resolution: test offset estimation at multiple points in a full recording and support manual correction. If reliable sync is impossible, treat the camera feeds as independent evidence rather than assuming frame-level alignment.
-
-Blocker 4 — Event attribution and evaluation data
-
-A detected player or ball does not automatically establish who passed, shot, scored or assisted. These labels require event-level ground truth.
-
-Resolution: manually annotate representative matches, evaluate each event type separately, and keep uncertain attributions reviewable. Do not publish fabricated precision.
-
-Blocker 5 — Actual cloud cost and throughput
-
-GPU hours per match, model loading overhead, frame-sampling requirements and retry rates are unknown.
-
-Resolution: benchmark two full camera feeds on the intended pipeline. Record actual processing time and cost before committing to pricing or a monthly budget.
-
-### Additional launch dependencies
-
-- Footage permission: facility ownership does not automatically resolve every privacy or player-consent obligation. Confirm applicable requirements, permitted use, retention and deletion before launch.
-- Existing-camera export: verify the facility can export usable recordings in a supported format without manual work that becomes a bottleneck.
-- Operational review: estimate the human time required to correct identities and event labels. If each match needs extensive manual work, the economics may not support the proposed service.
-- Statistics definitions: locked for MVP in `ARCHITECTURE.md` §4 (pass / shot / goal / player-wise attribution). Disputed or invisible events stay `estimated` or `unavailable` until staff confirm or reject.
-
-## 10. Final recommendation
-
-Proceed with Phase 0 only as the immediate commitment.
-
-1. Obtain representative two-camera footage from the target facility.
-2. Test decoding, synchronization, ball visibility, player tracking and inference speed.
-3. Annotate a small evaluation dataset.
-4. Measure quality and cost on full matches.
-5. Only then lock the MVP model choices, numerical acceptance thresholds, hosting provider and commercial offer.
-
-The best first product is not a complete futsal intelligence platform. It is a dependable workflow that turns two facility-owned recordings into reviewable goals, shots, selected passes, roster-linked player reports and useful clips. Advanced possession, defensive analytics, movement maps and live analysis should follow only after the core pipeline proves trustworthy and economically viable.
+Advanced features (homography, defensive stats, SSO, exports) follow in P1 once unit economics and trust labels hold on real facility volume.

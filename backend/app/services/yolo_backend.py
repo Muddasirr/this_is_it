@@ -1,4 +1,4 @@
-"""Pretrained YOLO detection + ByteTrack tracking (Ultralytics)."""
+"""Pretrained YOLO detection + BoT-SORT (default) / ByteTrack + OSNet ReID."""
 
 from __future__ import annotations
 
@@ -22,10 +22,12 @@ SPORTS_BALL = 32
 MAX_PERSON_SERIES = 400
 MAX_BALL_SERIES = 2000
 
+_CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
+
 
 class YoloTrackBackend(VisionBackend):
-    name = "yolov8n-bytetrack"
-    version = "0.3.0"
+    name = "yolov8n-botsort-osnet"
+    version = "0.4.0"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -35,8 +37,21 @@ class YoloTrackBackend(VisionBackend):
         self.conf = settings.vision_conf
         self.imgsz = settings.vision_imgsz
         self.max_frames = settings.vision_max_frames  # 0 = full video
+        self.tracker_name = (settings.vision_tracker or "botsort").strip().lower()
+        self.reid_on = bool(getattr(settings, "vision_reid", True))
+        self.reid_every = max(1, int(getattr(settings, "vision_reid_every", 3) or 3))
         self._model = None
+        self._coco_ball_model = None
+        self._class_map: dict[int, str] | None = None
         self.last_run_stats: dict[str, Any] = {}
+
+    def _tracker_cfg(self) -> str:
+        name = self.tracker_name if self.tracker_name in {"botsort", "bytetrack"} else "botsort"
+        path = _CFG_DIR / f"{name}.yaml"
+        if path.is_file():
+            return str(path)
+        # Fall back to Ultralytics built-in name
+        return f"{name}.yaml"
 
     def _load(self):
         if self._model is not None:
@@ -45,13 +60,32 @@ class YoloTrackBackend(VisionBackend):
 
         logger.info("Loading YOLO model %s on %s", self.model_name, self.device)
         self._model = YOLO(self.model_name)
+        self._class_map = _build_class_map(self._model)
         return self._model
+
+    def _load_coco_ball(self):
+        """COCO yolov8n for tiny-ball retry when primary is a futsal fine-tune."""
+        if self._coco_ball_model is not None:
+            return self._coco_ball_model
+        from ultralytics import YOLO
+
+        logger.info("Loading COCO ball fallback yolov8n.pt on %s", self.device)
+        self._coco_ball_model = YOLO("yolov8n.pt")
+        return self._coco_ball_model
 
     def detect_and_track(self, video_path: str, camera_label: str) -> list[Detection]:
         import cv2
         import numpy as np
 
         model = self._load()
+        class_map: dict[int, str] = self._class_map or {
+            PERSON: "person",
+            SPORTS_BALL: "sports_ball",
+        }
+        track_classes = sorted(class_map.keys())
+        is_coco = PERSON in class_map and SPORTS_BALL in class_map and class_map.get(PERSON) == "person"
+        # Futsal fine-tunes often can't see the ball — keep a COCO sports_ball retry.
+        need_coco_ball = not is_coco
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
@@ -62,25 +96,35 @@ class YoloTrackBackend(VisionBackend):
         person_tracks: dict[int, list[dict[str, Any]]] = defaultdict(list)
         color_sums: dict[int, Any] = {}
         color_counts: dict[int, int] = defaultdict(int)
+        reid_embs: dict[int, Any] = {}
+        jersey_hsv_sums: dict[int, list[dict]] = defaultdict(list)
         jersey_votes: dict[int, list[tuple[int, float]]] = defaultdict(list)
         best_thumbs: dict[int, tuple[float, str]] = {}
         ball_hits = 0
         frames_processed = 0
+        person_box_total = 0
+        person_box_with_id = 0
         t0 = time.perf_counter()
         frame_idx = 0
-        # With stride 15, keep OCR rare — full jersey OCR is expensive on CPU
-        ocr_every = max(8, 48 // max(1, self.frame_stride))
+        from app.services.jersey_ocr import jersey_ocr_enabled, read_jersey_number
+
+        ocr_on = jersey_ocr_enabled()
+        ocr_every = max(90, 450 // max(1, self.frame_stride))
+        ball_every = 1
+        tracker_cfg = self._tracker_cfg()
         thumb_dir = Path(tempfile.gettempdir()) / "courtlens_thumbs" / camera_label
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             while True:
+                if frame_idx % self.frame_stride != 0:
+                    if not cap.grab():
+                        break
+                    frame_idx += 1
+                    continue
                 ok, frame = cap.read()
                 if not ok:
                     break
-                if frame_idx % self.frame_stride != 0:
-                    frame_idx += 1
-                    continue
                 if self.max_frames and frames_processed >= self.max_frames:
                     break
 
@@ -90,44 +134,48 @@ class YoloTrackBackend(VisionBackend):
                     conf=self.conf,
                     imgsz=self.imgsz,
                     device=self.device,
-                    classes=[PERSON, SPORTS_BALL],
+                    classes=track_classes,
+                    tracker=tracker_cfg,
                     verbose=False,
                 )
                 frames_processed += 1
                 ts_ms = int((frame_idx / fps) * 1000)
                 result = results[0]
+                frame_h = float(frame.shape[0])
+                frame_w = float(frame.shape[1])
+                ball_seen_this_frame = False
+                ocr_budget = 1 if (ocr_on and frames_processed % ocr_every == 0) else 0
+                do_reid = self.reid_on and (frames_processed % self.reid_every == 0)
+                reid_boxes: list[list[float]] = []
+                reid_tids: list[int] = []
 
-                if result.boxes is None or len(result.boxes) == 0:
-                    frame_idx += 1
-                    continue
+                if result.boxes is not None and len(result.boxes) > 0:
+                    boxes = result.boxes
+                    ids = boxes.id
+                    for i in range(len(boxes)):
+                        cls_id = int(boxes.cls[i].item())
+                        conf = float(boxes.conf[i].item())
+                        xyxy = boxes.xyxy[i].tolist()
+                        tid = _safe_track_id(ids, i)
 
-                boxes = result.boxes
-                ids = boxes.id
-                for i in range(len(boxes)):
-                    cls_id = int(boxes.cls[i].item())
-                    conf = float(boxes.conf[i].item())
-                    xyxy = boxes.xyxy[i].tolist()
-                    if cls_id == SPORTS_BALL:
-                        ball_hits += 1
-                    if ids is None:
-                        continue
-                    tid = int(ids[i].item())
-                    obs = {
-                        "ts_ms": ts_ms,
-                        "confidence": conf,
-                        "bbox": {
-                            "x1": xyxy[0],
-                            "y1": xyxy[1],
-                            "x2": xyxy[2],
-                            "y2": xyxy[3],
-                        },
-                        "frame_h": float(frame.shape[0]),
-                        "frame_w": float(frame.shape[1]),
-                        "class_name": "sports_ball" if cls_id == SPORTS_BALL else "person",
-                    }
-                    if cls_id == SPORTS_BALL:
-                        person_tracks[tid + 100000].append(obs)
-                    elif cls_id == PERSON:
+                        mapped = class_map.get(cls_id)
+                        if mapped == "sports_ball":
+                            # Balls often lack tracker IDs — still keep the observation.
+                            ball_hits += 1
+                            ball_seen_this_frame = True
+                            person_tracks[100000].append(
+                                _obs(ts_ms, conf, xyxy, frame_h, frame_w, "sports_ball")
+                            )
+                            continue
+
+                        if mapped != "person":
+                            continue
+                        person_box_total += 1
+                        if tid is None:
+                            continue
+                        person_box_with_id += 1
+
+                        obs = _obs(ts_ms, conf, xyxy, frame_h, frame_w, "person")
                         person_tracks[tid].append(obs)
                         hist = _upper_body_hsv_hist(frame, xyxy)
                         if hist is not None:
@@ -136,6 +184,12 @@ class YoloTrackBackend(VisionBackend):
                             else:
                                 color_sums[tid] = color_sums[tid] + hist
                             color_counts[tid] += 1
+                        jhsv = _jersey_hsv_for_box(frame, xyxy)
+                        if jhsv is not None:
+                            jersey_hsv_sums[tid].append(jhsv)
+                        if do_reid:
+                            reid_boxes.append(xyxy)
+                            reid_tids.append(tid)
                         # Best in-match crop for avatar (prefer large, confident box)
                         bw = max(1.0, xyxy[2] - xyxy[0])
                         bh = max(1.0, xyxy[3] - xyxy[1])
@@ -150,13 +204,63 @@ class YoloTrackBackend(VisionBackend):
                                 path = str(thumb_dir / f"p{tid}.jpg")
                                 cv2.imwrite(path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                                 best_thumbs[tid] = (thumb_score, path)
-                        # Occasional jersey OCR when box is large enough
-                        if frames_processed % ocr_every == 0 and (xyxy[2] - xyxy[0]) >= 36:
-                            from app.services.jersey_ocr import read_jersey_number
-
+                        if ocr_budget > 0 and bw >= 36 and len(jersey_votes.get(tid, [])) < 2:
                             hit = read_jersey_number(frame, xyxy)
+                            ocr_budget -= 1
                             if hit:
                                 jersey_votes[tid].append((int(hit["number"]), float(hit["confidence"])))
+
+                    if do_reid and reid_boxes:
+                        try:
+                            from app.services.reid import embed_frame_boxes, ema_update
+
+                            embs = embed_frame_boxes(frame, reid_boxes, device=self.device)
+                            for tid, emb in zip(reid_tids, embs):
+                                if emb is None:
+                                    continue
+                                reid_embs[tid] = ema_update(reid_embs.get(tid), emb)
+                        except Exception as e:
+                            logger.warning("ReID embed failed: %s", e)
+
+                # Futsal balls are tiny on wide CCTV — sparse second pass (not every frame)
+                if not ball_seen_this_frame and frames_processed % ball_every == 0:
+                    ball_imgsz = max(self.imgsz, 960)
+                    ball_conf = min(self.conf, 0.12)
+                    ball_cls_ids = [cid for cid, name in class_map.items() if name == "sports_ball"]
+                    ball_model = model
+                    if need_coco_ball:
+                        ball_model = self._load_coco_ball()
+                        ball_cls_ids = [SPORTS_BALL]
+                    if ball_cls_ids:
+                        ball_results = ball_model.predict(
+                            frame,
+                            conf=ball_conf,
+                            imgsz=ball_imgsz,
+                            device=self.device,
+                            classes=ball_cls_ids,
+                            verbose=False,
+                        )
+                        bboxes = ball_results[0].boxes
+                        if bboxes is not None and len(bboxes) > 0:
+                            best_i = int(bboxes.conf.argmax().item())
+                            conf = float(bboxes.conf[best_i].item())
+                            xyxy = bboxes.xyxy[best_i].tolist()
+                            ball_hits += 1
+                            person_tracks[100000].append(
+                                _obs(ts_ms, conf, xyxy, frame_h, frame_w, "sports_ball")
+                            )
+
+                if frames_processed % 50 == 0:
+                    elapsed_so_far = time.perf_counter() - t0
+                    pps = frames_processed / elapsed_so_far if elapsed_so_far else 0
+                    logger.info(
+                        "YOLO progress frames=%s ball_hits=%s %.1f fps elapsed=%.0fs",
+                        frames_processed,
+                        ball_hits,
+                        pps,
+                        elapsed_so_far,
+                    )
+
                 frame_idx += 1
         finally:
             cap.release()
@@ -188,6 +292,14 @@ class YoloTrackBackend(VisionBackend):
             if class_name == "person" and tid in best_thumbs:
                 feats["thumb_path"] = best_thumbs[tid][1]
                 feats["thumb_score"] = float(best_thumbs[tid][0])
+            if class_name == "person" and tid in reid_embs and reid_embs[tid] is not None:
+                feats["reid_emb"] = np.asarray(reid_embs[tid], dtype=float).tolist()
+            if class_name == "person" and jersey_hsv_sums.get(tid):
+                from app.services.kit_color import mean_descriptor
+
+                jd = mean_descriptor(jersey_hsv_sums[tid])
+                if jd:
+                    feats["jersey_hsv"] = jd
 
             detections.append(
                 Detection(
@@ -212,10 +324,25 @@ class YoloTrackBackend(VisionBackend):
             )
 
         video_seconds = (total_frames / fps) if total_frames and fps else 0
+        from app.services.court_format import court_settings
+
+        person_dets = [d for d in detections if d.class_name == "person"]
+        person_pts = sum(len(d.bbox_series or []) for d in person_dets)
+        ball_coverage_pct = round(100.0 * ball_hits / max(1, frames_processed), 2)
+        id_rate = (
+            round(100.0 * person_box_with_id / max(1, person_box_total), 2) if person_box_total else 0.0
+        )
         self.last_run_stats = {
             "camera_label": camera_label,
             "model": self.model_name,
             "device": self.device,
+            "tracker": self.tracker_name,
+            "tracker_cfg": tracker_cfg,
+            "reid": self.reid_on,
+            "reid_tracks": sum(1 for d in person_dets if (d.features or {}).get("reid_emb")),
+            "person_boxes": person_box_total,
+            "person_boxes_with_id": person_box_with_id,
+            "id_assignment_pct": id_rate,
             "fps_source": round(fps, 3),
             "total_frames": total_frames,
             "frames_processed": frames_processed,
@@ -223,16 +350,44 @@ class YoloTrackBackend(VisionBackend):
             "elapsed_sec": round(elapsed, 3),
             "processing_fps": round(frames_processed / elapsed, 3) if elapsed else 0,
             "realtime_factor": round(video_seconds / elapsed, 3) if elapsed and video_seconds else None,
-            "person_tracks": sum(1 for d in detections if d.class_name == "person"),
+            "person_tracks": len(person_dets),
+            "person_bbox_samples": person_pts,
             "ball_tracks": sum(1 for d in detections if d.class_name == "sports_ball"),
             "ball_detections": ball_hits,
+            "ball_coverage_pct": ball_coverage_pct,
             "ball_visible": ball_hits > 0,
-            "player_visible": any(d.class_name == "person" for d in detections),
+            "player_visible": bool(person_dets),
+            "thumbs_written": sum(1 for d in person_dets if (d.features or {}).get("thumb_path")),
+            "court_format": court_settings()["format"],
             "video_seconds_probed": round(video_seconds, 2),
             "event_engine": "possession_v1",
             "jersey_ocr_tracks": sum(1 for d in detections if (d.features or {}).get("jersey_number")),
         }
         logger.info("YOLO track done: %s", self.last_run_stats)
+
+        # Futsal fine-tunes often miss facility CCTV (domain shift). Fall back to COCO.
+        if (
+            not person_dets
+            and not getattr(self, "_coco_fallback_attempted", False)
+            and Path(str(self.model_name)).name not in {"yolov8n.pt", "yolo11n.pt", "yolov8s.pt"}
+        ):
+            logger.warning(
+                "No players with %s — falling back to yolov8n.pt for this clip",
+                self.model_name,
+            )
+            self._coco_fallback_attempted = True
+            primary = self.model_name
+            self.model_name = "yolov8n.pt"
+            self._model = None
+            self._class_map = None
+            try:
+                dets = self.detect_and_track(video_path, camera_label)
+                self.last_run_stats["primary_model"] = primary
+                self.last_run_stats["fallback_model"] = "yolov8n.pt"
+                return dets
+            finally:
+                self._coco_fallback_attempted = False
+
         return detections
 
     def infer_events(self, detections: list[Detection], camera_label: str) -> list[EventCandidate]:
@@ -241,10 +396,70 @@ class YoloTrackBackend(VisionBackend):
         return infer_event_candidates(detections, camera_label)
 
 
+def _build_class_map(model) -> dict[int, str]:
+    """Map detector class ids → CourtLens person|sports_ball (skip referee)."""
+    names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+    out: dict[int, str] = {}
+    for cid, name in names.items():
+        n = str(name).strip().lower().replace(" ", "_")
+        if n in {"person", "player", "goalkeeper", "gk"}:
+            out[int(cid)] = "person"
+        elif n in {"sports_ball", "sportsball", "ball", "football", "soccer_ball"}:
+            out[int(cid)] = "sports_ball"
+        # referee intentionally omitted
+    if not out:
+        out = {PERSON: "person", SPORTS_BALL: "sports_ball"}
+    logger.info("YOLO class map: %s", {names.get(k, k): v for k, v in out.items()})
+    return out
+
+
 def _majority_jersey(votes: list[tuple[int, float]]) -> tuple[int | None, float]:
     from app.services.jersey_ocr import prefer_jersey_number
 
     return prefer_jersey_number(votes)
+
+
+def _safe_track_id(ids, index: int) -> int | None:
+    """ByteTrack often leaves sports_ball (and some persons) without an id."""
+    if ids is None:
+        return None
+    try:
+        val = ids[index].item()
+    except Exception:
+        return None
+    if val is None:
+        return None
+    try:
+        import math
+
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _obs(
+    ts_ms: int,
+    conf: float,
+    xyxy: list[float],
+    frame_h: float,
+    frame_w: float,
+    class_name: str,
+) -> dict[str, Any]:
+    return {
+        "ts_ms": ts_ms,
+        "confidence": conf,
+        "bbox": {
+            "x1": xyxy[0],
+            "y1": xyxy[1],
+            "x2": xyxy[2],
+            "y2": xyxy[3],
+        },
+        "frame_h": frame_h,
+        "frame_w": frame_w,
+        "class_name": class_name,
+    }
 
 
 def _downsample_series(obs: list[dict[str, Any]], max_n: int) -> list[dict[str, Any]]:
@@ -258,6 +473,7 @@ def _downsample_series(obs: list[dict[str, Any]], max_n: int) -> list[dict[str, 
 
 
 def _upper_body_hsv_hist(frame, xyxy: list[float]):
+    """Legacy 8×8 H×S hist (compat). Prefer jersey_hsv via kit_color."""
     import cv2
     import numpy as np
 
@@ -267,14 +483,22 @@ def _upper_body_hsv_hist(frame, xyxy: list[float]):
     x2, y2 = min(w - 1, x2), min(h - 1, y2)
     if x2 <= x1 + 2 or y2 <= y1 + 2:
         return None
-    # jersey-ish upper half of the person box
     y_mid = y1 + max(1, (y2 - y1) // 2)
     crop = frame[y1:y_mid, x1:x2]
     if crop.size == 0:
         return None
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
+    # Mask green pitch so grass doesn't own the histogram
+    green = cv2.inRange(hsv, (35, 40, 40), (95, 255, 255))
+    mask = cv2.bitwise_not(green)
+    hist = cv2.calcHist([hsv], [0, 1], mask, [8, 8], [0, 180, 0, 256])
     return hist.flatten().astype(np.float32)
+
+
+def _jersey_hsv_for_box(frame, xyxy: list[float]) -> dict | None:
+    from app.services.kit_color import descriptor_from_frame_box
+
+    return descriptor_from_frame_box(frame, xyxy)
 
 
 def run_feasibility_on_video(video_path: str, camera_label: str = "A") -> dict[str, Any]:
