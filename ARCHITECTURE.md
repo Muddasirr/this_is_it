@@ -10,7 +10,7 @@ This document is the **technical source of truth** for how CourtLens produces pl
 
 ## 1. Design principles (production)
 
-1. **League logic, facility cameras** — Same spine as pro leagues (dense tracks → possession → events → identity → human QA). Capture is 1–2 fixed CCTV or uploaded match video, not a 16–20 camera optical install.
+1. **League logic, facility cameras** — Same spine as pro leagues (dense tracks → possession → events → identity → human QA). Capture is 1–4 fixed CCTV angles (A–D) or uploaded match video, not a 16–20 camera optical install.
 2. **Canonical truth** — Published stats come only from **canonical events** + track metrics linked through **identity**. Never count raw detections as player stats.
 3. **Labels over false precision** — Every metric is `estimated` | `confirmed` | `unavailable`. Wrong identity is worse than a missing number.
 4. **Staff override wins** — Model proposes; facility staff confirm identity and events before high-stakes publish.
@@ -47,9 +47,9 @@ CourtLens copies this **pipeline shape**, not the stadium hardware.
 | League capability | CourtLens production v1 | Later (P1+) |
 | ----------------- | ----------------------- | ----------- |
 | Calibrated pitch metres | Image-plane units + relative distance; optional homography | Full court calibration |
-| Multi-view re-ID | Per-camera tracks + appearance; staff merge | Cross-camera re-ID |
+| Multi-view re-ID | Per-camera clusters linked across angles by kit + shirt + OSNet (one-to-one per camera); staff merge | Learned cross-view re-ID |
 | Jersey OCR | **In pipeline** (Tesseract when available); kit colour always | Stronger OCR / trained reader |
-| Kit / team | HSV upper-body clustering → Kit A / Kit B | Facility-trained kit models |
+| Kit / team | Torso Lab k-means clustering → Kit A / Kit B (refs/outliers → Kit X) | Facility-trained kit models |
 | Event ops room | Facility review UI | Optional ops tooling |
 | Event taxonomy | Pass, shot, goal, assist, dribble | Saves, tackles, set pieces |
 | Live | Deferred | Optional |
@@ -59,27 +59,27 @@ CourtLens copies this **pipeline shape**, not the stadium hardware.
 ## 4. End-to-end processing architecture
 
 ```
-Upload Camera A [(optional) Camera B]
+Upload Camera A [(optional) Cameras B, C, D]
     → Ingest / validate (FFmpeg probe)
     → Normalize (proxy for review; store original)
-    → Synchronize (2-cam offset estimate + manual fix)
+    → Synchronize (offset per camera onto A: audio onset xcorr → motion-energy xcorr → staff fix)
     → Detect & track (YOLO + BoT-SORT; persons + sports_ball)
          · dense bbox_series (ts_ms, xyxy, frame_w/h, conf)
          · ball kept even without tracker ID (synthetic ball track)
          · secondary ball `predict` at conf≤0.12 / imgsz≥1280 when track miss
          · OSNet ReID embeddings (EMA per track) when VISION_REID=1
-         · upper-body HSV colour_hist
+         · upper-body HSV colour_hist (fragment merge)
          · jersey OCR samples → majority number
          · best in-match thumb crop per track
     → Resolve identity
          · merge fragments by ReID cosine, then colour
-         · assign Kit A / Kit B by hue
+         · assign Kit A / Kit B by torso Lab k-means (refs / outliers → Kit X)
          · fuse OCR shirt numbers (unique within kit)
          · create/update roster → TrackIdentityLink
          · staff rename / reassign in UI
     → Infer events (possession-centric)
          · pass / shot / goal candidates + roles
-    → Fuse (dedupe type + time across cameras)
+    → Fuse (same type within 1.5 s on the synced timeline, ≤1 obs per camera, players must agree)
     → Stats (match_stats from canonical events + tracks)
     → Review gate (clips; estimated → confirmed)
     → Publish (dashboard, player reports, share token)
@@ -95,11 +95,11 @@ Upload Camera A [(optional) Camera B]
 | Queue | Redis + durable job rows |
 | Storage | Local (dev) or private S3-compatible (prod) |
 | Workers | `app.workers.runner` — media (CPU) + vision (GPU when `VISION_DEVICE=0`) |
-| Detection | Ultralytics YOLOv8n + BoT-SORT (default) / ByteTrack; OSNet ReID merge (`yolo_backend.py`, `reid.py`) |
+| Detection | Ultralytics YOLO (`yolov5x_football.pt` default, `yolov8n.pt` fallback) + BoT-SORT (default, `VISION_TRACKER`) / ByteTrack; OSNet ReID merge (`yolo_backend.py`, `reid.py`) |
 | Events | `events.py` possession heuristics |
 | Identity | `identity.py` kit + jersey clustering |
 | Stats | `match_stats.py` |
-| Offline GPU batch | `scripts/kaggle/courtlens_offline/` (same logic, no DB) for R&D / overflow batch — **not** the multi-tenant API path |
+| Offline GPU batch | `app.scripts.run_offline` — the real `process_job` on SQLite + local storage; run on Kaggle T4 via `scripts/kaggle/build_kaggle.py` for eval / overflow batch — **not** the multi-tenant API path |
 
 ### Env knobs (vision)
 
@@ -178,21 +178,27 @@ Rejected events never count. UI shows confirmation state per metric.
 
 Same-shirt numbers on opposite kits are allowed (**Kit A #10 ≠ Kit B #10**).
 
-1. **ByteTrack** short-term continuity per camera.  
-2. **Colour:** mean L2-normalised HSV hist of upper-body crops.  
+1. **BoT-SORT** (default; ByteTrack optional) short-term continuity per camera, plus OSNet ReID to merge fragments.  
+2. **Colour:** mean L2-normalised HSV hist of upper-body crops (fragment merge only).  
 3. **Cluster:** merge non-overlapping tracks with cosine colour similarity ≥ threshold.  
-4. **Kit split:** 2-means on dominant hue → Kit A / Kit B.  
+4. **Kit split:** per-player torso jersey colour (grass/skin/white masked, Lab k-means), then match-level k-means (k≤4): two largest distinct clusters → Kit A / Kit B, small clusters (refs, GKs, bibs) → Kit X (`team_assigner.py`; HSV fallback in `kit_color.py`).  
 5. **Jersey:** OCR votes → `prefer_jersey_number` (2-digit preference; anti “10→1”).  
 6. **Roster:** unique shirt within kit; auto-create `Kit A #N` / `Kit B #N` if needed.  
 7. **Avatars:** best in-match crop uploaded for player card.  
 8. **Staff:** rename, reassign track→player; confirmed links beat model proposals.
+
+**Multi-camera (A–D).** The "two tracks at the same time ⇒ two people" rule only holds inside one camera, so:
+
+- Steps 1–3 run **per camera**; the auto-player cap applies per camera.
+- Step 4 (kits) runs **jointly** over every camera's clusters so Kit A is the same team on every angle.
+- **Cross-camera link** (`link_clusters_across_cameras`): the camera with the most on-camera time is the reference; every other camera's clusters are matched one-to-one (Hungarian) to reference players. Same kit is required; readable different shirts are never linked; same kit + same shirt wins; otherwise OSNet cosine ≥ 0.6 (colour fallback). Unmatched clusters stay separate players for staff to merge.
 
 ---
 
 ## 7. Data model (core)
 
 `facilities`, `facility_users`, `teams`, `players`, `match_rosters`  
-`matches`, `camera_sources`, `video_assets`, `camera_syncs`  
+`matches`, `camera_sources` (A–D), `video_assets`, `camera_syncs` (one offset per camera B–D, latest wins, manual beats auto)  
 `processing_jobs`, `processing_runs`, `model_versions`  
 `player_tracks` (+ `features` JSON: class, bbox_series, color_hist, jersey_*, thumb_*)  
 `track_identity_links`  
@@ -219,7 +225,7 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 2. Identity (kit, OCR, avatar)  
 3. Possession module (`possession.py`)  
 4. Events + stats including **per-player heatmap**  
-5. Product review/share (multi-cam fuse typed for A/B/C)
+5. Product review/share + multi-cam (sync, cross-camera identity, fuse for A–D)
 
 ### Possession contract (Phase 3+)
 
@@ -235,18 +241,21 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 - Share + match UI must allow **per-player** selection (not match-only).  
 - Label: relative camera frame until homography (Phase 6).
 
-### Multi-cam fuse
+### Multi-cam sync + fuse
 
-- `CameraLabel` A | B | C.  
-- Fuse: same `event_type` + time bucket → one canonical event.  
-- v1 production path may run **A only**.
+- `CameraLabel` A | B | C | D. Camera A is the reference clock.  
+- Sync: `canonical_ts = camera_ts + offset_ms[camera]` (`media.estimate_offset_ms`): audio-onset cross-correlation when both files have audio, else motion-energy cross-correlation; confidence < 0.3 ⇒ staff must check. Manual offsets per camera always win.  
+- Fuse (`fuse.group_event_candidates`): same `event_type`, within 1.5 s on the canonical timeline, at most one observation per camera, and resolved players must not disagree. Raw tracker IDs are never compared across cameras. Each canonical event keeps every camera's `event_observation`; evidence clips come from the highest-confidence camera.  
+- Pilot runs **A only**; production courts target 3–4 angles.
 
 ### Eval corpus
 
 - Product: `testing_videos/test_video_2.mp4`.  
 - Stress: other `testing_videos/*` (not product UX claims).  
 - Detection: Roboflow futsal set via `scripts/eval/download_roboflow_futsal.py`.  
-- Commands: `EVAL.md`.
+- DFL Bundesliga 30 s clips (Kaggle `saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv`): tracking / kit-split stress. **No event labels** (the CSV is a file list; the original competition labels are no longer downloadable).  
+- Multi-cam: synthetic 3-camera check on Kaggle (shifted + cropped copies, known offsets) until real multi-angle court footage exists.  
+- GPU runs: Kaggle kernel `muddasirr/courtlens-gpu-eval` runs the real backend. Commands: `EVAL.md`.
 
 ---
 
@@ -259,7 +268,8 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | OCR fails on blurry kits | Kit clustering + staff rename |
 | Heuristic events ≠ Opta | Review gate; never sell as official league feed |
 | CPU-only workers | Slow; production uses GPU workers + documented stride |
-| Kaggle/Colab GPU | R&D / batch overflow only — not multi-tenant SaaS hosting |
+| Kaggle/Colab GPU | Eval / batch overflow only (same code via `run_offline`) — not multi-tenant SaaS hosting |
+| No real multi-angle footage yet | Multi-cam validated synthetically only; record a 3–4 camera pilot match before quality claims |
 
 ---
 
@@ -267,7 +277,7 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 
 | Stage | Upgrade |
 | ----- | ------- |
-| **Now (prod v1)** | YOLO + ByteTrack, kit+OCR identity, possession events, review, share, GPU workers |
+| **Now (prod v1)** | YOLO + BoT-SORT + ReID, kit+OCR identity, possession events, review, share, GPU workers |
 | **Next** | Court homography; stronger ball detector / SAHI; eval harness + auto-accept gates |
 | **Later** | Trained event model on facility annotations; cross-camera re-ID; SSO/exports |
 | **Optional** | Broadcast-grade providers if venues install optical arrays |
@@ -282,14 +292,16 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | Jersey OCR helpers | `backend/app/services/jersey_ocr.py` |
 | Possession (PZ / gain-loss) | `backend/app/services/possession.py` |
 | Possession → pass/shot/goal | `backend/app/services/events.py` |
-| Cross-cam fuse A/B/C | `backend/app/services/fuse.py` |
+| Cross-cam fuse A–D | `backend/app/services/fuse.py` |
+| Camera sync (audio / motion xcorr) | `backend/app/services/media.py` |
+| Cross-camera identity link | `backend/app/services/identity.py` (`link_clusters_across_cameras`) |
 | Court format 5v5/6v6/7v7 | `backend/app/services/court_format.py` |
 | Kit + roster identity | `backend/app/services/identity.py` |
 | Avatars | `backend/app/services/avatars.py` |
 | Match / player stats (+ per-player heatmap) | `backend/app/services/match_stats.py` |
 | Job stages | `backend/app/workers/pipeline.py` |
 | Stats + review API | `backend/app/api/review.py` |
-| Offline GPU batch (Kaggle) | `scripts/kaggle/courtlens_offline/` |
+| Offline / Kaggle run (real pipeline on SQLite) | `backend/app/scripts/run_offline.py`, `scripts/kaggle/build_kaggle.py` |
 | Product requirements | `PRD.md` |
 
 ---

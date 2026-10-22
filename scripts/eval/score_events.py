@@ -16,7 +16,7 @@ def load_pred(path: Path) -> list[dict]:
     out = []
     for e in raw:
         et = e.get("event_type") or e.get("type")
-        ts = e.get("camera_ts_ms", e.get("ts_ms"))
+        ts = e.get("ts_ms", e.get("camera_ts_ms"))  # canonical (A) time first
         if et and ts is not None:
             out.append({"type": et, "ts_ms": int(ts)})
     return out

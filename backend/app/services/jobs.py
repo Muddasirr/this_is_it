@@ -3,19 +3,24 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-import redis
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import Match, ProcessingJob
 from app.models.entities import JobStatus, MatchStatus
 
+if TYPE_CHECKING:
+    import redis
+
 
 QUEUE_NAME = "processing_jobs"
 
 
-def get_redis() -> redis.Redis:
+def get_redis() -> "redis.Redis":
+    import redis  # lazy: offline / Kaggle runs use the DB helpers only
+
     return redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
 
 

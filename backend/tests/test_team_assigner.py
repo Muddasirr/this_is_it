@@ -31,11 +31,12 @@ def test_jersey_bgr_large_crop_does_not_crash():
 def test_assign_kits_kmeans_two_teams_sticky():
     from app.services.team_assigner import TeamAssigner, assign_kits_kmeans
 
+    # Red vs yellow (broadcast DFL-style) — not red vs white
     metas = [
         {"img": _solid_crop((30, 30, 210)), "sticky_id": "p1", "src": "a.jpg"},
         {"img": _solid_crop((25, 25, 200)), "sticky_id": "p2", "src": "b.jpg"},
-        {"img": _solid_crop((210, 210, 210)), "sticky_id": "p3", "src": "c.jpg"},
-        {"img": _solid_crop((200, 200, 205)), "sticky_id": "p4", "src": "d.jpg"},
+        {"img": _solid_crop((40, 210, 220)), "sticky_id": "p3", "src": "c.jpg"},
+        {"img": _solid_crop((35, 200, 210)), "sticky_id": "p4", "src": "d.jpg"},
     ]
     assert assign_kits_kmeans(metas)
     kits = {m["sticky_id"]: m["kit"] for m in metas}
@@ -51,12 +52,27 @@ def test_assign_kits_kmeans_two_teams_sticky():
     assert k1 == k1b
 
 
+def test_assign_kits_separates_yellow_and_red():
+    from app.services.team_assigner import assign_kits_kmeans
+
+    metas = [
+        {"img": _solid_crop((40, 40, 200)), "sticky_id": f"r{i}"} for i in range(4)
+    ] + [
+        {"img": _solid_crop((40, 200, 210)), "sticky_id": f"y{i}"} for i in range(4)
+    ]
+    assert assign_kits_kmeans(metas)
+    red_kits = {m["kit"] for m in metas if m["sticky_id"].startswith("r")}
+    yel_kits = {m["kit"] for m in metas if m["sticky_id"].startswith("y")}
+    assert len(red_kits) == 1 and len(yel_kits) == 1
+    assert red_kits != yel_kits
+
+
 def test_referee_forced_to_x():
     from app.services.team_assigner import assign_kits_kmeans
 
     metas = [
         {"img": _solid_crop((30, 30, 210)), "sticky_id": "p1"},
-        {"img": _solid_crop((210, 210, 210)), "sticky_id": "p2"},
+        {"img": _solid_crop((40, 200, 210)), "sticky_id": "p2"},
         {
             "img": _solid_crop((20, 20, 20)),
             "sticky_id": "ref",
@@ -65,7 +81,6 @@ def test_referee_forced_to_x():
     ]
     assert assign_kits_kmeans(metas)
     assert metas[2]["kit"] == "X"
-
 
 def test_interpolate_ball_fills_gap():
     from app.services.possession import interpolate_bbox_series

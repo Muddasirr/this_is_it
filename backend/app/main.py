@@ -13,17 +13,35 @@ from app.services.storage import ensure_bucket
 logger = logging.getLogger(__name__)
 
 
+_PG_PATCHES = [
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(512)",
+    # Enum values must be added outside a transaction (AUTOCOMMIT below)
+    "ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'dribble'",
+    "ALTER TYPE cameralabel ADD VALUE IF NOT EXISTS 'D'",
+    # Per-camera sync: legacy rows were "B relative to A"
+    "ALTER TABLE camera_syncs ADD COLUMN IF NOT EXISTS camera_label cameralabel NOT NULL DEFAULT 'B'",
+    "ALTER TABLE match_shares ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ",
+]
+
+
+def _patch_postgres_schema() -> None:
+    """Lightweight schema upgrades for existing DBs (create_all won't ALTER)."""
+    from sqlalchemy import text
+
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        for stmt in _PG_PATCHES:
+            try:
+                conn.execute(text(stmt))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Schema patch skipped (%s): %s", stmt, exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     # Lightweight schema upgrades for existing DBs (create_all won't ALTER)
-    try:
-        from sqlalchemy import text
-
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE players ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(512)"))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Schema patch skipped: %s", exc)
+    if engine.dialect.name == "postgresql":
+        _patch_postgres_schema()
     try:
         ensure_bucket()
     except Exception as exc:  # noqa: BLE001

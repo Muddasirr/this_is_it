@@ -69,7 +69,7 @@ def main() -> None:
     # Upload camera A
     size = args.video.stat().st_size
     r = client.post(
-        f"/api/v1/facilities/{facility_id}/matches/{match_id}/uploads",
+        f"/api/v1/facilities/{facility_id}/matches/{match_id}/videos/upload-url",
         headers=headers,
         json={
             "camera_label": "A",
@@ -81,64 +81,121 @@ def main() -> None:
     r.raise_for_status()
     upload = r.json()
     upload_url = upload["upload_url"]
+    # Local storage returns host-relative URLs; rewrite for host→container API.
+    if upload_url.startswith("/"):
+        upload_url = args.api.rstrip("/") + upload_url
     print("uploading", args.video.name, f"{size/1e6:.1f}MB …")
     with args.video.open("rb") as f:
         put = httpx.put(upload_url, content=f, headers={"Content-Type": "video/mp4"}, timeout=600.0)
         put.raise_for_status()
     print("upload ok")
 
-    # Inject detections via in-container helper (avoids CPU re-YOLO)
-    inject = {
-        "match_id": match_id,
-        "detections_path": str(dets_path.resolve()),
-        "events_path": str(events_path.resolve()) if events_path.exists() else None,
-    }
-    inj_file = Path("/tmp") / f"courtlens_inject_{match_id}.json"
-    # Write next to out so docker can see it if mounted; else copy into backend volume via stdin
-    inj_path = args.out / "_inject_request.json"
-    inj_path.write_text(json.dumps(inject, indent=2))
-    print("wrote", inj_path)
-    print(
-        "NEXT: docker compose exec -T api python -m app.scripts.inject_detections "
-        f"{match_id} {dets_path}"
-    )
-    # Prefer direct python import when running inside api container; else shell out
-    sys.path.insert(0, str(ROOT / "backend"))
-    try:
-        from app.core.database import SessionLocal
-        from app.scripts.inject_detections import inject_match_from_files
-
-        db = SessionLocal()
+    # Paths inside the api container (./backend is mounted at /app)
+    dets_in = Path("/app") / dets_path.resolve().relative_to(ROOT / "backend") if str(dets_path.resolve()).startswith(str(ROOT / "backend")) else dets_path
+    ev_in = None
+    if events_path.exists():
         try:
-            share = inject_match_from_files(
-                db,
-                UUID(match_id),
-                dets_path,
-                events_path if events_path.exists() else None,
-                publish=True,
-            )
-            print("SHARE", share)
-        finally:
-            db.close()
-    except Exception as e:
-        print("direct inject failed (run inside api container):", e)
-        print(json.dumps({"match_id": match_id, "facility_id": facility_id, "inject": str(inj_path)}, indent=2))
+            ev_in = Path("/app") / events_path.resolve().relative_to(ROOT / "backend")
+        except ValueError:
+            ev_in = events_path
 
+    inj_path = args.out / "_inject_request.json"
+    inj_path.write_text(
+        json.dumps(
+            {
+                "match_id": match_id,
+                "facility_id": facility_id,
+                "detections_path": str(dets_in),
+                "events_path": str(ev_in) if ev_in else None,
+            },
+            indent=2,
+        )
+    )
+    print("wrote", inj_path)
+
+    # Prefer in-container inject (DB is on the compose network).
+    import subprocess
+
+    cmd = [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "api",
+        "python",
+        "-m",
+        "app.scripts.inject_detections",
+        match_id,
+        str(dets_in),
+    ]
+    if ev_in:
+        cmd.append(str(ev_in))
+    print("running:", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            env={**dict(**{k: v for k, v in __import__("os").environ.items()}), "DOCKER_HOST": "unix:///var/run/docker.sock"},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(proc.stderr)
+            raise SystemExit(proc.returncode)
+    except FileNotFoundError:
+        sys.path.insert(0, str(ROOT / "backend"))
+        try:
+            from app.core.database import SessionLocal
+            from app.scripts.inject_detections import inject_match_from_files
+
+            db = SessionLocal()
+            try:
+                share = inject_match_from_files(
+                    db,
+                    UUID(match_id),
+                    dets_path,
+                    events_path if events_path.exists() else None,
+                    publish=True,
+                )
+                print("SHARE", share)
+            finally:
+                db.close()
+        except Exception as e:
+            print("direct inject failed (run inside api container):", e)
+            print(json.dumps({"match_id": match_id, "facility_id": facility_id, "inject": str(inj_path)}, indent=2))
+            raise
+
+    # Fetch share URL
+    pub = client.post(
+        f"/api/v1/facilities/{facility_id}/matches/{match_id}/publish",
+        headers=headers,
+    )
+    if pub.status_code < 400:
+        body = pub.json()
+        print("UI match:", f"http://localhost:5174/facilities/{facility_id}/matches/{match_id}")
+        print("SHARE", body)
+    else:
+        print("UI match:", f"http://localhost:5174/facilities/{facility_id}/matches/{match_id}")
+        print("publish status", pub.status_code, pub.text[:300])
 
 def _ensure_auth(client: httpx.Client, email: str, password: str) -> str:
     r = client.post("/api/v1/auth/login", json={"email": email, "password": password})
-    if r.status_code == 200:
+    if r.status_code == 200 and "access_token" in r.json():
         return r.json()["access_token"]
     r = client.post(
         "/api/v1/auth/register",
         json={"email": email, "full_name": "Corpus Runner", "password": password},
     )
-    if r.status_code not in (200, 201):
-        # maybe exists
-        r = client.post("/api/v1/auth/login", json={"email": email, "password": password})
+    if r.status_code in (200, 201) and "access_token" in r.json():
+        return r.json()["access_token"]
+    r = client.post("/api/v1/auth/login", json={"email": email, "password": password})
     r.raise_for_status()
-    return r.json()["access_token"]
-
+    body = r.json()
+    if "access_token" not in body:
+        raise SystemExit(f"auth failed: {body}")
+    return body["access_token"]
 
 if __name__ == "__main__":
     main()

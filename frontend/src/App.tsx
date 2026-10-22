@@ -1,8 +1,13 @@
-import { FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { BrowserRouter, Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   api,
+  CAMERA_LABELS,
+  type CameraLabel,
+  type CameraSync,
   type Facility,
+  type FacilityMember,
+  type FacilityRole,
   type Match,
   type MatchEvent,
   type MatchStats,
@@ -163,16 +168,22 @@ function FacilityHome() {
   const [playerName, setPlayerName] = useState("");
   const [shirt, setShirt] = useState(10);
   const [matchTitle, setMatchTitle] = useState("");
+  const [members, setMembers] = useState<FacilityMember[]>([]);
+  const [memberEmail, setMemberEmail] = useState("");
+  const [memberRole, setMemberRole] = useState<FacilityRole>("staff");
+  const [staffMessage, setStaffMessage] = useState("");
 
   async function refresh() {
-    const [t, p, m] = await Promise.all([
+    const [t, p, m, mem] = await Promise.all([
       api.listTeams(facilityId),
       api.listPlayers(facilityId),
       api.listMatches(facilityId),
+      api.listMembers(facilityId).catch(() => [] as FacilityMember[]),
     ]);
     setTeams(t);
     setPlayers(p);
     setMatches(m);
+    setMembers(mem);
   }
 
   useEffect(() => {
@@ -235,6 +246,66 @@ function FacilityHome() {
             ))}
           </ul>
         </form>
+      </section>
+
+      <section className="panel">
+        <h2>Staff</h2>
+        <p className="lede">
+          Owners add people who already have a CourtLens account. Staff run matches; reviewers can view.
+        </p>
+        <form
+          className="inline"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            try {
+              await api.addMember(facilityId, memberEmail, memberRole);
+              setMemberEmail("");
+              setStaffMessage("");
+              await refresh();
+            } catch (err) {
+              setStaffMessage(err instanceof Error ? err.message : "Could not add member");
+            }
+          }}
+        >
+          <input
+            type="email"
+            value={memberEmail}
+            onChange={(e) => setMemberEmail(e.target.value)}
+            placeholder="staff@court.com"
+            required
+          />
+          <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as FacilityRole)}>
+            <option value="staff">Staff</option>
+            <option value="reviewer">Reviewer</option>
+            <option value="owner">Owner</option>
+          </select>
+          <button className="primary" type="submit">
+            Add
+          </button>
+        </form>
+        {staffMessage && <p className="lede">{staffMessage}</p>}
+        <ul className="list compact">
+          {members.map((m) => (
+            <li key={m.id}>
+              {m.email ?? m.user_id} <span className="badge">{m.role}</span>
+              {m.role !== "owner" && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await api.removeMember(facilityId, m.user_id);
+                      await refresh();
+                    } catch (err) {
+                      setStaffMessage(err instanceof Error ? err.message : "Could not remove member");
+                    }
+                  }}
+                >
+                  Remove
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
       </section>
 
       <section className="panel">
@@ -467,7 +538,8 @@ function MatchPage() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [events, setEvents] = useState<MatchEvent[]>([]);
   const [stats, setStats] = useState<MatchStats | null>(null);
-  const [offsetMs, setOffsetMs] = useState(0);
+  const [syncs, setSyncs] = useState<CameraSync[]>([]);
+  const [offsetDraft, setOffsetDraft] = useState<Partial<Record<CameraLabel, number>>>({});
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<"center" | "setup" | "identity">("center");
@@ -483,13 +555,14 @@ function MatchPage() {
       api.listPlayers(facilityId),
       api.listVideos(facilityId, matchId),
       api.listJobs(facilityId, matchId),
-      api.getSync(facilityId, matchId).catch(() => null),
+      api.getSync(facilityId, matchId).catch(() => [] as CameraSync[]),
     ]);
     setMatch(m);
     setPlayers(p);
     setVideos(v);
     setJobs(j);
-    if (sync) setOffsetMs(sync.offset_ms);
+    setSyncs(sync);
+    setOffsetDraft(Object.fromEntries(sync.map((s) => [s.camera_label, s.offset_ms])));
     const [tr, ev, st] = await Promise.all([
       api.listTracks(facilityId, matchId).catch(() => [] as Track[]),
       api.listEvents(facilityId, matchId).catch(() => [] as MatchEvent[]),
@@ -508,7 +581,7 @@ function MatchPage() {
     return () => clearInterval(id);
   }, [facilityId, matchId]);
 
-  async function onUpload(label: "A" | "B", file: File | null) {
+  async function onUpload(label: CameraLabel, file: File | null) {
     if (!file) return;
     setBusy(true);
     setMessage(`Uploading camera ${label}…`);
@@ -888,6 +961,21 @@ function MatchPage() {
             >
               Publish & share report
             </button>
+            {match?.status === "published" && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const { revoked } = await api.revokeShare(facilityId, matchId);
+                  setMessage(
+                    revoked
+                      ? "Share link revoked — the old URL no longer opens. Publish again for a new link."
+                      : "No active share link",
+                  );
+                }}
+              >
+                Revoke share link
+              </button>
+            )}
           </div>
         </>
       )}
@@ -921,26 +1009,21 @@ function MatchPage() {
             <div className="panel">
               <h2>Camera upload</h2>
               <p className="lede">
-                Pilot courts can start with Camera A only. Add Camera B when you have a second angle.
+                Camera A is the reference angle (wide view). Courts can run A only, or add B–D for
+                more angles — goals and occlusions get more reliable with every extra camera.
               </p>
-              <label className="file">
-                Camera A
-                <input
-                  type="file"
-                  accept="video/*"
-                  disabled={busy}
-                  onChange={(e) => onUpload("A", e.target.files?.[0] || null)}
-                />
-              </label>
-              <label className="file">
-                Camera B
-                <input
-                  type="file"
-                  accept="video/*"
-                  disabled={busy}
-                  onChange={(e) => onUpload("B", e.target.files?.[0] || null)}
-                />
-              </label>
+              {CAMERA_LABELS.map((label) => (
+                <label className="file" key={label}>
+                  Camera {label}
+                  {label === "A" ? " (reference)" : ""}
+                  <input
+                    type="file"
+                    accept="video/*"
+                    disabled={busy}
+                    onChange={(e) => onUpload(label, e.target.files?.[0] || null)}
+                  />
+                </label>
+              ))}
               <ul className="list compact">
                 {videos.map((v) => (
                   <li key={v.id}>
@@ -954,19 +1037,40 @@ function MatchPage() {
 
           <section className="panel">
             <h2>Camera sync</h2>
-            <form
-              className="inline"
-              onSubmit={async (e) => {
-                e.preventDefault();
-                await api.updateSync(facilityId, matchId, offsetMs, "Manual correction");
-                setMessage("Sync offset saved");
-              }}
-            >
-              <input type="number" value={offsetMs} onChange={(e) => setOffsetMs(Number(e.target.value))} />
-              <button className="primary" type="submit">
-                Save offset (ms)
-              </button>
-            </form>
+            <p className="lede">
+              Offset of each camera onto Camera A's clock (ms): a moment at camera time t is at A time
+              t + offset. Auto estimates with low confidence need a staff check.
+            </p>
+            {CAMERA_LABELS.filter((l) => l !== "A").map((label) => {
+              const current = syncs.find((s) => s.camera_label === label);
+              return (
+                <form
+                  key={label}
+                  className="inline"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    await api.updateSync(facilityId, matchId, label, offsetDraft[label] ?? 0, "Manual correction");
+                    setMessage(`Camera ${label} offset saved`);
+                    await refresh();
+                  }}
+                >
+                  <span>Camera {label}</span>
+                  <input
+                    type="number"
+                    value={offsetDraft[label] ?? 0}
+                    onChange={(e) => setOffsetDraft({ ...offsetDraft, [label]: Number(e.target.value) })}
+                  />
+                  <button className="primary" type="submit">
+                    Save offset (ms)
+                  </button>
+                  {current && (
+                    <span className="lede">
+                      {current.is_manual ? "manual" : `${current.method} · confidence ${(current.confidence ?? 0).toFixed(2)}`}
+                    </span>
+                  )}
+                </form>
+              );
+            })}
           </section>
 
           <section className="panel">

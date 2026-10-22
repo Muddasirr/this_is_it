@@ -7,13 +7,18 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_facility_member
+from app.core.deps import get_current_user, require_facility_member, require_facility_owner
 from app.models import Facility, FacilityUser, RetentionPolicy, User, VideoAsset
 from app.models.entities import FacilityRole, VideoKind
 from app.schemas import FacilityCreate, FacilityOut, FacilityUserOut
 from app.services.storage import delete_object
 
 router = APIRouter()
+
+
+class MemberAdd(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    role: FacilityRole = FacilityRole.staff
 
 
 class RetentionOut(BaseModel):
@@ -81,8 +86,57 @@ def list_members(
     facility_id: UUID,
     db: Session = Depends(get_db),
     _: FacilityUser = Depends(require_facility_member),
-) -> list[FacilityUser]:
-    return db.query(FacilityUser).filter(FacilityUser.facility_id == facility_id).all()
+) -> list[FacilityUserOut]:
+    rows = (
+        db.query(FacilityUser, User.email)
+        .join(User, User.id == FacilityUser.user_id)
+        .filter(FacilityUser.facility_id == facility_id)
+        .order_by(FacilityUser.created_at)
+        .all()
+    )
+    return [FacilityUserOut.model_validate(m).model_copy(update={"email": email}) for m, email in rows]
+
+
+@router.post("/{facility_id}/members", response_model=FacilityUserOut, status_code=status.HTTP_201_CREATED)
+def add_member(
+    facility_id: UUID,
+    payload: MemberAdd,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_owner),
+) -> FacilityUser:
+    """Owner adds a registered user (staff / reviewer / co-owner). No email infra yet:
+    the person registers first, then the owner adds them by email."""
+    user = db.query(User).filter(User.email == payload.email.strip().lower()).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No account with that email — ask them to register first")
+    membership = (
+        db.query(FacilityUser)
+        .filter(FacilityUser.facility_id == facility_id, FacilityUser.user_id == user.id)
+        .first()
+    )
+    if membership:
+        membership.role = payload.role
+    else:
+        membership = FacilityUser(facility_id=facility_id, user_id=user.id, role=payload.role)
+        db.add(membership)
+    db.commit()
+    db.refresh(membership)
+    return membership
+
+
+@router.delete("/{facility_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_member(
+    facility_id: UUID,
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    owner: FacilityUser = Depends(require_facility_owner),
+) -> None:
+    if user_id == owner.user_id:
+        raise HTTPException(status_code=400, detail="Owners cannot remove themselves")
+    db.query(FacilityUser).filter(
+        FacilityUser.facility_id == facility_id, FacilityUser.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.commit()
 
 
 @router.get("/{facility_id}/retention", response_model=RetentionOut)

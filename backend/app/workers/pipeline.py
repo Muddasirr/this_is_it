@@ -38,10 +38,11 @@ from app.services import jobs as job_service
 from app.services.clips import render_and_store_clip
 from app.services.avatars import attach_player_avatars
 from app.services.identity import propose_identity_links
-from app.services.media import estimate_offset_ms_stub, probe_video, validate_probe
+from app.services.media import SYNC_MIN_CONFIDENCE, estimate_offset_ms, probe_video, validate_probe
 from app.services.storage import download_to_path, object_key_for_proxy, upload_file
 from app.services.vision import get_vision_backend
 import secrets
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,61 @@ def _participant_roles(
     return [(k, "primary" if i == 0 else "secondary") for i, k in enumerate(track_keys)]
 
 
+def _synchronize_cameras(
+    db: Session,
+    match_id: UUID,
+    local: dict[CameraLabel, Path],
+    probes: dict[CameraLabel, dict],
+) -> dict[str, int]:
+    """Offset (ms) per camera onto the reference timeline; canonical = camera_ts + offset.
+
+    Reference is Camera A (or the first uploaded label). The latest manual
+    staff offset per camera always wins over a new auto estimate.
+    """
+    ref = CameraLabel.A if CameraLabel.A in local else sorted(local, key=lambda c: c.value)[0]
+    offsets: dict[str, int] = {ref.value: 0}
+    for label in sorted(local, key=lambda c: c.value):
+        if label == ref:
+            continue
+        manual = (
+            db.query(CameraSync)
+            .filter(
+                CameraSync.match_id == match_id,
+                CameraSync.camera_label == label,
+                CameraSync.is_manual.is_(True),
+            )
+            .order_by(CameraSync.created_at.desc())
+            .first()
+        )
+        if manual:
+            offsets[label.value] = manual.offset_ms
+            continue
+        offset_ms, confidence, method = estimate_offset_ms(
+            local[ref],
+            local[label],
+            ref_has_audio=bool(probes.get(ref, {}).get("has_audio")),
+            other_has_audio=bool(probes.get(label, {}).get("has_audio")),
+        )
+        needs_staff = confidence < SYNC_MIN_CONFIDENCE
+        db.add(
+            CameraSync(
+                match_id=match_id,
+                camera_label=label,
+                offset_ms=offset_ms,
+                confidence=confidence,
+                method=method,
+                is_manual=False,
+                notes=(
+                    f"Auto {method} vs camera {ref.value}"
+                    + (" — low confidence, staff should set the offset" if needs_staff else "")
+                ),
+            )
+        )
+        offsets[label.value] = offset_ms
+    db.commit()
+    return offsets
+
+
 def process_job(db: Session, job_id: UUID) -> None:
     job = db.get(ProcessingJob, job_id)
     if not job:
@@ -184,7 +240,7 @@ def process_job(db: Session, job_id: UUID) -> None:
             not settings.allow_single_camera
             and (CameraLabel.A not in labeled or CameraLabel.B not in labeled)
         ):
-            raise RuntimeError("Camera A and B assets required")
+            raise RuntimeError("At least two camera angles required (ALLOW_SINGLE_CAMERA=false)")
 
         with tempfile.TemporaryDirectory(prefix="futsal-") as tmp:
             tmp_path = Path(tmp)
@@ -200,7 +256,7 @@ def process_job(db: Session, job_id: UUID) -> None:
                 local[label] = path
                 try:
                     probe = probe_video(path)
-                    errors = validate_probe(probe)
+                    errors = validate_probe(probe, min_duration_ms=settings.min_video_duration_s * 1000)
                 except Exception as exc:  # noqa: BLE001
                     asset.validation_status = "failed"
                     asset.validation_errors = {"error": str(exc)}
@@ -226,7 +282,7 @@ def process_job(db: Session, job_id: UUID) -> None:
             from app.models import Match
 
             match = db.get(Match, job.match_id)
-            for label, path in local.items():
+            for label, path in (local.items() if settings.pipeline_proxies else []):
                 proxy_path = tmp_path / f"{label.value}_proxy.mp4"
                 try:
                     from app.services.media import make_proxy
@@ -249,30 +305,11 @@ def process_job(db: Session, job_id: UUID) -> None:
                     logger.warning("Proxy generation skipped for %s: %s", label, exc)
             _finish_run(db, run, JobStatus.succeeded)
 
-            # 3. Synchronize
+            # 3. Synchronize — every camera onto the reference (A) timeline
             run = _start_run(db, job, JobStage.synchronize, model.id)
             job_service.mark_job_progress(db, job, JobStage.synchronize, 35)
-            if CameraLabel.A in probes and CameraLabel.B in probes:
-                offset_ms, confidence, method = estimate_offset_ms_stub(
-                    probes[CameraLabel.A]["duration_ms"],
-                    probes[CameraLabel.B]["duration_ms"],
-                )
-                notes = "Auto estimate — staff should verify in review UI"
-            else:
-                offset_ms, confidence, method = 0, 0.0, "single_camera"
-                notes = "Single-camera Phase 0 run — sync skipped"
-            db.add(
-                CameraSync(
-                    match_id=job.match_id,
-                    offset_ms=offset_ms,
-                    confidence=confidence,
-                    method=method,
-                    is_manual=False,
-                    notes=notes,
-                )
-            )
-            db.commit()
-            _finish_run(db, run, JobStatus.succeeded, {"offset_ms": offset_ms, "confidence": confidence})
+            offsets_ms = _synchronize_cameras(db, job.match_id, local, probes)
+            _finish_run(db, run, JobStatus.succeeded, {"offsets_ms": offsets_ms})
 
             # 4. Detect / track (replace prior auto tracks/events for this match)
             run = _start_run(db, job, JobStage.detect_track, model.id)
@@ -280,6 +317,7 @@ def process_job(db: Session, job_id: UUID) -> None:
             _clear_auto_analysis(db, job.match_id)
             all_detections = []
             vision_stats = []
+            detect_started = time.monotonic()
             for label, path in local.items():
                 dets = backend.detect_and_track(str(path), label.value)
                 vision_stats.append(getattr(backend, "last_run_stats", {}))
@@ -301,11 +339,12 @@ def process_job(db: Session, job_id: UUID) -> None:
                     )
                 all_detections.extend(dets)
             db.commit()
+            detect_seconds = round(time.monotonic() - detect_started, 1)
             _finish_run(
                 db,
                 run,
                 JobStatus.succeeded,
-                {"track_count": len(all_detections), "vision_stats": vision_stats},
+                {"track_count": len(all_detections), "vision_stats": vision_stats, "seconds": detect_seconds},
             )
 
             # 5. Identity proposals for staff correction
@@ -340,17 +379,23 @@ def process_job(db: Session, job_id: UUID) -> None:
                 label_dets = [d for d in all_detections if d.camera_label == label.value]
                 candidates.extend(backend.infer_events(label_dets, label.value))
 
-            # 7. Fuse across cameras A/B/C
+            # 7. Fuse across cameras A/B/C/D on the synced timeline
             run_fuse = _start_run(db, job, JobStage.fuse, model.id)
             job_service.mark_job_progress(db, job, JobStage.fuse, 90)
-            from app.services.fuse import fuse_event_candidates
+            from app.services.fuse import canonical_ts_ms, group_event_candidates
 
-            # Cross-cam A/B/C: keep best obs per type+time+player bucket
-            fused_list = fuse_event_candidates(candidates, bucket_ms=1500)
-            fused: dict[tuple, list] = {}
-            for c in fused_list:
-                key = (c.event_type, c.camera_ts_ms // 1000)
-                fused.setdefault(key, []).append(c)
+            key_by_track_id = {t.id: t.track_key for t in saved_tracks}
+            player_by_track: dict[str, UUID | None] = {
+                key_by_track_id[link.track_id]: link.player_id
+                for link in links
+                if link.track_id in key_by_track_id
+            }
+            groups = group_event_candidates(
+                candidates,
+                bucket_ms=1500,
+                offsets_ms=offsets_ms,
+                player_of=player_by_track.get,
+            )
 
             type_map = {
                 "goal": EventType.goal,
@@ -360,16 +405,21 @@ def process_job(db: Session, job_id: UUID) -> None:
                 "dribble": EventType.dribble,
             }
             created_events: list[MatchEvent] = []
-            for (_etype, _sec), obs_list in fused.items():
+            for obs_list in groups:
                 primary = max(obs_list, key=lambda x: x.confidence)
                 event = MatchEvent(
                     match_id=job.match_id,
                     processing_run_id=run.id,
                     event_type=type_map.get(primary.event_type, EventType.shot),
-                    canonical_ts_ms=primary.camera_ts_ms,
+                    canonical_ts_ms=canonical_ts_ms(primary, offsets_ms),
                     confirmation=ConfirmationState.estimated,
                     confidence=primary.confidence,
-                    provenance={"model": backend.name, "version": backend.version, "heuristic": True},
+                    provenance={
+                        "model": backend.name,
+                        "version": backend.version,
+                        "heuristic": True,
+                        "cameras": sorted({o.camera_label for o in obs_list}),
+                    },
                     is_canonical=True,
                 )
                 db.add(event)
@@ -388,20 +438,10 @@ def process_job(db: Session, job_id: UUID) -> None:
                 roles = _participant_roles(primary.event_type, primary.track_keys, primary.evidence)
                 for tkey, role in roles:
                     track = track_by_key.get(tkey)
-                    player_id = None
-                    if track:
-                        link = (
-                            db.query(TrackIdentityLink)
-                            .filter(TrackIdentityLink.track_id == track.id)
-                            .order_by(TrackIdentityLink.created_at.desc())
-                            .first()
-                        )
-                        if link:
-                            player_id = link.player_id
                     db.add(
                         EventParticipant(
                             event_id=event.id,
-                            player_id=player_id,
+                            player_id=player_by_track.get(tkey),
                             track_id=track.id if track else None,
                             role=role,
                             confidence=primary.confidence,
@@ -409,22 +449,29 @@ def process_job(db: Session, job_id: UUID) -> None:
                     )
             db.commit()
             _finish_run(db, run, JobStatus.succeeded)
-            _finish_run(db, run_fuse, JobStatus.succeeded, {"canonical_events": len(fused)})
+            _finish_run(db, run_fuse, JobStatus.succeeded, {"canonical_events": len(groups)})
 
             # 8. Review gate — auto evidence clips for uncertain events
             run = _start_run(db, job, JobStage.review_gate, model.id)
             job_service.mark_job_progress(db, job, JobStage.review_gate, 95)
-            first_label = next(iter(local))
-            src_path = local[first_label]
-            for event in created_events[:25]:
-                start_ms = max(0, event.canonical_ts_ms - 3000)
-                end_ms = event.canonical_ts_ms + 4000
+            for event in created_events[: settings.pipeline_max_clips]:
+                best_obs = (
+                    db.query(EventObservation)
+                    .filter(EventObservation.event_id == event.id)
+                    .order_by(EventObservation.confidence.desc())
+                    .first()
+                )
+                clip_label = best_obs.camera_label if best_obs and best_obs.camera_label in local else next(iter(local))
+                src_path = local[clip_label]
+                cam_ts = best_obs.camera_ts_ms if best_obs else event.canonical_ts_ms
+                start_ms = max(0, cam_ts - 3000)
+                end_ms = cam_ts + 4000
                 key = f"facilities/{match.facility_id}/matches/{match.id}/clips/{event.id}.mp4"
                 try:
                     render_and_store_clip(src_path, key, start_ms, end_ms)
                     clip_asset = VideoAsset(
                         match_id=match.id,
-                        camera_source_id=labeled[first_label].camera_source_id,
+                        camera_source_id=labeled[clip_label].camera_source_id,
                         kind=VideoKind.clip,
                         object_key=key,
                         content_type="video/mp4",
@@ -443,15 +490,12 @@ def process_job(db: Session, job_id: UUID) -> None:
                             share_token=secrets.token_urlsafe(12),
                         )
                     )
-                    from app.models import EventObservation as EO
-
-                    obs = db.query(EO).filter(EO.event_id == event.id).first()
-                    if obs:
-                        obs.evidence_key = key
+                    if best_obs:
+                        best_obs.evidence_key = key
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Clip render failed for %s: %s", event.id, exc)
             db.commit()
-            _finish_run(db, run, JobStatus.succeeded, {"clips_attempted": min(25, len(created_events))})
+            _finish_run(db, run, JobStatus.succeeded, {"clips_attempted": min(settings.pipeline_max_clips, len(created_events))})
 
             run = _start_run(db, job, JobStage.publish, model.id)
             _finish_run(db, run, JobStatus.succeeded, {"note": "awaiting staff review before published stats"})
@@ -460,10 +504,15 @@ def process_job(db: Session, job_id: UUID) -> None:
                 UsageRecord(
                     facility_id=match.facility_id,
                     match_id=match.id,
-                    category="gpu_seconds",
-                    quantity=0,
+                    category="cpu_seconds" if str(settings.vision_device).lower() == "cpu" else "gpu_seconds",
+                    quantity=detect_seconds,
                     unit_cost_cents=0,
-                    details={"note": "stub — fill from real GPU timing"},
+                    details={
+                        "stage": "detect_track",
+                        "cameras": [lbl.value for lbl in local],
+                        "device": settings.vision_device,
+                        "frame_stride": settings.vision_frame_stride,
+                    },
                 )
             )
             db.commit()

@@ -8,9 +8,6 @@ from pathlib import Path
 from uuid import UUID
 from urllib.parse import quote
 
-import boto3
-from botocore.client import Config
-from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import get_settings
 
@@ -21,6 +18,10 @@ class StorageError(Exception):
 
 @lru_cache
 def get_s3_client():
+    # Lazy: local-storage runs (offline / Kaggle) don't need boto3 installed
+    import boto3
+    from botocore.client import Config
+
     settings = get_settings()
     return boto3.client(
         "s3",
@@ -164,6 +165,8 @@ def ensure_bucket() -> None:
     if use_local_storage():
         local_root()
         return
+    from botocore.exceptions import BotoCoreError, ClientError
+
     settings = get_settings()
     client = get_s3_client()
     try:

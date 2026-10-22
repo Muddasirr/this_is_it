@@ -16,13 +16,24 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    JSON,
     UniqueConstraint,
+    Uuid,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+
+# Portable column types: native UUID / JSONB on Postgres (unchanged DDL), plain
+# CHAR(32) / JSON elsewhere so the real pipeline can run on SQLite (Kaggle, tests).
+JSONB = JSON().with_variant(postgresql.JSONB(), "postgresql")
+
+
+def UUID(as_uuid: bool = True) -> Uuid:  # noqa: N802 — keeps call sites readable
+    return Uuid(as_uuid=as_uuid)
 
 
 def _uuid() -> uuid.UUID:
@@ -78,7 +89,8 @@ class VideoKind(str, enum.Enum):
 class CameraLabel(str, enum.Enum):
     A = "A"
     B = "B"
-    C = "C"  # 2–3 cam ready; v1 may use A only
+    C = "C"
+    D = "D"  # production courts: 3–4 fixed angles; pilot may run A only
 
 
 class EventType(str, enum.Enum):
@@ -255,7 +267,10 @@ class CameraSync(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     match_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("matches.id", ondelete="CASCADE"), index=True)
-    offset_ms: Mapped[int] = mapped_column(Integer, default=0)  # B relative to A
+    # Offset of `camera_label` relative to Camera A (reference). One row per
+    # non-A camera per correction; latest row per label wins.
+    camera_label: Mapped[CameraLabel] = mapped_column(Enum(CameraLabel), default=CameraLabel.B)
+    offset_ms: Mapped[int] = mapped_column(Integer, default=0)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     method: Mapped[str] = mapped_column(String(64), default="manual")
     is_manual: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -457,3 +472,4 @@ class MatchShare(Base):
     match_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("matches.id", ondelete="CASCADE"), index=True)
     share_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

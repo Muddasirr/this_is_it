@@ -158,7 +158,14 @@ def create_upload_url(
         .first()
     )
     if not camera:
-        raise HTTPException(status_code=400, detail="Camera source missing")
+        # A/B are created with the match; C/D appear when a court uploads them
+        camera = CameraSource(
+            match_id=match.id,
+            label=payload.camera_label,
+            description=f"Camera {payload.camera_label.value}",
+        )
+        db.add(camera)
+        db.flush()
 
     key = object_key_for_original(facility_id, match.id, payload.camera_label.value, payload.filename)
     asset = VideoAsset(
@@ -222,8 +229,13 @@ def update_sync(
     _: FacilityUser = Depends(require_facility_member),
 ) -> CameraSync:
     match = _get_match(db, facility_id, match_id)
+    if payload.camera_label == CameraLabel.A:
+        raise HTTPException(status_code=400, detail="Camera A is the reference timeline (offset 0)")
     previous = (
-        db.query(CameraSync).filter(CameraSync.match_id == match.id).order_by(CameraSync.created_at.desc()).first()
+        db.query(CameraSync)
+        .filter(CameraSync.match_id == match.id, CameraSync.camera_label == payload.camera_label)
+        .order_by(CameraSync.created_at.desc())
+        .first()
     )
     history = []
     if previous and previous.history:
@@ -238,6 +250,7 @@ def update_sync(
         )
     sync = CameraSync(
         match_id=match.id,
+        camera_label=payload.camera_label,
         offset_ms=payload.offset_ms,
         confidence=1.0,
         method="manual",
@@ -252,20 +265,25 @@ def update_sync(
     return sync
 
 
-@router.get("/{match_id}/sync", response_model=CameraSyncOut | None)
+@router.get("/{match_id}/sync", response_model=list[CameraSyncOut])
 def get_sync(
     facility_id: UUID,
     match_id: UUID,
     db: Session = Depends(get_db),
     _: FacilityUser = Depends(require_facility_member),
-) -> CameraSync | None:
+) -> list[CameraSync]:
+    """Latest offset per non-reference camera (B/C/D)."""
     _get_match(db, facility_id, match_id)
-    return (
+    rows = (
         db.query(CameraSync)
         .filter(CameraSync.match_id == match_id)
         .order_by(CameraSync.created_at.desc())
-        .first()
+        .all()
     )
+    latest: dict[CameraLabel, CameraSync] = {}
+    for row in rows:
+        latest.setdefault(row.camera_label, row)
+    return [latest[k] for k in sorted(latest, key=lambda c: c.value)]
 
 
 @router.post("/{match_id}/process", response_model=ProcessingJobOut, status_code=status.HTTP_202_ACCEPTED)

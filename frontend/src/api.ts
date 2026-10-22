@@ -1,6 +1,8 @@
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export type Facility = { id: string; name: string; timezone: string; created_at: string };
+export type FacilityRole = "owner" | "staff" | "reviewer";
+export type FacilityMember = { id: string; user_id: string; role: FacilityRole; email: string | null };
 export type Team = { id: string; facility_id: string; name: string; primary_color: string | null };
 export type Player = {
   id: string;
@@ -38,8 +40,11 @@ export type ProcessingJob = {
   progress_pct: number;
   error_message: string | null;
 };
+export type CameraLabel = "A" | "B" | "C" | "D";
+export const CAMERA_LABELS: CameraLabel[] = ["A", "B", "C", "D"];
 export type CameraSync = {
   id: string;
+  camera_label: CameraLabel;
   offset_ms: number;
   confidence: number | null;
   method: string;
@@ -157,6 +162,14 @@ export const api = {
   listFacilities: () => request<Facility[]>("/api/v1/facilities"),
   createFacility: (name: string) =>
     request<Facility>("/api/v1/facilities", { method: "POST", body: JSON.stringify({ name }) }),
+  listMembers: (facilityId: string) => request<FacilityMember[]>(`/api/v1/facilities/${facilityId}/members`),
+  addMember: (facilityId: string, email: string, role: FacilityRole) =>
+    request<FacilityMember>(`/api/v1/facilities/${facilityId}/members`, {
+      method: "POST",
+      body: JSON.stringify({ email, role }),
+    }),
+  removeMember: (facilityId: string, userId: string) =>
+    request<void>(`/api/v1/facilities/${facilityId}/members/${userId}`, { method: "DELETE" }),
   listTeams: (facilityId: string) => request<Team[]>(`/api/v1/facilities/${facilityId}/teams`),
   createTeam: (facilityId: string, name: string) =>
     request<Team>(`/api/v1/facilities/${facilityId}/teams`, {
@@ -182,7 +195,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ player_id, shirt_number }),
     }),
-  getUploadUrl: (facilityId: string, matchId: string, camera_label: "A" | "B", filename: string, byte_size: number) =>
+  getUploadUrl: (facilityId: string, matchId: string, camera_label: CameraLabel, filename: string, byte_size: number) =>
     request<{ video_asset_id: string; upload_url: string }>(
       `/api/v1/facilities/${facilityId}/matches/${matchId}/videos/upload-url`,
       {
@@ -193,11 +206,11 @@ export const api = {
   listVideos: (facilityId: string, matchId: string) =>
     request<VideoAsset[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/videos`),
   getSync: (facilityId: string, matchId: string) =>
-    request<CameraSync | null>(`/api/v1/facilities/${facilityId}/matches/${matchId}/sync`),
-  updateSync: (facilityId: string, matchId: string, offset_ms: number, notes?: string) =>
+    request<CameraSync[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/sync`),
+  updateSync: (facilityId: string, matchId: string, camera_label: CameraLabel, offset_ms: number, notes?: string) =>
     request<CameraSync>(`/api/v1/facilities/${facilityId}/matches/${matchId}/sync`, {
       method: "PUT",
-      body: JSON.stringify({ offset_ms, notes }),
+      body: JSON.stringify({ camera_label, offset_ms, notes }),
     }),
   startProcessing: (facilityId: string, matchId: string) =>
     request<ProcessingJob>(`/api/v1/facilities/${facilityId}/matches/${matchId}/process`, { method: "POST" }),
@@ -236,6 +249,10 @@ export const api = {
     ),
   getStats: (facilityId: string, matchId: string) =>
     request<MatchStats>(`/api/v1/facilities/${facilityId}/matches/${matchId}/stats`),
+  revokeShare: (facilityId: string, matchId: string) =>
+    request<{ revoked: number }>(`/api/v1/facilities/${facilityId}/matches/${matchId}/share/revoke`, {
+      method: "POST",
+    }),
   publishMatch: (facilityId: string, matchId: string) =>
     request<{
       match_id: string;

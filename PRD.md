@@ -11,7 +11,7 @@
 
 CourtLens turns facility-owned match video into **reviewable, publishable player and match analytics**.
 
-Facilities upload completed match recordings (1–2 fixed cameras). The platform detects and tracks players and ball, proposes roster identity (kit colour + jersey number), infers possession-centric events, and lets staff confirm uncertain cases before publishing dashboards, player reports, and shareable highlight links.
+Facilities upload completed match recordings from **1–4 fixed cameras** (Camera A = reference wide view; B–D extra angles). The platform detects and tracks players and ball, proposes roster identity (kit colour + jersey number), infers possession-centric events, and lets staff confirm uncertain cases before publishing dashboards, player reports, and shareable highlight links.
 
 **Production bar:** a facility can run weekly matches with minimal engineer involvement, trust labelled stats enough to share with coaches/players, and the operator can run the service with measured cost, uptime, and data controls.
 
@@ -24,14 +24,14 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 | Decision | Production choice |
 | -------- | ----------------- |
 | Sport / customer | Futsal facilities (indoor courts); multi-tenant SaaS |
-| Capture | Facility-owned fixed cameras; **1 or 2** views supported (1-cam fully supported) |
+| Capture | Facility-owned fixed cameras; **1–4** views (A–D). Pilot runs 1 camera; production courts target 3–4 (both goals + wide) |
 | Timing | **Post-match, asynchronous** cloud processing; live deferred |
 | Identity | Auto: kit colour clustering + jersey OCR when readable; staff override always wins |
 | Events | Pass, shot, goal (and assist when attribution allows) from **possession changes**; see `ARCHITECTURE.md` |
 | Quality labels | Every published metric: `estimated` \| `confirmed` \| `unavailable` |
 | Review | High-confidence classes may auto-accept after validation gates; uncertain → review queue |
 | Sharing | Facility-controlled share links for reports/clips; no public index by default |
-| Compute | On-demand GPU workers for detection/tracking; CPU OK for media/clip jobs; no always-on idle GPU |
+| Compute | On-demand GPU workers for detection/tracking; CPU OK for media/clip jobs; no always-on idle GPU. Kaggle T4 for eval/batch runs of the same code (`scripts/kaggle/build_kaggle.py`) |
 | Single source of truth | Stats derive only from **canonical events** + track metrics linked through identity |
 
 **Still commercial variables (not engineering assumptions):** list pricing, SLA tier packaging, exact GPU vendor. Settle via measured unit economics after production benchmarks.
@@ -50,9 +50,9 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 ### Primary journey (production)
 
 1. **Onboard facility** — workspace, roles, teams, optional pre-registered roster.  
-2. **Create match** — metadata, optional Camera B, retention policy.  
+2. **Create match** — metadata, cameras A–D, retention policy.  
 3. **Upload** — signed URLs; validate codec, duration, FPS, resolution, integrity.  
-4. **Process** — ingest → (optional sync) → detect/track → identity → events → fuse → stats.  
+4. **Process** — ingest → sync (multi-cam) → detect/track → identity → events → fuse → stats.  
 5. **Review** — fix identity, accept/reject/edit events; audit trail.  
 6. **Publish & share** — match centre + player reports + clips; share token.  
 7. **Retain / delete** — policy enforcement; verified deletion.
@@ -65,33 +65,34 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 
 **Multi-tenant product**
 
-- Facility workspaces, staff auth (email/password or SSO-ready design), roles: `admin`, `operator`, `viewer`.
+- Facility workspaces, staff auth (email/password or SSO-ready design), roles: `owner` (admin), `staff` (operator), `reviewer` (viewer). Owners add/remove registered users by email (no invite emails yet).
 - Facility-scoped authorization on every API and media URL.
 - Match lifecycle: draft → processing → needs_review → published → archived.
 - Soft-delete + hard-delete with retention jobs.
 
 **Ingestion & media**
 
-- 1 or 2 camera uploads via signed, expiring URLs.
+- 1–4 camera uploads (A–D) via signed, expiring URLs.
 - Validation: container/codec, duration, FPS, resolution, corruption, incomplete files.
 - Proxy generation for review; originals in private object storage.
 - Job status: queued, running, stage progress %, retry, cancel; idempotent stages.
-- Optional Camera A/B sync offset with manual correction (2-cam).
+- Per-camera sync offset onto Camera A's timeline: auto estimate (audio onset → motion-energy cross-correlation) + staff correction; manual offsets always win.
 
 **Vision & identity**
 
 - Player + ball detect/track (stable `VisionBackend` interface).
 - Dense track series, kit colour features, jersey OCR when available.
 - Proposed roster (Kit A/B + shirt number); staff rename / reassign.
+- Multi-cam: one player across angles — per-camera clusters linked by kit + shirt + appearance (one-to-one per camera); staff merge/split.
 - Unknown / low-confidence identity states preserved — never silently invent certainty.
 
 **Events, review, stats**
 
-- Candidate pass / shot / goal / assist / dribble; cross-camera dedupe when 2-cam.
+- Candidate pass / shot / goal / assist / dribble; cross-camera fuse on the synced timeline (one real event → one canonical event with one observation per camera).
 - Review UI: timeline, evidence clips, accept / reject / edit; full audit log.
 - Match dashboard + per-player reports: goals, shots, passes, assists, dribbles, receptions, possession %, touches, minutes, relative speed, conversion %, movement + on-ball heatmaps.
 - Clear `estimated` / `confirmed` / `unavailable` labelling in UI and exports.
-- Publish + shareable report link (`/report/<token>`).
+- Publish + shareable report link (`/report/<token>`); staff can revoke it (old URL 404s; re-publish mints a new token).
 
 **Operations**
 
@@ -221,7 +222,8 @@ Controls:
 | Queue | Redis or managed queue; durable job state in Postgres |
 | Storage | Private S3-compatible object storage |
 | Media | FFmpeg |
-| Vision | Ultralytics YOLO + ByteTrack (swappable via `VisionBackend`) |
+| Vision | Ultralytics YOLO + BoT-SORT/ByteTrack + OSNet ReID (swappable via `VisionBackend`) |
+| Batch / eval GPU | Same pipeline on SQLite (`app.scripts.run_offline`), run on Kaggle T4 |
 | Events / identity | Possession heuristics + kit/jersey clustering (`ARCHITECTURE.md`) |
 | Deploy | Containerized API/workers; managed DB/storage; on-demand GPU |
 
@@ -229,7 +231,7 @@ Controls:
 
 1. **Ingest** — validate media.  
 2. **Normalize** — proxy + metadata.  
-3. **Synchronize** — A/B offset (if 2-cam).  
+3. **Synchronize** — offset per camera B–D onto A (if multi-cam).  
 4. **Detect & track** — persons + ball; colour hist; OCR; thumbs.  
 5. **Identity** — cluster → Kit A/B + shirt → roster links.  
 6. **Events** — possession-centric candidates.  
@@ -269,9 +271,9 @@ Facilities use existing CCTV; CourtLens does not sell cameras in v1. Publish a *
 | Frame rate | 25–30 FPS | 15 FPS fallback (expect missed ball) |
 | Codec | H.264 | H.265 if pipeline-validated |
 | View | Fixed wide; both goals preferred | Stable FOV (no PTZ during match) |
-| Cameras | 1 supported; 2 preferred for goals/occlusion | 1-cam OK with lower confidence |
+| Cameras | 3–4: wide (A) + one behind/beside each goal | 1-cam OK with lower confidence (pilot) |
 
-Sync (2-cam): common visible action at start; estimate offset; staff adjust; re-check mid/late match for drift. Do not trust file mtimes alone.
+Sync (multi-cam): Camera A is the reference clock. Each other camera gets an offset (`canonical = camera_ts + offset`) estimated from audio onsets (whistles, kicks) or, for silent CCTV, motion-energy cross-correlation; low-confidence estimates are flagged for staff. Re-check mid/late match for drift. Do not trust file mtimes alone.
 
 ---
 
@@ -284,7 +286,7 @@ Planning defaults (replace with facility measurements):
 - ~4–8 Mbps average bitrate  
 - Retention 7–90 days (default 30)
 
-Illustrative raw volume (25 matches × 60 min × 6 Mbps × 2 cams) ≈ **135 GB/month** uploads before proxies/clips/retries. Production capacity planning must include proxies, clips, and multi-tenant peaks.
+Illustrative raw volume (25 matches × 60 min × 6 Mbps) ≈ **67 GB/month per camera** — **≈ 270 GB/month** for a 4-camera court — before proxies/clips/retries. GPU detect/track time also scales ~linearly with cameras. Production capacity planning must include proxies, clips, and multi-tenant peaks.
 
 ---
 
@@ -295,14 +297,14 @@ Illustrative raw volume (25 matches × 60 min × 6 Mbps × 2 cams) ≈ **135 GB/
 | Phase | Outcome | Exit gate |
 | ----- | ------- | --------- |
 | **0 — Eval + data** | `scripts/eval/*`, GT template, Roboflow download script, corpus list | `run_detection_smoke.py` exits 0 |
-| **1 — Detect/track** | YOLO+ByteTrack+ball; court format 5v5/6v6/7v7; thumbs | Facility smoke: ball + person tracks in `summary.json` |
+| **1 — Detect/track** | YOLO+BoT-SORT+ball; court format 5v5/6v6/7v7; thumbs | Facility smoke: ball + person tracks in `summary.json` |
 | **2 — Identity** | Kit A/B, throttled OCR, **avatar per player** | Every proposed player has thumb; staff rename works |
 | **3 — Possession** | Vidal-Codina PZ + gain/loss (Δv/Δθ when possible) | Possession segments when ball samples ≥ 80 |
 | **4 — Events + stats** | Pass/shot/goal + touches/poss%/**per-player heatmap** | No shot flood; `score_events.py` runs; heatmaps on player rows |
-| **5 — Product** | Upload → process → review → share (avatars + **player heatmaps**) | One docker/local match completes with share report |
-| **6 (later)** | Homography metres, cam B/C fuse quality, SSO/exports | Separate PRD |
+| **5 — Product + multi-cam** | Upload → process → review → share (avatars + **player heatmaps**); cameras A–D: per-camera sync, cross-camera identity + fuse | One docker/local match completes with share report; Kaggle synthetic 3-cam check passes (`EVAL.md`) |
+| **6 (later)** | Homography metres, multi-cam quality on **real** multi-angle court footage, SSO/exports | Separate PRD |
 
-**Court formats:** `COURT_FORMAT=5v5|6v6|7v7` (field players per side). **Cameras:** 1 now; labels A/B/C ready. **Heatmaps:** image-plane grids per player + match aggregate; always `estimated` until calibrated pitch.
+**Court formats:** `COURT_FORMAT=5v5|6v6|7v7` (field players per side). **Cameras:** A–D supported end-to-end; pilot uses A. **Heatmaps:** image-plane grids per player + match aggregate; always `estimated` until calibrated pitch.
 
 ---
 
@@ -330,7 +332,8 @@ Launch is allowed only when **all** are true:
 | CPU-only processing | Slow / costly UX | On-demand GPU; documented stride trade-offs; queue SLAs |
 | Over-trust of heuristics | Bad player reputation | Labels + review gate + audit |
 | Cost spikes (retries, egress) | Margin failure | Spend ceilings, proxies, retention |
-| Sync drift (2-cam) | Double-count / wrong fuse | Manual offset + mid-match validation |
+| Sync drift (multi-cam) | Double-count / wrong fuse | Auto offset + confidence flag, manual offset per camera, mid-match validation |
+| No multi-angle eval footage yet | Multi-cam quality unmeasured on real courts | Synthetic 3-cam gate now; record a real 3–4 cam pilot match before production claims |
 
 ---
 

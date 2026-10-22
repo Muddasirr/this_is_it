@@ -82,6 +82,8 @@ class VideoAssetOut(BaseModel):
 
 
 class CameraSyncUpdate(BaseModel):
+    # Offset of this camera onto Camera A's timeline: canonical = camera_ts + offset_ms
+    camera_label: CameraLabel = CameraLabel.B
     offset_ms: int
     notes: str | None = None
 
@@ -89,6 +91,7 @@ class CameraSyncUpdate(BaseModel):
 class CameraSyncOut(BaseModel):
     id: UUID
     match_id: UUID
+    camera_label: CameraLabel
     offset_ms: int
     confidence: float | None
     method: str

@@ -57,60 +57,22 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
         t for t in tracks if (t.features or {}).get("class", "person") != "person"
     ] + skipped_closeups
 
-    clusters = _cluster_tracks(person_tracks)
-    clusters = sorted(
-        clusters,
-        key=lambda c: sum(t.end_ms - t.start_ms for t in c),
-        reverse=True,
-    )[: max_auto_players()]
+    # Time-overlap rules ("two tracks at once ⇒ two people") only hold within
+    # one camera, so cluster + fragment-merge per camera, then assign kits
+    # jointly (Kit A must mean the same team on every angle), then link the
+    # other cameras' clusters onto the reference camera's players.
+    by_camera: dict[str, list[PlayerTrack]] = {}
+    for t in person_tracks:
+        by_camera.setdefault(_camera_of(t), []).append(t)
+    metas_by_camera = {cam: _camera_cluster_meta(ts) for cam, ts in sorted(by_camera.items())}
 
-    cluster_meta: list[dict] = []
-    for cluster in clusters:
-        number, nconf = _cluster_jersey(cluster)
-        hist = _cluster_mean_hist(cluster)
-        cluster_meta.append(
-            {
-                "tracks": cluster,
-                "jersey_number": number,
-                "jersey_confidence": nconf,
-                "has_color": hist is not None,
-                "color_hist": hist,
-                "duration": sum(t.end_ms - t.start_ms for t in cluster),
-                "kit": "A",  # filled below
-            }
-        )
-
-    # Attach mean ReID embedding per cluster (from track features).
-    for meta in cluster_meta:
-        embs = []
-        for t in meta["tracks"]:
-            e = (t.features or {}).get("reid_emb")
-            if e:
-                embs.append(e)
-        if embs:
-            import numpy as np
-
-            m = np.mean(np.asarray(embs, dtype=np.float32), axis=0)
-            n = float(np.linalg.norm(m) + 1e-12)
-            meta["reid_emb"] = (m / n).tolist()
-        else:
-            meta["reid_emb"] = None
-
-    # BoT-SORT/ByteTrack still fragment one player → many clusters.
-    # Prefer OSNet ReID merge, then colour-hist fallback, then kits.
-    try:
-        from app.services.reid import merge_tracks_by_reid, reid_enabled
-
-        if reid_enabled():
-            cluster_meta = merge_tracks_by_reid(cluster_meta)
-            for meta in cluster_meta:
-                _refresh_meta(meta)
-    except Exception:
-        pass
-    cluster_meta = _merge_colour_fragments(cluster_meta)
+    cluster_meta = [m for metas in metas_by_camera.values() for m in metas]
     _assign_kits(cluster_meta)
-    _reconcile_same_colour_kits(cluster_meta)
+    for metas in metas_by_camera.values():
+        _reconcile_same_colour_kits(metas)
     _smooth_kits_by_neighbours(cluster_meta)
+    if len(metas_by_camera) > 1:
+        cluster_meta = link_clusters_across_cameras(metas_by_camera)
 
     roster = _ensure_kit_roster(db, match, cluster_meta)
     roster_by_key = {(r.team_id, r.shirt_number): r for r in roster}
@@ -186,6 +148,137 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
 
     db.commit()
     return links
+
+
+def _camera_of(track) -> str:
+    label = getattr(track, "camera_label", None)
+    return str(getattr(label, "value", label) or "A")
+
+
+def _camera_cluster_meta(tracks: list[PlayerTrack]) -> list[dict]:
+    """Cluster one camera's person tracks into candidate players."""
+    clusters = _cluster_tracks(tracks)
+    clusters = sorted(
+        clusters,
+        key=lambda c: sum(t.end_ms - t.start_ms for t in c),
+        reverse=True,
+    )[: max_auto_players()]
+
+    cluster_meta: list[dict] = []
+    for cluster in clusters:
+        number, nconf = _cluster_jersey(cluster)
+        hist = _cluster_mean_hist(cluster)
+        cluster_meta.append(
+            {
+                "tracks": cluster,
+                "camera": _camera_of(cluster[0]),
+                "jersey_number": number,
+                "jersey_confidence": nconf,
+                "has_color": hist is not None,
+                "color_hist": hist,
+                "duration": sum(t.end_ms - t.start_ms for t in cluster),
+                "kit": "A",  # filled by _assign_kits
+            }
+        )
+    for meta in cluster_meta:
+        meta["reid_emb"] = _mean_reid(meta["tracks"])
+
+    # BoT-SORT/ByteTrack still fragment one player → many clusters.
+    # Prefer OSNet ReID merge, then colour-hist fallback, then kits.
+    try:
+        from app.services.reid import merge_tracks_by_reid, reid_enabled
+
+        if reid_enabled():
+            cluster_meta = merge_tracks_by_reid(cluster_meta)
+            for meta in cluster_meta:
+                _refresh_meta(meta)
+    except Exception:
+        pass
+    return _merge_colour_fragments(cluster_meta)
+
+
+def _mean_reid(tracks: list) -> list[float] | None:
+    embs = [e for t in tracks if (e := (getattr(t, "features", None) or {}).get("reid_emb"))]
+    if not embs:
+        return None
+    import numpy as np
+
+    m = np.mean(np.asarray(embs, dtype=np.float32), axis=0)
+    return (m / float(np.linalg.norm(m) + 1e-12)).tolist()
+
+
+# Cross-camera link: OSNet cosine needed to call two angles the same player
+# (views differ, so looser than the same-camera REID_MERGE_SIM).
+CROSS_CAM_REID_SIM = 0.6
+CROSS_CAM_COLOUR_SIM = 0.9
+
+
+def _cross_camera_score(anchor: dict, other: dict) -> float | None:
+    """Similarity of two clusters seen on different cameras; None = impossible."""
+    kit_a, kit_o = anchor.get("kit"), other.get("kit")
+    if kit_a != kit_o or kit_a not in {"A", "B"}:
+        return None
+    na, no = anchor.get("jersey_number"), other.get("jersey_number")
+    conf_a = float(anchor.get("jersey_confidence") or 0)
+    conf_o = float(other.get("jersey_confidence") or 0)
+    numbers_known = na is not None and no is not None and conf_a > 0 and conf_o > 0
+    if numbers_known and int(na) != int(no):
+        return None  # readable, different shirts ⇒ different players
+    from app.services.reid import cosine
+
+    reid = cosine(anchor.get("reid_emb"), other.get("reid_emb"))
+    if numbers_known:
+        return 1.0 + reid  # same kit + same shirt beats any appearance match
+    if anchor.get("reid_emb") is not None and other.get("reid_emb") is not None:
+        return reid if reid >= CROSS_CAM_REID_SIM else None
+    colour = _cosine(anchor.get("color_hist") or [], other.get("color_hist") or [])
+    return colour - 0.5 if colour >= CROSS_CAM_COLOUR_SIM else None
+
+
+def link_clusters_across_cameras(metas_by_camera: dict[str, list[dict]]) -> list[dict]:
+    """Fold other cameras' clusters into the reference camera's players.
+
+    Reference = camera with the most on-camera person time (usually A, the wide
+    view). Each other camera is matched one-to-one (Hungarian on the scores
+    above) so two players on one angle never collapse into one. Unmatched
+    clusters stay separate players — staff can merge them in review.
+    """
+    import numpy as np
+
+    from app.services.reid import linear_assignment_max
+
+    cams = sorted(
+        metas_by_camera,
+        key=lambda c: (-sum(int(m.get("duration") or 0) for m in metas_by_camera[c]), c),
+    )
+    merged = [dict(m, tracks=list(m["tracks"]), cameras=[m["camera"]]) for m in metas_by_camera[cams[0]]]
+    for cam in cams[1:]:
+        others = metas_by_camera[cam]
+        if not merged or not others:
+            merged.extend(dict(m, tracks=list(m["tracks"]), cameras=[cam]) for m in others)
+            continue
+        score = np.full((len(merged), len(others)), -np.inf)
+        for i, anchor in enumerate(merged):
+            if cam in anchor["cameras"]:
+                continue
+            for j, other in enumerate(others):
+                s = _cross_camera_score(anchor, other)
+                if s is not None:
+                    score[i, j] = s
+        matched: set[int] = set()
+        for i, j in linear_assignment_max(score):
+            anchor, other = merged[i], others[j]
+            anchor["tracks"].extend(other["tracks"])
+            anchor["cameras"].append(cam)
+            if anchor.get("jersey_number") is None and other.get("jersey_number") is not None:
+                anchor["jersey_number"] = other["jersey_number"]
+                anchor["jersey_confidence"] = other.get("jersey_confidence")
+            anchor["duration"] = int(anchor.get("duration") or 0) + int(other.get("duration") or 0)
+            matched.add(j)
+        merged.extend(
+            dict(m, tracks=list(m["tracks"]), cameras=[cam]) for j, m in enumerate(others) if j not in matched
+        )
+    return merged
 
 
 def _cluster_jersey(cluster: list[PlayerTrack]) -> tuple[int | None, float]:
@@ -484,12 +577,14 @@ def _ensure_kit_roster(db: Session, match: Match, cluster_meta: list[dict]) -> l
             db.flush()
         teams[kit] = team
 
-    # Assign shirt numbers unique within kit
+    # Assign shirt numbers unique within kit (skip refs / outliers → Kit X)
     used_by_kit: dict[str, set[int]] = {"A": set(), "B": set()}
     assignments: list[tuple[dict, str, int]] = []
 
     for meta in cluster_meta:
         kit = meta.get("kit") or "A"
+        if kit not in {"A", "B"}:
+            continue
         num = meta.get("jersey_number")
         if num is not None and int(num) not in used_by_kit[kit]:
             used_by_kit[kit].add(int(num))

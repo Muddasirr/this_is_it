@@ -56,3 +56,6 @@ scripts/kaggle/offline_wheels/
 !data/eval/fixture_detection/**
 !data/eval/roboflow_futsal/
 !data/eval/roboflow_futsal/DOWNLOAD_INSTRUCTIONS.txt
+
+# Generated Kaggle code bundle (scripts/kaggle/build_kaggle.py)
+scripts/kaggle/code_dataset/*.zip

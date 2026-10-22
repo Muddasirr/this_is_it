@@ -115,7 +115,10 @@ class YoloTrackBackend(VisionBackend):
         ocr_every = max(90, 450 // max(1, self.frame_stride))
         ball_every = 1
         tracker_cfg = self._tracker_cfg()
-        thumb_dir = Path(tempfile.gettempdir()) / "courtlens_thumbs" / camera_label
+        # Per-job dir when configured: a shared temp dir lets later videos on the
+        # same machine overwrite earlier crops that kit assignment still reads.
+        thumb_root = Path(get_settings().vision_thumb_dir or Path(tempfile.gettempdir()) / "courtlens_thumbs")
+        thumb_dir = thumb_root / camera_label
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
         try:

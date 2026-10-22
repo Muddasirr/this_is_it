@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""Run CourtLens offline pipeline across testing_videos/ (smoke or full).
+"""Run the real CourtLens pipeline (backend app.scripts.run_offline) across testing_videos/.
 
 Examples:
   # Local smoke (~few minutes): first 240 processed frames, stride 15, OCR off
   python scripts/run_testing_videos.py --smoke
-
   # One clip only
   python scripts/run_testing_videos.py --match Portugal --smoke
-
-  # Full GPU-style (stride 5, OCR on) for selected clips
+  # Full GPU-style (stride 5, OCR on) — prefer the Kaggle kernel for this
   VISION_DEVICE=0 python scripts/run_testing_videos.py --match test_video_2
+
+Byte-identical duplicates (the DFL "extra" downloads repeat clips) are skipped.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OFFLINE = ROOT / "scripts" / "kaggle" / "courtlens_offline"
+BACKEND = ROOT / "backend"
 VIDEOS = ROOT / "testing_videos"
 DEFAULT_OUT = ROOT / "data" / "corpus_out"
 
@@ -34,8 +36,21 @@ def _slug(name: str) -> str:
     return (s[:80] or "clip")
 
 
+def _fingerprint(path: Path) -> tuple[int, str]:
+    with path.open("rb") as f:
+        head = f.read(1 << 20)
+    return path.stat().st_size, hashlib.sha1(head).hexdigest()
+
+
 def list_videos(match: str | None) -> list[Path]:
-    vids = sorted(VIDEOS.glob("*.mp4"))
+    vids: list[Path] = []
+    seen: dict[tuple[int, str], Path] = {}
+    for v in sorted(VIDEOS.glob("*.mp4")):
+        fp = _fingerprint(v)
+        if fp in seen:
+            continue  # duplicate of seen[fp]
+        seen[fp] = v
+        vids.append(v)
     if not vids:
         raise SystemExit(f"No mp4 under {VIDEOS}")
     if match:
@@ -47,83 +62,41 @@ def list_videos(match: str | None) -> list[Path]:
 
 
 def run_one(video: Path, out_root: Path, *, smoke: bool) -> dict:
-    if str(OFFLINE) not in sys.path:
-        sys.path.insert(0, str(OFFLINE))
-
     slug = _slug(video.name)
     out_dir = out_root / slug
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
 
+    env = dict(os.environ)
     default_v5x = ROOT / "data" / "eval" / "football_analysis_model" / "best.pt"
-    weights = os.environ.get("COURTLENS_WEIGHTS") or (
-        str(default_v5x) if default_v5x.is_file() else str(ROOT / "yolov8n.pt")
-    )
-    os.environ["COURTLENS_VIDEO"] = str(video)
-    os.environ["COURTLENS_WEIGHTS"] = weights
-    os.environ["COURTLENS_OUT"] = str(out_dir)
-    os.environ["COURTLENS_CAMERA"] = "A"
-
+    env.setdefault("YOLO_MODEL", str(default_v5x) if default_v5x.is_file() else "yolov8n.pt")
     if smoke:
         # Force (do not setdefault) — shell may already export VISION_* from prior runs
-        os.environ["VISION_FRAME_STRIDE"] = os.environ.get("SMOKE_FRAME_STRIDE", "15")
-        os.environ["VISION_MAX_FRAMES"] = os.environ.get("SMOKE_MAX_FRAMES", "240")
-        os.environ["VISION_JERSEY_OCR"] = "0"
-        os.environ.setdefault("VISION_IMGSZ", "640")
+        env["VISION_FRAME_STRIDE"] = os.environ.get("SMOKE_FRAME_STRIDE", "15")
+        env["VISION_MAX_FRAMES"] = os.environ.get("SMOKE_MAX_FRAMES", "240")
+        env["VISION_JERSEY_OCR"] = "0"
     else:
-        os.environ.setdefault("VISION_FRAME_STRIDE", "5")
-        os.environ.setdefault("VISION_MAX_FRAMES", "0")
-        os.environ.setdefault("VISION_JERSEY_OCR", "1")
-
-    # Prefer CUDA when available unless caller pinned device
-    if "VISION_DEVICE" not in os.environ:
-        try:
-            import torch
-
-            os.environ["VISION_DEVICE"] = "0" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            os.environ["VISION_DEVICE"] = "cpu"
-
-    import run as courtlens_run
+        env.setdefault("VISION_FRAME_STRIDE", "5")
+        env.setdefault("VISION_MAX_FRAMES", "0")
+        env.setdefault("VISION_JERSEY_OCR", "1")
+    env["PYTHONPATH"] = str(BACKEND) + os.pathsep + env.get("PYTHONPATH", "")
 
     print("=" * 72)
     print(f"VIDEO {video.name}")
     print(f"OUT   {out_dir}")
-    print(
-        "ENV   stride=",
-        os.environ.get("VISION_FRAME_STRIDE"),
-        "max_frames=",
-        os.environ.get("VISION_MAX_FRAMES"),
-        "ocr=",
-        os.environ.get("VISION_JERSEY_OCR"),
-        "device=",
-        os.environ.get("VISION_DEVICE"),
-    )
-    courtlens_run.main()
+    cmd = [sys.executable, "-m", "app.scripts.run_offline", "--out", str(out_dir), "--camera", f"A={video}"]
+    subprocess.run(cmd, check=True, cwd=BACKEND, env=env)
 
-    table_path = out_dir / "player_table.json"
-    totals_path = out_dir / "match_stats.json"
-    summary = {
+    summary = json.loads((out_dir / "summary.json").read_text())
+    stats = json.loads((out_dir / "match_stats.json").read_text())
+    return {
         "video": video.name,
         "slug": slug,
         "out": str(out_dir),
-        "totals": {},
-        "players": 0,
-        "thumbs": 0,
+        "counts": summary.get("counts"),
+        "wall_seconds": summary.get("wall_seconds"),
+        "totals": stats.get("totals") or {},
     }
-    if totals_path.exists():
-        stats = json.loads(totals_path.read_text())
-        summary["totals"] = stats.get("totals") or {}
-        summary["players"] = len(stats.get("players") or [])
-        summary["detection"] = stats.get("detection") or {}
-    if table_path.exists():
-        table = json.loads(table_path.read_text())
-        summary["players"] = len(table)
-    thumbs = out_dir / "thumbs"
-    if thumbs.is_dir():
-        summary["thumbs"] = len(list(thumbs.glob("*.jpg")))
-    return summary
 
 
 def main() -> None:

@@ -31,7 +31,7 @@ def shared_clip(share_token: str, db: Session = Depends(get_db)) -> dict:
 @router.get("/matches/{share_token}")
 def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict:
     share = db.query(MatchShare).filter(MatchShare.share_token == share_token).first()
-    if not share:
+    if not share or share.revoked_at is not None:
         raise HTTPException(status_code=404, detail="Report not found")
     match = db.get(Match, share.match_id)
     if not match or match.status == MatchStatus.deleted:
@@ -84,7 +84,12 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
 
 
 def ensure_match_share(db: Session, match_id) -> MatchShare:
-    existing = db.query(MatchShare).filter(MatchShare.match_id == match_id).first()
+    """Active share for the match; a revoked link is never reissued — publish mints a new token."""
+    existing = (
+        db.query(MatchShare)
+        .filter(MatchShare.match_id == match_id, MatchShare.revoked_at.is_(None))
+        .first()
+    )
     if existing:
         return existing
     share = MatchShare(match_id=match_id, share_token=secrets.token_urlsafe(16))

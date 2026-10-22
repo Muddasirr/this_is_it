@@ -330,6 +330,30 @@ def match_stats(
     )
 
 
+@router.post("/{match_id}/share/revoke")
+def revoke_share(
+    facility_id: UUID,
+    match_id: UUID,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> dict:
+    """Kill every active public link for this match (PRD: share links revocable)."""
+    from datetime import UTC, datetime
+
+    from app.models import MatchShare
+
+    _match(db, facility_id, match_id)
+    shares = (
+        db.query(MatchShare)
+        .filter(MatchShare.match_id == match_id, MatchShare.revoked_at.is_(None))
+        .all()
+    )
+    for share in shares:
+        share.revoked_at = datetime.now(UTC)
+    db.commit()
+    return {"match_id": str(match_id), "revoked": len(shares)}
+
+
 @router.post("/{match_id}/publish")
 def publish_match(
     facility_id: UUID,

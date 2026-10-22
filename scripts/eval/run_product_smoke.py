@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 5 product-path smoke (no full GPU match required).
 
-Checks: CameraLabel A/B/C, fuse, possession, share payload includes per-player heatmaps,
+Checks: CameraLabel A–D, fuse, possession, share payload includes per-player heatmaps,
 avatars API helpers importable.
 """
 
@@ -26,7 +26,7 @@ def main() -> None:
 
     labels = {c.value for c in CameraLabel}
     report["checks"].append({"camera_labels": sorted(labels)})
-    if not {"A", "B", "C"}.issubset(labels):
+    if not {"A", "B", "C", "D"}.issubset(labels):
         report["ok"] = False
 
     cfg = court_settings("5v5")

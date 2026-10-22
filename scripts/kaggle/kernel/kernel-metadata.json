@@ -1,7 +1,7 @@
 {
-  "id": "muddasirr/courtlens-gpu-corpus",
-  "title": "courtlens-gpu-corpus",
-  "code_file": "courtlens_gpu_track.ipynb",
+  "id": "muddasirr/courtlens-gpu-eval",
+  "title": "courtlens-gpu-eval",
+  "code_file": "courtlens_gpu_eval.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,
@@ -10,8 +10,10 @@
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
+    "muddasirr/courtlens-code",
     "muddasirr/courtlens-test-video-2",
-    "muddasirr/courtlens-yolov5x-football"
+    "muddasirr/courtlens-yolov5x-football",
+    "saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv"
   ],
   "competition_sources": [],
   "kernel_sources": [],

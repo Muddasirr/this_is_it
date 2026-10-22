@@ -26,5 +26,6 @@ class FacilityUserOut(BaseModel):
     user_id: UUID
     role: FacilityRole
     created_at: datetime
+    email: str | None = None
 
     model_config = {"from_attributes": True}

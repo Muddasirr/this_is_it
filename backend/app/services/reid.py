@@ -175,3 +175,25 @@ def merge_tracks_by_reid(cluster_meta: list[dict]) -> list[dict]:
                 j += 1
             i += 1
     return metas
+
+
+def linear_assignment_max(score: np.ndarray) -> list[tuple[int, int]]:
+    """One-to-one pairs maximising total score; -inf cells are never paired."""
+    score = np.asarray(score, dtype=np.float64)
+    if score.size == 0 or not np.isfinite(score).any():
+        return []
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        cost = np.where(np.isfinite(score), -score, 1e9)
+        rows, cols = linear_sum_assignment(cost)
+        return [(int(i), int(j)) for i, j in zip(rows, cols) if np.isfinite(score[i, j])]
+    except ImportError:
+        pairs: list[tuple[int, int]] = []
+        s = score.copy()
+        while np.isfinite(s).any():
+            i, j = np.unravel_index(int(np.argmax(np.where(np.isfinite(s), s, -1e18))), s.shape)
+            pairs.append((int(i), int(j)))
+            s[i, :] = -np.inf
+            s[:, j] = -np.inf
+        return pairs
