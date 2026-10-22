@@ -1,6 +1,51 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# backend/app/core/config.py → repo root is parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_yolo_weights(name: str | None = None) -> str:
+    """Resolve a YOLO weights name to an existing file when possible."""
+    raw = (name or "yolov5x_football.pt").strip() or "yolov5x_football.pt"
+    given = Path(raw)
+    if given.is_file() and given.stat().st_size > 1000:
+        return str(given.resolve())
+
+    candidates = [
+        Path.cwd() / raw,
+        _BACKEND_ROOT / raw,
+        _REPO_ROOT / raw,
+        _BACKEND_ROOT / given.name,
+        _REPO_ROOT / given.name,
+    ]
+    stem = given.name.lower()
+    if "yolov5x" in stem or stem in {"best.pt", "yolov5x_football.pt"}:
+        candidates.extend(
+            [
+                _BACKEND_ROOT / "yolov5x_football.pt",
+                _REPO_ROOT / "yolov5x_football.pt",
+                _REPO_ROOT / "data/eval/football_analysis_model/best.pt",
+            ]
+        )
+    if stem in {"yolov8n.pt", "yolo11n.pt", "yolov8s.pt"}:
+        candidates.extend(
+            [
+                _BACKEND_ROOT / stem,
+                _REPO_ROOT / stem,
+                _REPO_ROOT / "scripts/kaggle/dataset" / stem,
+            ]
+        )
+    for cand in candidates:
+        try:
+            if cand.is_file() and cand.stat().st_size > 1000:
+                return str(cand.resolve())
+        except OSError:
+            continue
+    return raw
 
 
 class Settings(BaseSettings):
@@ -27,7 +72,7 @@ class Settings(BaseSettings):
 
     # Vision / Phase 0
     vision_backend: str = "yolo"  # yolo | stub
-    yolo_model: str = "yolov8n.pt"
+    yolo_model: str = "yolov5x_football.pt"
     vision_device: str = "cpu"  # cpu | 0 | cuda
     vision_frame_stride: int = 5  # process every Nth frame
     vision_conf: float = 0.25

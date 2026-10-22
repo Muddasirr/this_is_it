@@ -50,11 +50,18 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
                 "goal": row["goal"],
                 "shot": row["shot"],
                 "pass": row["pass"],
+                "assist": row.get("assist", 0),
+                "dribble": row.get("dribble", 0),
+                "pass_received": row.get("pass_received", 0),
                 "possession_pct": row.get("possession_pct", 0),
                 "touches": row.get("touches", 0),
                 "distance": row.get("distance", 0),
+                "minutes": row.get("minutes", 0),
+                "avg_speed": row.get("avg_speed", 0),
+                "conversion_pct": row.get("conversion_pct"),
                 "attribution": row.get("attribution", "estimated"),
                 "heatmap": row.get("heatmap"),
+                "possession_heatmap": row.get("possession_heatmap"),
             }
         )
     return {
@@ -63,10 +70,12 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
         "status": match.status.value,
         "totals": stats["totals"],
         "by_player": players,
+        "by_team": stats.get("by_team") or [],
         "heatmap": {
             "width": stats["heatmap"]["width"],
             "height": stats["heatmap"]["height"],
             "match": stats["heatmap"]["match"],
+            "match_possession": stats["heatmap"].get("match_possession"),
             "note": stats["heatmap"].get("note"),
             "by_player": True,
         },

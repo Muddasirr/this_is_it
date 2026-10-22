@@ -46,11 +46,18 @@ def main() -> None:
 
     # Share module includes heatmap field in source
     share_src = (ROOT / "backend/app/api/share.py").read_text()
-    if '"heatmap": row.get("heatmap")' not in share_src and "heatmap" not in share_src:
+    share_ok = all(
+        token in share_src
+        for token in (
+            '"heatmap": row.get("heatmap")',
+            '"assist": row.get("assist", 0)',
+            '"dribble": row.get("dribble", 0)',
+            '"possession_heatmap": row.get("possession_heatmap")',
+        )
+    )
+    report["checks"].append({"share_heatmap": share_ok})
+    if not share_ok:
         report["ok"] = False
-        report["checks"].append({"share_heatmap": False})
-    else:
-        report["checks"].append({"share_heatmap": True})
 
     # Frontend public report has player heat select
     app_src = (ROOT / "frontend/src/App.tsx").read_text()

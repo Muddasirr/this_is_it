@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from config import get_settings
+from config import get_settings, resolve_yolo_weights
 from vision import Detection, EventCandidate, VisionBackend
 
 logger = logging.getLogger(__name__)
@@ -24,12 +24,12 @@ MAX_BALL_SERIES = 2000
 
 
 class YoloTrackBackend(VisionBackend):
-    name = "yolov8n-bytetrack"
-    version = "0.3.0"
+    name = "yolov5x-football-botsort"
+    version = "0.5.0"
 
     def __init__(self) -> None:
         settings = get_settings()
-        self.model_name = settings.yolo_model
+        self.model_name = resolve_yolo_weights(settings.yolo_model)
         self.device = settings.vision_device
         self.frame_stride = max(1, settings.vision_frame_stride)
         self.conf = settings.vision_conf
@@ -45,8 +45,10 @@ class YoloTrackBackend(VisionBackend):
             return self._model
         from ultralytics import YOLO
 
-        logger.info("Loading YOLO model %s on %s", self.model_name, self.device)
-        self._model = YOLO(self.model_name)
+        weights = resolve_yolo_weights(self.model_name)
+        self.model_name = weights
+        logger.info("Loading YOLO model %s on %s", weights, self.device)
+        self._model = YOLO(weights)
         self._class_map = _build_class_map(self._model)
         return self._model
 
@@ -56,8 +58,9 @@ class YoloTrackBackend(VisionBackend):
             return self._coco_ball_model
         from ultralytics import YOLO
 
-        logger.info("Loading COCO ball fallback yolov8n.pt on %s", self.device)
-        self._coco_ball_model = YOLO("yolov8n.pt")
+        coco = resolve_yolo_weights("yolov8n.pt")
+        logger.info("Loading COCO ball fallback %s on %s", coco, self.device)
+        self._coco_ball_model = YOLO(coco)
         return self._coco_ball_model
 
     def detect_and_track(self, video_path: str, camera_label: str) -> list[Detection]:
@@ -315,13 +318,13 @@ class YoloTrackBackend(VisionBackend):
             )
             self._coco_fallback_attempted = True
             primary = self.model_name
-            self.model_name = "yolov8n.pt"
+            self.model_name = resolve_yolo_weights("yolov8n.pt")
             self._model = None
             self._class_map = None
             try:
                 dets = self.detect_and_track(video_path, camera_label)
                 self.last_run_stats["primary_model"] = primary
-                self.last_run_stats["fallback_model"] = "yolov8n.pt"
+                self.last_run_stats["fallback_model"] = self.model_name
                 return dets
             finally:
                 self._coco_fallback_attempted = False

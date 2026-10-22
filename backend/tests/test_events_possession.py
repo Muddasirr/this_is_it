@@ -100,6 +100,10 @@ def test_possession_change_creates_multiple_passes():
         for t in range(1600, 2600, 200):
             ball.append((t0 + t, 900, 360))
 
+    # Pad dense ball so len(ball_series) >= MIN_BALL_FOR_STRICT (80)
+    while len(ball) < 90:
+        t_last = ball[-1][0] + 100
+        ball.append((t_last, ball[-1][1], ball[-1][2]))
     dets = [p1, p2, _ball(ball)]
     cands = infer_event_candidates(dets, "A")
     passes = [c for c in cands if c.event_type == "pass"]

@@ -73,7 +73,10 @@ def main() -> None:
         "tolerance_ms": tol,
         "pred_total": len(pred),
         "gt_total": len(gt),
-        "by_class": [match_class(pred, gt, t, tol) for t in ("pass", "shot", "goal")],
+        "by_class": [
+            match_class(pred, gt, t, tol)
+            for t in ("pass", "shot", "goal", "assist", "dribble")
+        ],
         "pred_counts": defaultdict(int),
     }
     for e in pred:

@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.config import get_settings, resolve_yolo_weights
 from app.services.vision import Detection, EventCandidate, VisionBackend
 
 logger = logging.getLogger(__name__)
@@ -26,12 +26,12 @@ _CFG_DIR = Path(__file__).resolve().parents[2] / "cfg"
 
 
 class YoloTrackBackend(VisionBackend):
-    name = "yolov8n-botsort-osnet"
-    version = "0.4.0"
+    name = "yolov5x-football-botsort-osnet"
+    version = "0.5.0"
 
     def __init__(self) -> None:
         settings = get_settings()
-        self.model_name = settings.yolo_model
+        self.model_name = resolve_yolo_weights(settings.yolo_model)
         self.device = settings.vision_device
         self.frame_stride = max(1, settings.vision_frame_stride)
         self.conf = settings.vision_conf
@@ -58,8 +58,10 @@ class YoloTrackBackend(VisionBackend):
             return self._model
         from ultralytics import YOLO
 
-        logger.info("Loading YOLO model %s on %s", self.model_name, self.device)
-        self._model = YOLO(self.model_name)
+        weights = resolve_yolo_weights(self.model_name)
+        self.model_name = weights
+        logger.info("Loading YOLO model %s on %s", weights, self.device)
+        self._model = YOLO(weights)
         self._class_map = _build_class_map(self._model)
         return self._model
 
@@ -69,8 +71,9 @@ class YoloTrackBackend(VisionBackend):
             return self._coco_ball_model
         from ultralytics import YOLO
 
-        logger.info("Loading COCO ball fallback yolov8n.pt on %s", self.device)
-        self._coco_ball_model = YOLO("yolov8n.pt")
+        coco = resolve_yolo_weights("yolov8n.pt")
+        logger.info("Loading COCO ball fallback %s on %s", coco, self.device)
+        self._coco_ball_model = YOLO(coco)
         return self._coco_ball_model
 
     def detect_and_track(self, video_path: str, camera_label: str) -> list[Detection]:
@@ -166,6 +169,28 @@ class YoloTrackBackend(VisionBackend):
                             person_tracks[100000].append(
                                 _obs(ts_ms, conf, xyxy, frame_h, frame_w, "sports_ball")
                             )
+                            continue
+
+                        if mapped == "referee":
+                            if tid is None:
+                                continue
+                            person_tracks[tid].append(
+                                _obs(ts_ms, conf, xyxy, frame_h, frame_w, "referee")
+                            )
+                            # thumb for overlay / Kit X — no OCR/kit clustering
+                            bw = max(1.0, xyxy[2] - xyxy[0])
+                            bh = max(1.0, xyxy[3] - xyxy[1])
+                            thumb_score = bw * bh * conf
+                            if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= 28 and bh >= 40:
+                                x1 = max(0, int(xyxy[0]))
+                                y1 = max(0, int(xyxy[1]))
+                                x2 = min(frame.shape[1], int(xyxy[2]))
+                                y2 = min(frame.shape[0], int(xyxy[3]))
+                                crop = frame[y1:y2, x1:x2]
+                                if crop.size:
+                                    path = str(thumb_dir / f"r{tid}.jpg")
+                                    cv2.imwrite(path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                                    best_thumbs[tid] = (thumb_score, path)
                             continue
 
                         if mapped != "person":
@@ -271,12 +296,24 @@ class YoloTrackBackend(VisionBackend):
             if not obs:
                 continue
             class_name = obs[0].get("class_name", "person")
-            prefix = "b" if class_name == "sports_ball" else "p"
-            key_id = tid - 100000 if class_name == "sports_ball" else tid
+            if class_name == "sports_ball":
+                prefix, key_id = "b", tid - 100000
+            elif class_name == "referee":
+                prefix, key_id = "r", tid
+            else:
+                prefix, key_id = "p", tid
             series_obs = _downsample_series(
                 obs, MAX_BALL_SERIES if class_name == "sports_ball" else MAX_PERSON_SERIES
             )
+            # Fill short gaps in ball track (football_analysis interpolate)
+            if class_name == "sports_ball":
+                from app.services.possession import interpolate_bbox_series
+
+                series_obs = interpolate_bbox_series(series_obs, max_gap_ms=500)
             feats: dict[str, Any] = {"class": class_name}
+            if class_name == "referee" and tid in best_thumbs:
+                feats["thumb_path"] = best_thumbs[tid][1]
+                feats["is_referee"] = True
             if class_name == "person" and tid in color_sums and color_counts[tid]:
                 mean_hist = (color_sums[tid] / max(1, color_counts[tid])).astype(float)
                 # L2 normalize for cosine similarity later
@@ -351,6 +388,7 @@ class YoloTrackBackend(VisionBackend):
             "processing_fps": round(frames_processed / elapsed, 3) if elapsed else 0,
             "realtime_factor": round(video_seconds / elapsed, 3) if elapsed and video_seconds else None,
             "person_tracks": len(person_dets),
+            "referee_tracks": sum(1 for d in detections if d.class_name == "referee"),
             "person_bbox_samples": person_pts,
             "ball_tracks": sum(1 for d in detections if d.class_name == "sports_ball"),
             "ball_detections": ball_hits,
@@ -377,13 +415,13 @@ class YoloTrackBackend(VisionBackend):
             )
             self._coco_fallback_attempted = True
             primary = self.model_name
-            self.model_name = "yolov8n.pt"
+            self.model_name = resolve_yolo_weights("yolov8n.pt")
             self._model = None
             self._class_map = None
             try:
                 dets = self.detect_and_track(video_path, camera_label)
                 self.last_run_stats["primary_model"] = primary
-                self.last_run_stats["fallback_model"] = "yolov8n.pt"
+                self.last_run_stats["fallback_model"] = self.model_name
                 return dets
             finally:
                 self._coco_fallback_attempted = False
@@ -397,7 +435,11 @@ class YoloTrackBackend(VisionBackend):
 
 
 def _build_class_map(model) -> dict[int, str]:
-    """Map detector class ids → CourtLens person|sports_ball (skip referee)."""
+    """Map detector class ids → person | sports_ball | referee.
+
+    Football/futsal fine-tunes (player/goalkeeper/ball/referee) keep refs as
+    their own class so they never enter Kit A/B. COCO has no referee.
+    """
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
     out: dict[int, str] = {}
     for cid, name in names.items():
@@ -406,7 +448,8 @@ def _build_class_map(model) -> dict[int, str]:
             out[int(cid)] = "person"
         elif n in {"sports_ball", "sportsball", "ball", "football", "soccer_ball"}:
             out[int(cid)] = "sports_ball"
-        # referee intentionally omitted
+        elif n in {"referee", "ref", "official"}:
+            out[int(cid)] = "referee"
     if not out:
         out = {PERSON: "person", SPORTS_BALL: "sports_ball"}
     logger.info("YOLO class map: %s", {names.get(k, k): v for k, v in out.items()})

@@ -85,16 +85,33 @@ export type MatchStats = {
     shot: number;
     pass: number;
     assist?: number;
+    dribble?: number;
+    pass_received?: number;
     possession_pct?: number;
     touches?: number;
     distance?: number;
+    minutes?: number;
+    avg_speed?: number;
+    conversion_pct?: number | null;
     heatmap?: number[][];
+    possession_heatmap?: number[][];
     attribution: string;
+  }[];
+  by_team?: {
+    team_id?: string | null;
+    goal: number;
+    shot: number;
+    pass: number;
+    assist: number;
+    dribble: number;
+    possession_pct: number;
+    players: number;
   }[];
   heatmap?: {
     width: number;
     height: number;
     match: number[][];
+    match_possession?: number[][];
     unit?: string;
     note?: string;
   };
@@ -246,16 +263,24 @@ export const api = {
         goal: number;
         shot: number;
         pass: number;
+        assist?: number;
+        dribble?: number;
+        pass_received?: number;
         possession_pct: number;
         touches: number;
         distance: number;
+        minutes?: number;
+        avg_speed?: number;
+        conversion_pct?: number | null;
         attribution: string;
         heatmap?: number[][];
+        possession_heatmap?: number[][];
       }[];
       heatmap: {
         width: number;
         height: number;
         match: number[][];
+        match_possession?: number[][];
         note?: string;
         by_player?: boolean;
       };

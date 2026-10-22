@@ -472,6 +472,7 @@ function MatchPage() {
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<"center" | "setup" | "identity">("center");
   const [heatPlayerId, setHeatPlayerId] = useState<string>("match");
+  const [heatKind, setHeatKind] = useState<"presence" | "onball">("presence");
   const [photoModal, setPhotoModal] = useState<{ src: string; title: string } | null>(null);
   const [clipModal, setClipModal] = useState<{ src: string; title: string } | null>(null);
   const [clipBusyId, setClipBusyId] = useState<string | null>(null);
@@ -537,6 +538,8 @@ function MatchPage() {
   const goals = stats?.totals.goal ?? 0;
   const shots = stats?.totals.shot ?? 0;
   const passes = stats?.totals.pass ?? 0;
+  const assists = stats?.totals.assist ?? 0;
+  const dribbles = stats?.totals.dribble ?? 0;
   const leaderboard = [...(stats?.by_player || [])].sort(
     (a, b) =>
       (b.possession_pct ?? 0) * 2 +
@@ -550,16 +553,24 @@ function MatchPage() {
     .sort((a, b) => a.canonical_ts_ms - b.canonical_ts_ms);
   const selectedHeat =
     heatPlayerId === "match"
-      ? stats?.heatmap?.match
-      : leaderboard.find((p) => p.player_id === heatPlayerId)?.heatmap;
+      ? heatKind === "onball"
+        ? stats?.heatmap?.match_possession
+        : stats?.heatmap?.match
+      : heatKind === "onball"
+        ? leaderboard.find((p) => p.player_id === heatPlayerId)?.possession_heatmap
+        : leaderboard.find((p) => p.player_id === heatPlayerId)?.heatmap;
   const heatLabel =
     heatPlayerId === "match"
-      ? "Match heatmap (all players)"
-      : `${leaderboard.find((p) => p.player_id === heatPlayerId)?.display_name || "Player"} movement`;
+      ? heatKind === "onball"
+        ? "Match on-ball heatmap"
+        : "Match heatmap (all players)"
+      : `${leaderboard.find((p) => p.player_id === heatPlayerId)?.display_name || "Player"} ${
+          heatKind === "onball" ? "on the ball" : "movement"
+        }`;
 
   const eventPlayer = (ev: MatchEvent) => {
     const primary =
-      ev.participants.find((p) => ["passer", "shooter", "scorer", "primary"].includes(p.role)) ||
+      ev.participants.find((p) => ["passer", "shooter", "scorer", "carrier", "primary"].includes(p.role)) ||
       ev.participants[0];
     return playerName(primary?.player_id ?? null);
   };
@@ -597,6 +608,14 @@ function MatchPage() {
           <div className="bc-stat is-pass">
             <div className="bc-stat-value">{passes}</div>
             <div className="bc-stat-label">Passes</div>
+          </div>
+          <div className="bc-stat">
+            <div className="bc-stat-value">{assists}</div>
+            <div className="bc-stat-label">Assists</div>
+          </div>
+          <div className="bc-stat">
+            <div className="bc-stat-value">{dribbles}</div>
+            <div className="bc-stat-label">Dribbles</div>
           </div>
         </div>
 
@@ -638,7 +657,7 @@ function MatchPage() {
             <section className="bc-board">
               <div className="bc-board-head">
                 <h2>Squad board</h2>
-                <span>POS% · Touches · Move · G · S · P</span>
+                <span>POS% · Min · Touches · Move · G · S · A · D · P</span>
               </div>
               {leaderboard.length ? (
                 <>
@@ -647,6 +666,7 @@ function MatchPage() {
                       <tr>
                         <th>Player</th>
                         <th className="num" title="Possession share">POS%</th>
+                        <th className="num" title="On-camera minutes">Min</th>
                         <th className="num" title="Ball touches">Touches</th>
                         <th
                           className="num"
@@ -656,7 +676,10 @@ function MatchPage() {
                         </th>
                         <th className="num" title="Goals">G</th>
                         <th className="num" title="Shots">S</th>
+                        <th className="num" title="Assists">A</th>
+                        <th className="num" title="Dribbles">D</th>
                         <th className="num" title="Passes">P</th>
+                        <th className="num" title="Passes received">Rec</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -698,19 +721,23 @@ function MatchPage() {
                               </div>
                             </td>
                             <td className="num">{(row.possession_pct ?? 0).toFixed(0)}</td>
+                            <td className="num">{(row.minutes ?? 0).toFixed(1)}</td>
                             <td className="num">{row.touches ?? 0}</td>
                             <td className="num">{Math.round(row.distance ?? 0)}</td>
                             <td className="num">{row.goal}</td>
                             <td className="num">{row.shot}</td>
+                            <td className="num">{row.assist ?? 0}</td>
+                            <td className="num">{row.dribble ?? 0}</td>
                             <td className="num">{row.pass}</td>
+                            <td className="num">{row.pass_received ?? 0}</td>
                           </tr>
                         );
                       })}
                     </tbody>
                   </table>
                               <p className="bc-table-note">
-                    POS% possession · Touches = times on the ball · Move = relative distance in camera view
-                    (not metres). Tap a player for their pitch map; tap photo to enlarge.
+                    POS% possession · Min on camera · A assist · D dribble · Rec = passes received.
+                    Move is relative camera distance (not metres). Tap a player for their pitch map.
                   </p>
                 </>
               ) : (
@@ -820,6 +847,13 @@ function MatchPage() {
                       {p.display_name}
                     </option>
                   ))}
+                </select>
+              </label>
+              <label className="bc-heat-select">
+                Map
+                <select value={heatKind} onChange={(e) => setHeatKind(e.target.value as "presence" | "onball")}>
+                  <option value="presence">Movement</option>
+                  <option value="onball">On the ball</option>
                 </select>
               </label>
             </div>
@@ -1141,6 +1175,7 @@ function PublicReportPage() {
   const [error, setError] = useState("");
   const [photoModal, setPhotoModal] = useState<{ src: string; title: string } | null>(null);
   const [heatPlayerId, setHeatPlayerId] = useState("match");
+  const [heatKind, setHeatKind] = useState<"presence" | "onball">("presence");
 
   useEffect(() => {
     api
@@ -1171,12 +1206,20 @@ function PublicReportPage() {
   );
   const selectedHeat =
     heatPlayerId === "match"
-      ? data.heatmap?.match
-      : board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.heatmap;
+      ? heatKind === "onball"
+        ? data.heatmap?.match_possession
+        : data.heatmap?.match
+      : heatKind === "onball"
+        ? board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.possession_heatmap
+        : board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.heatmap;
   const heatLabel =
     heatPlayerId === "match"
-      ? "Match movement heatmap"
-      : `${board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.display_name || "Player"} movement`;
+      ? heatKind === "onball"
+        ? "Match on-ball heatmap"
+        : "Match movement heatmap"
+      : `${board.find((p) => (p.player_id || p.display_name) === heatPlayerId)?.display_name || "Player"} ${
+          heatKind === "onball" ? "on the ball" : "movement"
+        }`;
 
   return (
     <div className="page broadcast">
@@ -1208,6 +1251,14 @@ function PublicReportPage() {
             <div className="bc-stat-value">{data.totals.pass ?? 0}</div>
             <div className="bc-stat-label">Passes</div>
           </div>
+          <div className="bc-stat">
+            <div className="bc-stat-value">{data.totals.assist ?? 0}</div>
+            <div className="bc-stat-label">Assists</div>
+          </div>
+          <div className="bc-stat">
+            <div className="bc-stat-value">{data.totals.dribble ?? 0}</div>
+            <div className="bc-stat-label">Dribbles</div>
+          </div>
         </div>
         <div className="bc-confidence">
           <span>For coaches & players</span>
@@ -1217,14 +1268,15 @@ function PublicReportPage() {
       <div className="bc-layout">
         <section className="bc-board">
           <div className="bc-board-head">
-            <h2>Squad board</h2>
-            <span>POS% · Touches · Move · G · S · P</span>
+                <h2>Squad board</h2>
+                <span>POS% · Min · Touches · Move · G · S · A · D · P</span>
           </div>
           <table className="bc-table">
             <thead>
               <tr>
                 <th>Player</th>
                 <th className="num" title="Possession share">POS%</th>
+                <th className="num" title="On-camera minutes">Min</th>
                 <th className="num" title="Ball touches">Touches</th>
                 <th
                   className="num"
@@ -1234,7 +1286,10 @@ function PublicReportPage() {
                 </th>
                 <th className="num" title="Goals">G</th>
                 <th className="num" title="Shots">S</th>
+                <th className="num" title="Assists">A</th>
+                <th className="num" title="Dribbles">D</th>
                 <th className="num" title="Passes">P</th>
+                <th className="num" title="Passes received">Rec</th>
               </tr>
             </thead>
             <tbody>
@@ -1264,11 +1319,15 @@ function PublicReportPage() {
                     </div>
                   </td>
                   <td className="num">{(row.possession_pct ?? 0).toFixed(0)}</td>
+                  <td className="num">{(row.minutes ?? 0).toFixed(1)}</td>
                   <td className="num">{row.touches ?? 0}</td>
                   <td className="num">{Math.round(row.distance ?? 0)}</td>
                   <td className="num">{row.goal}</td>
                   <td className="num">{row.shot}</td>
+                  <td className="num">{row.assist ?? 0}</td>
+                  <td className="num">{row.dribble ?? 0}</td>
                   <td className="num">{row.pass}</td>
+                  <td className="num">{row.pass_received ?? 0}</td>
                 </tr>
               ))}
             </tbody>
@@ -1286,6 +1345,13 @@ function PublicReportPage() {
                     {p.display_name}
                   </option>
                 ))}
+              </select>
+            </label>
+            <label className="bc-heat-select">
+              Map
+              <select value={heatKind} onChange={(e) => setHeatKind(e.target.value as "presence" | "onball")}>
+                <option value="presence">Movement</option>
+                <option value="onball">On the ball</option>
               </select>
             </label>
           </div>

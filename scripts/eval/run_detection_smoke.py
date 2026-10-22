@@ -73,6 +73,21 @@ def main() -> None:
     try:
         from ultralytics import YOLO
 
+        v5x = ROOT / "data" / "eval" / "football_analysis_model" / "best.pt"
+        if not v5x.exists():
+            v5x = ROOT / "backend" / "yolov5x_football.pt"
+        if v5x.exists():
+            fm = YOLO(str(v5x))
+            fnames = fm.names if isinstance(fm.names, dict) else dict(enumerate(fm.names))
+            report["yolov5x_football"] = {
+                "weights": str(v5x),
+                "names": list(fnames.values()),
+                "has_player": any(str(v).lower() in {"player", "goalkeeper", "person"} for v in fnames.values()),
+                "has_ball": any(str(v).lower() in {"ball", "sports_ball", "sports ball"} for v in fnames.values()),
+                "has_referee": any(str(v).lower() in {"referee", "ref"} for v in fnames.values()),
+            }
+            if not report["yolov5x_football"]["has_player"] or not report["yolov5x_football"]["has_ball"]:
+                report["ok"] = False
         weights = ROOT / "yolov8n.pt"
         if not weights.exists():
             weights = ROOT / "scripts" / "kaggle" / "dataset" / "yolov8n.pt"

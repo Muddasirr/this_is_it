@@ -56,7 +56,10 @@ def run_one(video: Path, out_root: Path, *, smoke: bool) -> dict:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
 
-    weights = os.environ.get("COURTLENS_WEIGHTS") or str(ROOT / "yolov8n.pt")
+    default_v5x = ROOT / "data" / "eval" / "football_analysis_model" / "best.pt"
+    weights = os.environ.get("COURTLENS_WEIGHTS") or (
+        str(default_v5x) if default_v5x.is_file() else str(ROOT / "yolov8n.pt")
+    )
     os.environ["COURTLENS_VIDEO"] = str(video)
     os.environ["COURTLENS_WEIGHTS"] = weights
     os.environ["COURTLENS_OUT"] = str(out_dir)

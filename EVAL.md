@@ -47,7 +47,7 @@ Download Roboflow (needs `ROBOFLOW_API_KEY`):
 python scripts/eval/download_roboflow_futsal.py
 ```
 
-Fine-tune weights: `yolov8n_futsal.pt` (also `backend/models/futsal_yolov8n.pt`). Classes `ball/goalkeeper/player/referee` remap to CourtLens `sports_ball|person` (ref skipped). **Domain gap:** these weights score well on Roboflow images but often find zero players on facility CCTV — backend auto-falls back to `yolov8n.pt` when the primary model returns no person tracks. Keep `YOLO_MODEL=yolov8n.pt` for facility product runs; set `YOLO_MODEL=yolov8n_futsal.pt` for broadcast/Roboflow-like footage.
+Product default: `YOLO_MODEL=yolov5x_football.pt` (football_analysis YOLOv5x, classes `ball/goalkeeper/player/referee` remapped to CourtLens `sports_ball|person|referee`). Better referee and ball than COCO `yolov8n.pt`; ~3–5× slower on CPU. Facility CCTV with 0 players still auto-falls back to `yolov8n.pt`. Optional `yolov8n_futsal.pt` / `backend/models/futsal_yolov8n.pt` for Roboflow-like futsal still works the same way.
 
 ## Gates (pass/fail)
 
@@ -62,7 +62,7 @@ Fine-tune weights: `yolov8n_futsal.pt` (also `backend/models/futsal_yolov8n.pt`)
 
 ## Heatmaps
 
-Per-player grids live on `stats.by_player[].heatmap` (and share report). Match aggregate on `stats.heatmap.match`. Always image-plane / `estimated`.
+Per-player grids live on `stats.by_player[].heatmap` and `possession_heatmap` (share report too). Match aggregates on `stats.heatmap.match` and `match_possession`. Always image-plane / `estimated`.
 
 ## Labels
 

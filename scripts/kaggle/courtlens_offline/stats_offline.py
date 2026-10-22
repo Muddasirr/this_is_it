@@ -36,32 +36,40 @@ def build_player_stats(
                 "shot": 0,
                 "pass": 0,
                 "assist": 0,
+                "dribble": 0,
+                "pass_received": 0,
                 "possession_pct": 0.0,
                 "touches": 0,
                 "distance": 0.0,
+                "minutes": 0.0,
+                "avg_speed": 0.0,
+                "conversion_pct": None,
                 "heatmap": _empty_heat(),
+                "possession_heatmap": _empty_heat(),
                 "attribution": "estimated",
             },
         )
 
-    totals = {"goal": 0, "shot": 0, "pass": 0, "assist": 0}
+    totals = {"goal": 0, "shot": 0, "pass": 0, "assist": 0, "dribble": 0}
     for e in events:
         et = e.event_type
         if et in totals:
             totals[et] += 1
         keys = e.track_keys or []
         primary = keys[0] if keys else None
-        secondary = keys[1] if len(keys) > 1 else None
         if et == "pass":
             if primary and primary in track_to_player:
                 row(track_to_player[primary])["pass"] += 1
-            if secondary and secondary in track_to_player:
-                row(track_to_player[secondary])["assist"] += 1
-                totals["assist"] += 1
+            if len(keys) > 1 and keys[1] in track_to_player:
+                row(track_to_player[keys[1]])["pass_received"] += 1
         elif et == "shot" and primary and primary in track_to_player:
             row(track_to_player[primary])["shot"] += 1
         elif et == "goal" and primary and primary in track_to_player:
             row(track_to_player[primary])["goal"] += 1
+        elif et == "assist" and primary and primary in track_to_player:
+            row(track_to_player[primary])["assist"] += 1
+        elif et == "dribble" and primary and primary in track_to_player:
+            row(track_to_player[primary])["dribble"] += 1
 
     persons = [t for t in tracks if t.class_name == "person"]
     balls = [t for t in tracks if t.class_name == "sports_ball"]
@@ -97,6 +105,7 @@ def build_player_stats(
         pres_share = presence_ms.get(pid, 0) / total_pres
         blended = w_ball * ball_share + (1 - w_ball) * pres_share
         r["possession_pct"] = round(100.0 * blended, 1)
+        r["minutes"] = round(presence_ms.get(pid, 0) / 60000.0, 2)
         # Prefer ball-holder touches; fall back to pass/shot involvement when ball is sparse
         ball_t = int(touches.get(pid, 0))
         r["touches"] = ball_t if ball_t > 0 else int(event_touches.get(pid, 0))
@@ -107,6 +116,14 @@ def build_player_stats(
             100.0 * by_player[pid]["possession_pct"] / poss_sum, 1
         )
         by_player[pid]["distance"] = round(by_player[pid]["distance"], 2)
+        by_player[pid]["avg_speed"] = round(
+            by_player[pid]["distance"] / max(by_player[pid]["minutes"], 0.01), 1
+        )
+        by_player[pid]["conversion_pct"] = (
+            round(100.0 * by_player[pid]["goal"] / by_player[pid]["shot"], 1)
+            if by_player[pid]["shot"]
+            else None
+        )
         by_player[pid]["heatmap"] = _normalize_heat(by_player[pid]["heatmap"])
 
     player_rows = sorted(

@@ -76,6 +76,53 @@ def build_possession_timeline(detections: list[Detection]) -> dict[str, Any]:
     }
 
 
+def interpolate_bbox_series(
+    points: list[dict[str, Any]],
+    max_gap_ms: int = 500,
+    step_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Linear-interpolate ball (or any) boxes across short detection gaps.
+
+    Port of football_analysis Tracker.interpolate_ball_positions — fills
+    missing frames so possession / overlays do not drop the ball every miss.
+    """
+    if len(points) < 2:
+        return list(points)
+    pts = sorted(points, key=lambda p: int(p.get("ts_ms") or 0))
+    out: list[dict[str, Any]] = [dict(pts[0])]
+    for nxt in pts[1:]:
+        prev = out[-1]
+        t0 = int(prev.get("ts_ms") or 0)
+        t1 = int(nxt.get("ts_ms") or 0)
+        gap = t1 - t0
+        if gap <= 0:
+            if float(nxt.get("confidence") or 0) >= float(prev.get("confidence") or 0):
+                out[-1] = dict(nxt)
+            continue
+        if gap > max_gap_ms or gap < 2:
+            out.append(dict(nxt))
+            continue
+        # ~fps step from frame timing; default 40ms (~25fps)
+        dt = step_ms or max(20, min(80, gap // max(1, gap // 40)))
+        n_steps = max(1, gap // dt)
+        for i in range(1, n_steps):
+            a = i / n_steps
+            mid = {
+                **prev,
+                "ts_ms": t0 + int(a * gap),
+                "x1": float(prev["x1"]) * (1 - a) + float(nxt["x1"]) * a,
+                "y1": float(prev["y1"]) * (1 - a) + float(nxt["y1"]) * a,
+                "x2": float(prev["x2"]) * (1 - a) + float(nxt["x2"]) * a,
+                "y2": float(prev["y2"]) * (1 - a) + float(nxt["y2"]) * a,
+                "confidence": min(float(prev.get("confidence") or 0), float(nxt.get("confidence") or 0))
+                * 0.85,
+                "interpolated": True,
+            }
+            out.append(mid)
+        out.append(dict(nxt))
+    return out
+
+
 def merge_ball_series(balls: list[Detection]) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
     for b in balls:
@@ -89,7 +136,7 @@ def merge_ball_series(balls: list[Detection]) -> list[dict[str, Any]]:
                 out[-1] = pt
             continue
         out.append(pt)
-    return out
+    return interpolate_bbox_series(out, max_gap_ms=500)
 
 
 def _median_box_frac(series: list[dict[str, Any]]) -> float:

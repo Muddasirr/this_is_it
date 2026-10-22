@@ -432,28 +432,39 @@ def _smooth_kits_by_neighbours(cluster_meta: list[dict], sim_thresh: float = 0.9
 
 
 def _assign_kits(cluster_meta: list[dict]) -> None:
-    """Split clusters into Kit A / Kit B via jersey HSV descriptors.
+    """Split clusters into Kit A / Kit B (KMeans jersey crops → HSV fallback).
 
-    Does NOT use raw 64-D hist L2 (grass/skin/shadow made red≈black) or
-    low-S "lightness" (black and white both low-S). See kit_color.py.
+    Sticky kit via track_key / thumb. Refs (features.is_referee) → Kit X.
     """
+    import cv2
     from app.services.kit_color import assign_kits_from_descriptors, descriptor_from_thumb_path
 
     if not cluster_meta:
         return
     # Prefer thumb recompute — corpus hists are often grass-polluted
     for m in cluster_meta:
-        if m.get("jersey_hsv"):
-            continue
+        sticky = None
         for t in m.get("tracks") or []:
             feats = getattr(t, "features", None) or {}
-            if feats.get("jersey_hsv"):
+            if feats.get("is_referee") or getattr(t, "class_name", "") == "referee":
+                m["kit"] = "X"
+                m["class_name"] = "referee"
+                m["jersey_hsv"] = {**(m.get("jersey_hsv") or {}), "is_outlier": True}
+            path = feats.get("thumb_path")
+            if path and m.get("img") is None:
+                img = cv2.imread(str(path))
+                if img is not None:
+                    m["img"] = img
+                    m["thumb_path"] = path
+            if sticky is None:
+                sticky = getattr(t, "track_key", None)
+            if feats.get("jersey_hsv") and not m.get("jersey_hsv"):
                 m["jersey_hsv"] = feats["jersey_hsv"]
-                break
-            d = descriptor_from_thumb_path(feats.get("thumb_path"))
+        m["sticky_id"] = sticky or m.get("src")
+        if not m.get("jersey_hsv"):
+            d = descriptor_from_thumb_path(m.get("thumb_path"))
             if d:
                 m["jersey_hsv"] = d
-                break
     assign_kits_from_descriptors(cluster_meta)
 
 

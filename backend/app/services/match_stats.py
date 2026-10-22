@@ -34,6 +34,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         "shot": 0,
         "pass": 0,
         "assist": 0,
+        "dribble": 0,
         "confirmed": 0,
         "estimated": 0,
         "rejected": 0,
@@ -49,10 +50,16 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
                 "shot": 0,
                 "pass": 0,
                 "assist": 0,
+                "dribble": 0,
+                "pass_received": 0,
                 "possession_pct": 0.0,
                 "touches": 0,
                 "distance": 0.0,
+                "minutes": 0.0,
+                "avg_speed": 0.0,
+                "conversion_pct": None,
                 "heatmap": _empty_heat(),
+                "possession_heatmap": _empty_heat(),
                 "attribution": "estimated",
             },
         )
@@ -66,6 +73,9 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         for p in parts:
             if not p.player_id or e.confirmation == ConfirmationState.rejected:
                 continue
+            if et == "pass" and p.role == "receiver":
+                row(str(p.player_id))["pass_received"] += 1
+                continue
             if et == "pass" and p.role not in {"passer", "primary"}:
                 continue
             if et == "shot" and p.role not in {"shooter", "primary"}:
@@ -73,6 +83,8 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             if et == "goal" and p.role not in {"scorer", "primary"}:
                 continue
             if et == "assist" and p.role not in {"passer", "assist", "primary"}:
+                continue
+            if et == "dribble" and p.role not in {"carrier", "dribbler", "primary"}:
                 continue
             r = row(str(p.player_id))
             if et in r:
@@ -87,6 +99,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
     balls = [t for t in tracks if (t.features or {}).get("class") == "sports_ball"]
 
     match_heat = _empty_heat()
+    match_poss_heat = _empty_heat()
     for t in persons:
         pid = track_player.get(t.id)
         series = (t.features or {}).get("bbox_series") or []
@@ -99,6 +112,10 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             _add_heat(r["heatmap"], heat)
 
     poss_ms, touches = _possession_and_touches(persons, balls, track_player)
+    # Vidal-Codina §3.2.1: possession-informed heatmap (on-ball locations only)
+    _accumulate_possession_heat(
+        persons, balls, track_player, by_player, row, match_poss_heat
+    )
     event_touches = _event_touch_counts(db, events)
     # Blend ball-control with on-camera presence so sparse ball tracking
     # does not give one player ~100% possession.
@@ -119,6 +136,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         w_ball = 0.35 + 0.55 * coverage
         blended = w_ball * ball_share + (1 - w_ball) * pres_share
         r["possession_pct"] = round(100.0 * blended, 1)
+        r["minutes"] = round(presence_ms.get(pid, 0) / 60000.0, 2)
         ball_t = int(touches.get(pid, 0))
         r["touches"] = ball_t if ball_t > 0 else int(event_touches.get(pid, 0))
     # Renormalize possession to ~100%
@@ -146,10 +164,16 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
                 "shot": r["shot"],
                 "pass": r["pass"],
                 "assist": r["assist"],
+                "dribble": r["dribble"],
+                "pass_received": r["pass_received"],
                 "possession_pct": r["possession_pct"],
                 "touches": r["touches"],
                 "distance": round(r["distance"], 1),
+                "minutes": r["minutes"],
+                "avg_speed": _avg_speed(r["distance"], r["minutes"]),
+                "conversion_pct": _conversion_pct(r["goal"], r["shot"]),
                 "heatmap": _normalize_heat(r["heatmap"]),
+                "possession_heatmap": _normalize_heat(r["possession_heatmap"]),
                 "attribution": r["attribution"],
             }
         )
@@ -157,17 +181,22 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
     player_rows.sort(
         key=lambda x: (-x["possession_pct"], -(x["pass"] + x["shot"] * 3 + x["goal"] * 10))
     )
+    by_team = _aggregate_teams(player_rows)
 
     return {
         "totals": {
             **totals,
             "possession_coverage_pct": _ball_coverage_pct(balls, persons),
+            "players": len(player_rows),
+            "teams": len(by_team),
         },
         "by_player": player_rows,
+        "by_team": by_team,
         "heatmap": {
             "width": HEAT_W,
             "height": HEAT_H,
             "match": match_heat_n,
+            "match_possession": _normalize_heat(match_poss_heat),
             "unit": "image_plane_bins",
             "note": "Estimated from camera pixels — not calibrated pitch meters",
         },
@@ -178,10 +207,55 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             "unavailable": "Metric not available for this match",
             "possession": "Share of ball-control samples attributed to this player",
             "distance": "Relative path length in image space (not metres)",
+            "avg_speed": "Relative distance per minute on camera (not km/h)",
+            "minutes": "On-camera time from person tracks",
             "heatmap": "Where the player was detected most often in the camera frame",
+            "possession_heatmap": "Where the player was while holding the ball (Vidal-Codina)",
             "touches": "Ball-holder changes when ball is tracked; else pass/shot involvement count",
+            "dribble": "Progressive carry while retaining possession (estimated)",
+            "assist": "Pass immediately preceding a goal in the possession chain (estimated)",
+            "pass_received": "Completed passes where this player was the receiver",
+            "conversion_pct": "Goals per shot × 100 (None if no shots)",
         },
     }
+
+
+def _avg_speed(distance: float, minutes: float) -> float:
+    if minutes <= 0 and distance <= 0:
+        return 0.0
+    return round(float(distance) / max(float(minutes), 0.01), 1)
+
+
+def _conversion_pct(goals: int, shots: int) -> float | None:
+    if shots <= 0:
+        return None
+    return round(100.0 * float(goals) / float(shots), 1)
+
+
+def _aggregate_teams(player_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    teams: dict[str, dict[str, Any]] = {}
+    for r in player_rows:
+        tid = r.get("team_id") or "unknown"
+        t = teams.setdefault(
+            tid,
+            {
+                "team_id": None if tid == "unknown" else tid,
+                "goal": 0,
+                "shot": 0,
+                "pass": 0,
+                "assist": 0,
+                "dribble": 0,
+                "pass_received": 0,
+                "touches": 0,
+                "possession_pct": 0.0,
+                "players": 0,
+            },
+        )
+        for k in ("goal", "shot", "pass", "assist", "dribble", "pass_received", "touches"):
+            t[k] += int(r.get(k) or 0)
+        t["possession_pct"] = round(t["possession_pct"] + float(r.get("possession_pct") or 0), 1)
+        t["players"] += 1
+    return sorted(teams.values(), key=lambda x: (-x["goal"], -x["possession_pct"]))
 
 
 def _event_type_value(et: EventType) -> str:
@@ -236,6 +310,59 @@ def _series_to_heat(series: list[dict[str, Any]]) -> list[list[float]]:
         y = min(HEAT_H - 1, max(0, int((cy / h) * HEAT_H)))
         heat[y][x] += 1.0
     return heat
+
+
+def _accumulate_possession_heat(
+    persons: list[PlayerTrack],
+    balls: list[PlayerTrack],
+    track_player: dict[UUID, str],
+    by_player: dict[str, dict[str, Any]],
+    row_fn,
+    match_poss_heat: list[list[float]],
+) -> None:
+    """Bin player centers only on frames where they hold the ball (PZ)."""
+    ball_pts: list[dict[str, Any]] = []
+    for b in balls:
+        for pt in (b.features or {}).get("bbox_series") or []:
+            ball_pts.append(pt)
+    ball_pts.sort(key=lambda p: p.get("ts_ms", 0))
+    if not ball_pts:
+        return
+    person_series: dict[UUID, list[dict[str, Any]]] = {}
+    for t in persons:
+        series = (t.features or {}).get("bbox_series") or []
+        if series:
+            person_series[t.id] = sorted(series, key=lambda s: s.get("ts_ms", 0))
+    if not person_series:
+        return
+    sample_w = float(ball_pts[0].get("frame_w") or 1280)
+    sample_h = float(ball_pts[0].get("frame_h") or 720)
+    diag = (sample_w**2 + sample_h**2) ** 0.5
+    radius = max(70.0, POSSESSION_RADIUS_FRAC * diag)
+    for bp in ball_pts:
+        ts = int(bp.get("ts_ms") or 0)
+        best_tid = None
+        best_d = radius
+        for tid, series in person_series.items():
+            pt = _person_at(series, ts)
+            if not pt:
+                continue
+            d = _ball_to_player_dist(bp, pt)
+            if d < best_d:
+                best_d = d
+                best_tid = tid
+        if best_tid is None:
+            continue
+        pid = track_player.get(best_tid)
+        series = person_series[best_tid]
+        ppt = _person_at(series, ts)
+        if not ppt:
+            continue
+        cell = _series_to_heat([ppt])
+        _add_heat(match_poss_heat, cell)
+        if pid:
+            r = row_fn(pid)
+            _add_heat(r["possession_heatmap"], cell)
 
 
 def _add_heat(dst: list[list[float]], src: list[list[float]]) -> None:

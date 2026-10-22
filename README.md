@@ -23,7 +23,7 @@ docker compose up --build
 - App: http://localhost:5173  
 - API: http://localhost:8000/docs  
 
-Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov8n.pt`, `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`.
+Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov5x_football.pt` (football player/GK/ref/ball; ~3–5× slower on CPU than `yolov8n.pt`), `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`.
 
 ### Phase 0 CLI (no UI)
 

@@ -140,6 +140,12 @@ def _participant_roles(
     if event_type == "goal":
         scorer = evidence.get("shooter") or (track_keys[0] if track_keys else None)
         return [(scorer, "scorer")] if scorer else []
+    if event_type == "assist":
+        passer = evidence.get("passer") or (track_keys[0] if track_keys else None)
+        return [(passer, "passer")] if passer else []
+    if event_type == "dribble":
+        carrier = evidence.get("holder") or (track_keys[0] if track_keys else None)
+        return [(carrier, "carrier")] if carrier else []
     return [(k, "primary" if i == 0 else "secondary") for i, k in enumerate(track_keys)]
 
 
@@ -350,6 +356,8 @@ def process_job(db: Session, job_id: UUID) -> None:
                 "goal": EventType.goal,
                 "shot": EventType.shot,
                 "pass": EventType.pass_event,
+                "assist": EventType.assist,
+                "dribble": EventType.dribble,
             }
             created_events: list[MatchEvent] = []
             for (_etype, _sec), obs_list in fused.items():

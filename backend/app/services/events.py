@@ -80,11 +80,125 @@ def infer_event_candidates(
     shot_ts = {s.camera_ts_ms for s in shots}
     # Drop pass that double-counts the same release already labeled a shot
     passes = [p for p in passes if p.camera_ts_ms not in shot_ts]
+    goals = _goals_after_shots(shots, ball_series, camera_label)
+    dribbles = _dribbles_from_segments(segments, persons, camera_label, diag)
+    assists = _assists_from_goals(goals, passes, camera_label)
     candidates: list[EventCandidate] = []
     candidates.extend(passes)
     candidates.extend(shots)
-    candidates.extend(_goals_after_shots(shots, ball_series, camera_label))
+    candidates.extend(goals)
+    candidates.extend(assists)
+    candidates.extend(dribbles)
     return _dedupe(candidates)
+
+
+ASSIST_WINDOW_MS = 20000  # facility CCTV: longer chain than broadcast tracking
+DRIBBLE_MIN_MS = 1200
+DRIBBLE_MIN_DISP_FRAC = 0.06
+MAX_DRIBBLES = 40
+MAX_ASSISTS = 12
+
+
+def _assists_from_goals(
+    goals: list[EventCandidate],
+    passes: list[EventCandidate],
+    camera_label: str,
+) -> list[EventCandidate]:
+    """Pass whose receiver scores within ASSIST_WINDOW_MS → assist (passer).
+
+    Vidal-Codina style: events sit on possession chain; assist is the prior
+    completed pass into the scorer (estimated until review).
+    """
+    out: list[EventCandidate] = []
+    for g in goals:
+        gt = g.camera_ts_ms
+        scorer = (g.track_keys or [None])[0]
+        best = None
+        best_dt = ASSIST_WINDOW_MS + 1
+        for p in passes:
+            pt = p.camera_ts_ms
+            if pt >= gt or gt - pt > ASSIST_WINDOW_MS:
+                continue
+            keys = p.track_keys or []
+            # pass evidence often has receiver; else second track key
+            receiver = (p.evidence or {}).get("receiver") or (keys[1] if len(keys) > 1 else None)
+            passer = (p.evidence or {}).get("passer") or (keys[0] if keys else None)
+            if scorer and receiver and receiver != scorer:
+                continue
+            if not passer or passer == scorer:
+                continue
+            dt = gt - pt
+            if dt < best_dt:
+                best_dt = dt
+                best = (passer, p)
+        if best is None:
+            continue
+        passer, src_pass = best
+        out.append(
+            EventCandidate(
+                event_type="assist",
+                camera_label=camera_label,
+                camera_ts_ms=src_pass.camera_ts_ms,
+                confidence=min(0.55, 0.35 + src_pass.confidence * 0.3),
+                track_keys=[passer],
+                evidence={
+                    "heuristic": "pass_then_goal",
+                    "passer": passer,
+                    "scorer": scorer,
+                    "goal_ts_ms": gt,
+                    "method": "possession_chain_assist",
+                },
+            )
+        )
+        if len(out) >= MAX_ASSISTS:
+            break
+    return out
+
+
+def _dribbles_from_segments(
+    segments: list[tuple[str, int, int]],
+    persons: list[Detection],
+    camera_label: str,
+    diag: float,
+) -> list[EventCandidate]:
+    """Progressive carry: same holder keeps ball while moving (≥DRIBBLE_MIN_DISP).
+
+    Not in Vidal-Codina core taxonomy; useful futsal/facility metric (estimated).
+    """
+    by_key = {d.track_key: d for d in persons}
+    out: list[EventCandidate] = []
+    for holder, t0, t1 in segments:
+        if t1 - t0 < DRIBBLE_MIN_MS:
+            continue
+        det = by_key.get(holder)
+        if not det:
+            continue
+        series = sorted(det.bbox_series or [], key=lambda p: int(p.get("ts_ms") or 0))
+        pts = [p for p in series if t0 <= int(p.get("ts_ms") or 0) <= t1]
+        if len(pts) < 3:
+            continue
+        disp = _center_delta(pts[0], pts[-1]) / max(diag, 1.0)
+        if disp < DRIBBLE_MIN_DISP_FRAC:
+            continue
+        out.append(
+            EventCandidate(
+                event_type="dribble",
+                camera_label=camera_label,
+                camera_ts_ms=t0 + (t1 - t0) // 2,
+                confidence=0.45,
+                track_keys=[holder],
+                evidence={
+                    "heuristic": "possession_progressive_carry",
+                    "holder": holder,
+                    "duration_ms": t1 - t0,
+                    "disp_frac": round(disp, 4),
+                    "method": "facility_dribble_approx",
+                },
+            )
+        )
+        if len(out) >= MAX_DRIBBLES:
+            break
+    return out
 
 
 def _pass_flight_limit_ms(ball_series: list[dict[str, Any]]) -> int:
@@ -240,11 +354,9 @@ def _passes_from_segments(
             continue
         if flight > max_flight:
             continue
-        # Hard strike veto — only when ball tracking is dense enough for kinematics.
-        # On highlights (sparse ball) this falsely kills every handoff.
-        if max_flight <= MAX_FLIGHT_MS:
-            if _is_shot_kinematics(ball_series, a_end, a_end + SHOT_KIN_WINDOW_MS, diag):
-                continue
+        # Receiver already gained possession → completed pass (Vidal-Codina).
+        # Do NOT veto on strike kinematics: lateral/through balls are fast but
+        # still passes when B holds. Shots are handled separately when no receiver.
         # Require both sides held briefly (completed pass)
         if (a_end - a_start) < MIN_POSSESSION_MS:
             continue
@@ -434,6 +546,10 @@ def _dedupe(candidates: list[EventCandidate]) -> list[EventCandidate]:
             bucket = c.camera_ts_ms // SHOT_DEDUP_MS
         elif c.event_type == "goal":
             bucket = c.camera_ts_ms // GOAL_DEDUP_MS
+        elif c.event_type == "assist":
+            bucket = c.camera_ts_ms // ASSIST_WINDOW_MS
+        elif c.event_type == "dribble":
+            bucket = c.camera_ts_ms // DRIBBLE_MIN_MS
         else:
             bucket = c.camera_ts_ms // PASS_DEDUP_MS
         key = (c.event_type, bucket, tuple(sorted(c.track_keys)))

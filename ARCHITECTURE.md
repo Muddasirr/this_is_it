@@ -51,7 +51,7 @@ CourtLens copies this **pipeline shape**, not the stadium hardware.
 | Jersey OCR | **In pipeline** (Tesseract when available); kit colour always | Stronger OCR / trained reader |
 | Kit / team | HSV upper-body clustering → Kit A / Kit B | Facility-trained kit models |
 | Event ops room | Facility review UI | Optional ops tooling |
-| Event taxonomy | Pass, shot, goal (+ assist roles) | Saves, tackles, progressive passes |
+| Event taxonomy | Pass, shot, goal, assist, dribble | Saves, tackles, set pieces |
 | Live | Deferred | Optional |
 
 ---
@@ -106,7 +106,7 @@ Upload Camera A [(optional) Camera B]
 | Variable | Role | Production default |
 | -------- | ---- | ------------------ |
 | `VISION_BACKEND` | `yolo` \| `stub` | `yolo` |
-| `YOLO_MODEL` | Weights path | `yolov8n.pt` (facility default). `yolov8n_futsal.pt` remaps `player/gk/ball`; auto-falls back to COCO if no persons; COCO ball retry when primary is futsal |
+| `YOLO_MODEL` | Weights path | `yolov5x_football.pt` (football player/GK/ref/ball; resolves to `data/eval/football_analysis_model/best.pt`). Auto-falls back to `yolov8n.pt` if no persons (facility CCTV). `yolov8n_futsal.pt` remaps `player/gk/ball`. ~3–5× slower on CPU than `yolov8n.pt` |
 | `VISION_DEVICE` | `cpu` \| `0` | `0` on GPU workers |
 | `VISION_FRAME_STRIDE` | Process every Nth frame | `5` (balance quality/cost; raise on CPU) |
 | `VISION_CONF` / `VISION_IMGSZ` | Detector thresholds | `0.25` / `640` |
@@ -150,6 +150,14 @@ Only after a detected shot, if the ball **lingers** in the extreme goal band (�
 | Heatmap | Binned foot/centre positions on image plane |
 | Possession % | Blend of ball-holder time + on-camera presence (weights follow ball coverage) |
 | Touches | Possession holder changes (ball timeline); if no ball samples, pass/shot/goal primary roles |
+| Minutes | On-camera time from linked person tracks |
+| Avg speed | Relative distance / minutes (image plane; not km/h) |
+| Assist | Prior completed pass into a goal in the possession chain |
+| Dribble | Progressive carry while the same holder keeps the ball |
+| Pass received | Receiver role on completed passes |
+| Conversion % | Goals / shots × 100 (None if no shots) |
+| On-ball heatmap | Player location only while holding the ball (Vidal-Codina §3.2.1) |
+| Team totals | Sum of player stats by `team_id` |
 
 ### Aggregation
 
@@ -157,7 +165,9 @@ Only after a detected shot, if the ball **lingers** in the extreme goal band (�
 by_player[player_id].pass  += pass events (role passer|primary), not rejected
 by_player[player_id].shot  += shot events (role shooter|primary)
 by_player[player_id].goal  += goal events (role scorer|primary)
-by_player[player_id].assist += pass events (role assist|passer on assist) when modelled
+by_player[player_id].assist += assist events (role assist|passer|primary)
+by_player[player_id].dribble += dribble events (role carrier|dribbler|primary)
+by_player[player_id].pass_received += pass events (role receiver)
 ```
 
 Rejected events never count. UI shows confirmation state per metric.

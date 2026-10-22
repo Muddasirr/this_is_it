@@ -29,3 +29,7 @@ ultralytics-platform>=0.1.45
 lap>=0.5.12
 pytesseract>=0.3.10
 torchreid>=0.2.5
+# Keep protobuf <6 so google-cloud / grpcio-status stay compatible.
+# tensorboard 2.21 wants protobuf>=6.31; that conflict is pre-existing and
+# tensorboard is not a CourtLens runtime dep.
+protobuf>=5.26.1,<6

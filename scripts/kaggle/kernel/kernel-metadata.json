@@ -10,7 +10,8 @@
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
-    "muddasirr/courtlens-test-video-2"
+    "muddasirr/courtlens-test-video-2",
+    "muddasirr/courtlens-yolov5x-football"
   ],
   "competition_sources": [],
   "kernel_sources": [],

@@ -87,9 +87,9 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 
 **Events, review, stats**
 
-- Candidate pass / shot / goal (+ assist when roles exist); cross-camera dedupe when 2-cam.
+- Candidate pass / shot / goal / assist / dribble; cross-camera dedupe when 2-cam.
 - Review UI: timeline, evidence clips, accept / reject / edit; full audit log.
-- Match dashboard + per-player reports: goals, shots, passes, possession %, touches, distance, heatmaps.
+- Match dashboard + per-player reports: goals, shots, passes, assists, dribbles, receptions, possession %, touches, minutes, relative speed, conversion %, movement + on-ball heatmaps.
 - Clear `estimated` / `confirmed` / `unavailable` labelling in UI and exports.
 - Publish + shareable report link (`/report/<token>`).
 

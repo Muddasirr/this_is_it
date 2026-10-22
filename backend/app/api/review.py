@@ -58,6 +58,7 @@ class StatsOut(BaseModel):
     status: str
     totals: dict
     by_player: list[dict]
+    by_team: list[dict] | None = None
     heatmap: dict | None = None
     labels: dict
 
@@ -151,7 +152,13 @@ def review_event(
     elif payload.action == "edit":
         event.confirmation = ConfirmationState.confirmed
         if payload.event_type:
-            mapping = {"goal": EventType.goal, "shot": EventType.shot, "pass": EventType.pass_event, "assist": EventType.assist}
+            mapping = {
+                "goal": EventType.goal,
+                "shot": EventType.shot,
+                "pass": EventType.pass_event,
+                "assist": EventType.assist,
+                "dribble": EventType.dribble,
+            }
             if payload.event_type not in mapping:
                 raise HTTPException(status_code=400, detail="Invalid event_type")
             event.event_type = mapping[payload.event_type]
@@ -317,6 +324,7 @@ def match_stats(
         status=match.status.value,
         totals=built["totals"],
         by_player=built["by_player"],
+        by_team=built.get("by_team"),
         heatmap=built.get("heatmap"),
         labels=built["labels"],
     )

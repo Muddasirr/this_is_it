@@ -86,6 +86,7 @@ class EventType(str, enum.Enum):
     shot = "shot"
     pass_event = "pass"
     assist = "assist"
+    dribble = "dribble"
 
 
 class ConfirmationState(str, enum.Enum):

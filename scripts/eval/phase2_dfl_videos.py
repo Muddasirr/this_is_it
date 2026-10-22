@@ -61,7 +61,13 @@ def _collect_crops(video: Path) -> list[tuple]:
     import cv2
     from ultralytics import YOLO
 
-    weights = _BACKEND / "yolov8n.pt"
+    weights = _BACKEND / "yolov5x_football.pt"
+    if not weights.is_file():
+        weights = _BACKEND.parent / "data/eval/football_analysis_model/best.pt"
+    if not weights.is_file():
+        weights = Path("/app/yolov5x_football.pt")
+    if not weights.is_file():
+        weights = _BACKEND / "yolov8n.pt"
     if not weights.is_file():
         weights = Path("/app/yolov8n.pt")
     model = YOLO(str(weights))

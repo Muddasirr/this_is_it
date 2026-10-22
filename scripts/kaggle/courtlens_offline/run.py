@@ -43,8 +43,12 @@ def main() -> None:
     if not weights:
         import glob
 
-        cands = glob.glob("/kaggle/input/**/yolov8n.pt", recursive=True)
-        weights = cands[0] if cands else "yolov8n.pt"
+        cands = (
+            glob.glob("/kaggle/input/**/yolov5x_football.pt", recursive=True)
+            or glob.glob("/kaggle/input/**/football_analysis_model/best.pt", recursive=True)
+            or glob.glob("/kaggle/input/**/yolov8n.pt", recursive=True)
+        )
+        weights = cands[0] if cands else "yolov5x_football.pt"
 
     cuda = torch.cuda.is_available()
     print("cuda:", cuda, torch.cuda.get_device_name(0) if cuda else "cpu")
