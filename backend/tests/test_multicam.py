@@ -59,8 +59,15 @@ def test_two_passes_on_one_camera_stay_separate():
 
 def test_different_players_on_two_cameras_stay_separate():
     players = {"A-p1": "kitA#7", "B-p5": "kitB#4"}
-    cands = [_evt("pass", "A", 10_000, ["A-p1"]), _evt("pass", "B", 10_300, ["B-p5"])]
+    cands = [_evt("pass", "A", 10_000, ["A-p1"]), _evt("pass", "B", 10_900, ["B-p5"])]
     assert len(group_event_candidates(cands, player_of=players.get)) == 2
+
+
+def test_same_moment_fuses_despite_misattributed_player():
+    # Kaggle synthetic 3-cam: one pass, different passer per angle, 120 ms apart
+    players = {"A-p1": "kitB#2", "B-p5": "kitA#8"}
+    cands = [_evt("pass", "A", 8_320, ["A-p1"]), _evt("pass", "B", 8_200, ["B-p5"])]
+    assert len(group_event_candidates(cands, player_of=players.get)) == 1
 
 
 def test_four_cameras_one_event():
@@ -115,3 +122,13 @@ def test_conflicting_shirts_never_link():
     a = [_meta("A", "A", 7, 0.9, [1.0, 0.0], 60_000)]
     b = [_meta("B", "A", 9, 0.9, [1.0, 0.0])]
     assert len(link_clusters_across_cameras({"A": a, "B": b})) == 2
+
+
+def test_xcorr_lag_ignores_tiny_overlap_lags():
+    # Realistic: shared slow "play intensity" + per-camera noise; B starts 3 s late.
+    rng = np.random.default_rng(7)
+    play = np.convolve(rng.random(320), np.ones(8) / 8, mode="same")
+    ref = play[:280] + 0.3 * rng.random(280)
+    other = play[30:280] + 0.3 * rng.random(250)
+    lag_ms, _ = xcorr_lag(ref, other, 10.0)
+    assert abs(lag_ms - 3000) <= 200

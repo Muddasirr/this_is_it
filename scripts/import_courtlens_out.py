@@ -138,7 +138,7 @@ def main() -> None:
             env={**dict(**{k: v for k, v in __import__("os").environ.items()}), "DOCKER_HOST": "unix:///var/run/docker.sock"},
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=3600,
         )
         print(proc.stdout)
         if proc.returncode != 0:

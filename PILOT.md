@@ -23,7 +23,7 @@
 ## Honest quality notes for the pilot court
 
 - Ball-heavy stats (shots/goals) need visible ball; wide CCTV may under-count
-- Jersey OCR works when numbers are readable; otherwise color clustering + rename
+- Shirt numbers are only proposed by the trained jersey classifier when configured (generic OCR was right for 7 % of players on SoccerNet); otherwise kit colour + staff rename
 - All auto stats stay **estimated** until staff confirm
 
 ## Free GPU options (training / faster offline runs)

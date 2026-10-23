@@ -34,14 +34,21 @@ class YoloTrackBackend(VisionBackend):
         self.model_name = resolve_yolo_weights(settings.yolo_model)
         self.device = settings.vision_device
         self.frame_stride = max(1, settings.vision_frame_stride)
+        self.target_fps = float(getattr(settings, "vision_target_fps", 0) or 0)
+        self.team_embed_on = bool(getattr(settings, "vision_team_embed", True))
         self.conf = settings.vision_conf
         self.imgsz = settings.vision_imgsz
+        self.imgsz_max = int(getattr(settings, "vision_imgsz_max", 1920) or 1920)
         self.max_frames = settings.vision_max_frames  # 0 = full video
         self.tracker_name = (settings.vision_tracker or "botsort").strip().lower()
         self.reid_on = bool(getattr(settings, "vision_reid", True))
         self.reid_every = max(1, int(getattr(settings, "vision_reid_every", 3) or 3))
         self._model = None
         self._coco_ball_model = None
+        self._ball_model = None
+        # Benchmarks set a list here to receive every processed frame's person boxes
+        # (frame_idx, track_id, x1, y1, x2, y2, conf) — bbox_series is downsampled.
+        self.frame_log: list[tuple] | None = None
         self._class_map: dict[int, str] | None = None
         self.last_run_stats: dict[str, Any] = {}
 
@@ -65,6 +72,20 @@ class YoloTrackBackend(VisionBackend):
         self._class_map = _build_class_map(self._model)
         return self._model
 
+    def _load_ball_model(self):
+        """Separate instance of the primary weights for the hi-res ball pass.
+
+        Calling .predict on the tracking model shares its predictor: the ball-only
+        results then feed the person tracker's update callback and every person
+        track is marked lost on those frames.
+        """
+        if self._ball_model is None:
+            from ultralytics import YOLO
+
+            self._load()  # resolves self.model_name to a weights path
+            self._ball_model = YOLO(self.model_name)
+        return self._ball_model
+
     def _load_coco_ball(self):
         """COCO yolov8n for tiny-ball retry when primary is a futsal fine-tune."""
         if self._coco_ball_model is not None:
@@ -81,6 +102,7 @@ class YoloTrackBackend(VisionBackend):
         import numpy as np
 
         model = self._load()
+        reset_tracker(model)
         class_map: dict[int, str] = self._class_map or {
             PERSON: "person",
             SPORTS_BALL: "sports_ball",
@@ -95,6 +117,14 @@ class YoloTrackBackend(VisionBackend):
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        imgsz = self.imgsz or auto_imgsz(
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0), self.imgsz_max
+        )
+        if self.target_fps > 0:
+            # Same temporal density on 25 and 60 fps sources (fast players need ~10 Hz to keep IDs)
+            self.frame_stride = max(1, int(round(fps / self.target_fps)))
+        team_crops: dict[int, list[Any]] = defaultdict(list)
+        team_crop_frame: dict[int, int] = {}
 
         person_tracks: dict[int, list[dict[str, Any]]] = defaultdict(list)
         color_sums: dict[int, Any] = {}
@@ -104,15 +134,24 @@ class YoloTrackBackend(VisionBackend):
         jersey_votes: dict[int, list[tuple[int, float]]] = defaultdict(list)
         best_thumbs: dict[int, tuple[float, str]] = {}
         ball_hits = 0
+        # (ts_ms, x1, y1, x2, y2, conf, frame_h, frame_w) — every ball candidate; the match
+        # ball is chosen after the loop (ball_select: static spares out, trajectory first)
+        ball_cands: list[tuple] = []
         frames_processed = 0
         person_box_total = 0
         person_box_with_id = 0
         t0 = time.perf_counter()
         frame_idx = 0
-        from app.services.jersey_ocr import jersey_ocr_enabled, read_jersey_number
+        from app.services.jersey_ocr import jersey_reader
 
-        ocr_on = jersey_ocr_enabled()
-        ocr_every = max(90, 450 // max(1, self.frame_stride))
+        read_jersey_number = jersey_reader()
+        ocr_on = read_jersey_number is not None
+        # Trained classifier is cheap: more reads per frame and per track for a real vote;
+        # Tesseract (opt-in only) keeps the old throttle.
+        fast_reader = getattr(read_jersey_number, "__name__", "") == "read_jersey_number_cls"
+        ocr_every = 5 if fast_reader else max(90, 450 // max(1, self.frame_stride))
+        ocr_per_frame = 6 if fast_reader else 1
+        ocr_per_track = 8 if fast_reader else 2
         ball_every = 1
         tracker_cfg = self._tracker_cfg()
         # Per-job dir when configured: a shared temp dir lets later videos on the
@@ -138,7 +177,7 @@ class YoloTrackBackend(VisionBackend):
                     frame,
                     persist=True,
                     conf=self.conf,
-                    imgsz=self.imgsz,
+                    imgsz=imgsz,
                     device=self.device,
                     classes=track_classes,
                     tracker=tracker_cfg,
@@ -150,7 +189,7 @@ class YoloTrackBackend(VisionBackend):
                 frame_h = float(frame.shape[0])
                 frame_w = float(frame.shape[1])
                 ball_seen_this_frame = False
-                ocr_budget = 1 if (ocr_on and frames_processed % ocr_every == 0) else 0
+                ocr_budget = ocr_per_frame if (ocr_on and frames_processed % ocr_every == 0) else 0
                 do_reid = self.reid_on and (frames_processed % self.reid_every == 0)
                 reid_boxes: list[list[float]] = []
                 reid_tids: list[int] = []
@@ -169,9 +208,7 @@ class YoloTrackBackend(VisionBackend):
                             # Balls often lack tracker IDs — still keep the observation.
                             ball_hits += 1
                             ball_seen_this_frame = True
-                            person_tracks[100000].append(
-                                _obs(ts_ms, conf, xyxy, frame_h, frame_w, "sports_ball")
-                            )
+                            ball_cands.append((ts_ms, *xyxy, conf, frame_h, frame_w))
                             continue
 
                         if mapped == "referee":
@@ -204,6 +241,8 @@ class YoloTrackBackend(VisionBackend):
                         person_box_with_id += 1
 
                         obs = _obs(ts_ms, conf, xyxy, frame_h, frame_w, "person")
+                        if self.frame_log is not None:
+                            self.frame_log.append((frame_idx, tid, *xyxy, conf))
                         person_tracks[tid].append(obs)
                         hist = _upper_body_hsv_hist(frame, xyxy)
                         if hist is not None:
@@ -218,6 +257,8 @@ class YoloTrackBackend(VisionBackend):
                         if do_reid:
                             reid_boxes.append(xyxy)
                             reid_tids.append(tid)
+                        if self.team_embed_on:
+                            _sample_team_crop(frame, xyxy, tid, frames_processed, team_crops, team_crop_frame)
                         # Best in-match crop for avatar (prefer large, confident box)
                         bw = max(1.0, xyxy[2] - xyxy[0])
                         bh = max(1.0, xyxy[3] - xyxy[1])
@@ -232,7 +273,7 @@ class YoloTrackBackend(VisionBackend):
                                 path = str(thumb_dir / f"p{tid}.jpg")
                                 cv2.imwrite(path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                                 best_thumbs[tid] = (thumb_score, path)
-                        if ocr_budget > 0 and bw >= 36 and len(jersey_votes.get(tid, [])) < 2:
+                        if ocr_budget > 0 and bw >= 36 and len(jersey_votes.get(tid, [])) < ocr_per_track:
                             hit = read_jersey_number(frame, xyxy)
                             ocr_budget -= 1
                             if hit:
@@ -251,32 +292,40 @@ class YoloTrackBackend(VisionBackend):
                             logger.warning("ReID embed failed: %s", e)
 
                 # Futsal balls are tiny on wide CCTV — sparse second pass (not every frame)
-                if not ball_seen_this_frame and frames_processed % ball_every == 0:
-                    ball_imgsz = max(self.imgsz, 960)
+                # Hi-res ball pass also when a ball was seen: the primary may only see a
+                # spare ball by the touchline (every 2nd frame to bound cost).
+                if (not ball_seen_this_frame or frames_processed % 2 == 0) and frames_processed % ball_every == 0:
+                    ball_imgsz = max(imgsz, 960)
                     ball_conf = min(self.conf, 0.12)
                     ball_cls_ids = [cid for cid, name in class_map.items() if name == "sports_ball"]
-                    ball_model = model
+                    ball_model = self._load_ball_model()
                     if need_coco_ball:
                         ball_model = self._load_coco_ball()
                         ball_cls_ids = [SPORTS_BALL]
                     if ball_cls_ids:
+                        # Frames wider than the detector input are shrunk and a ~10 px ball vanishes:
+                        # tile at native resolution instead (SAHI-style), offsets mapped back.
+                        tiles = ball_tiles(frame.shape[1], frame.shape[0], ball_imgsz)
                         ball_results = ball_model.predict(
-                            frame,
+                            [frame[y0:y1, x0:x1] for x0, y0, x1, y1 in tiles] if len(tiles) > 1 else frame,
                             conf=ball_conf,
                             imgsz=ball_imgsz,
                             device=self.device,
                             classes=ball_cls_ids,
                             verbose=False,
                         )
-                        bboxes = ball_results[0].boxes
-                        if bboxes is not None and len(bboxes) > 0:
-                            best_i = int(bboxes.conf.argmax().item())
-                            conf = float(bboxes.conf[best_i].item())
-                            xyxy = bboxes.xyxy[best_i].tolist()
+                        found = []
+                        for (x0, y0, _x1, _y1), res in zip(tiles, ball_results):
+                            bb = res.boxes
+                            if bb is None or not len(bb):
+                                continue
+                            for j in bb.conf.argsort(descending=True)[:BALL_CANDIDATES_PER_FRAME].tolist():
+                                bx1, by1, bx2, by2 = bb.xyxy[j].tolist()
+                                found.append((float(bb.conf[j].item()), [bx1 + x0, by1 + y0, bx2 + x0, by2 + y0]))
+                        for conf_b, box in sorted(found, key=lambda t: -t[0])[:BALL_CANDIDATES_PER_FRAME]:
+                            ball_cands.append((ts_ms, *box, conf_b, frame_h, frame_w))
+                        if found:
                             ball_hits += 1
-                            person_tracks[100000].append(
-                                _obs(ts_ms, conf, xyxy, frame_h, frame_w, "sports_ball")
-                            )
 
                 if frames_processed % 50 == 0:
                     elapsed_so_far = time.perf_counter() - t0
@@ -294,6 +343,16 @@ class YoloTrackBackend(VisionBackend):
             cap.release()
 
         elapsed = time.perf_counter() - t0
+        from app.services.ball_select import select_ball
+        from app.services.ball_select import summary as ball_summary
+
+        chosen_ball = select_ball([c[:6] for c in ball_cands], frames_processed)
+        dims = {c[0]: (c[6], c[7]) for c in ball_cands}
+        if chosen_ball:
+            person_tracks[100000] = [
+                _obs(c[0], c[5], list(c[1:5]), dims[c[0]][0], dims[c[0]][1], "sports_ball") for c in chosen_ball
+            ]
+        team_embs = _embed_team_crops(team_crops, self.device) if self.team_embed_on else {}
         detections: list[Detection] = []
         for tid, obs in person_tracks.items():
             if not obs:
@@ -308,12 +367,11 @@ class YoloTrackBackend(VisionBackend):
             series_obs = _downsample_series(
                 obs, MAX_BALL_SERIES if class_name == "sports_ball" else MAX_PERSON_SERIES
             )
-            # Fill short gaps in ball track (football_analysis interpolate)
-            if class_name == "sports_ball":
-                from app.services.possession import interpolate_bbox_series
-
-                series_obs = interpolate_bbox_series(series_obs, max_gap_ms=500)
             feats: dict[str, Any] = {"class": class_name}
+            if class_name == "sports_ball":
+                # Raw candidates (ts, x1, y1, x2, y2, conf) so ball selection can be re-tuned offline
+                feats["ball_candidates"] = [[int(c[0]), *(round(float(v), 1) for v in c[1:5]), round(float(c[5]), 3)]
+                                            for c in ball_cands]
             if class_name == "referee" and tid in best_thumbs:
                 feats["thumb_path"] = best_thumbs[tid][1]
                 feats["is_referee"] = True
@@ -332,6 +390,8 @@ class YoloTrackBackend(VisionBackend):
             if class_name == "person" and tid in best_thumbs:
                 feats["thumb_path"] = best_thumbs[tid][1]
                 feats["thumb_score"] = float(best_thumbs[tid][0])
+            if class_name == "person" and tid in team_embs:
+                feats.update(team_embs[tid])
             if class_name == "person" and tid in reid_embs and reid_embs[tid] is not None:
                 feats["reid_emb"] = np.asarray(reid_embs[tid], dtype=float).tolist()
             if class_name == "person" and jersey_hsv_sums.get(tid):
@@ -348,16 +408,7 @@ class YoloTrackBackend(VisionBackend):
                     start_ms=obs[0]["ts_ms"],
                     end_ms=obs[-1]["ts_ms"],
                     confidence=sum(o["confidence"] for o in obs) / len(obs),
-                    bbox_series=[
-                        {
-                            "ts_ms": o["ts_ms"],
-                            **o["bbox"],
-                            "confidence": o["confidence"],
-                            "frame_h": o.get("frame_h"),
-                            "frame_w": o.get("frame_w"),
-                        }
-                        for o in series_obs
-                    ],
+                    bbox_series=_flat_series(series_obs, interpolate=class_name == "sports_ball"),
                     class_name=class_name,
                     features=feats,
                 )
@@ -368,7 +419,8 @@ class YoloTrackBackend(VisionBackend):
 
         person_dets = [d for d in detections if d.class_name == "person"]
         person_pts = sum(len(d.bbox_series or []) for d in person_dets)
-        ball_coverage_pct = round(100.0 * ball_hits / max(1, frames_processed), 2)
+        # Share of processed frames with a selected match ball (was candidates / frames, >100 %)
+        ball_coverage_pct = round(100.0 * len(chosen_ball) / max(1, frames_processed), 2)
         id_rate = (
             round(100.0 * person_box_with_id / max(1, person_box_total), 2) if person_box_total else 0.0
         )
@@ -377,6 +429,7 @@ class YoloTrackBackend(VisionBackend):
             "model": self.model_name,
             "device": self.device,
             "tracker": self.tracker_name,
+            "imgsz": imgsz,
             "tracker_cfg": tracker_cfg,
             "reid": self.reid_on,
             "reid_tracks": sum(1 for d in person_dets if (d.features or {}).get("reid_emb")),
@@ -395,6 +448,7 @@ class YoloTrackBackend(VisionBackend):
             "person_bbox_samples": person_pts,
             "ball_tracks": sum(1 for d in detections if d.class_name == "sports_ball"),
             "ball_detections": ball_hits,
+            **ball_summary([c[:6] for c in ball_cands], chosen_ball, frames_processed),
             "ball_coverage_pct": ball_coverage_pct,
             "ball_visible": ball_hits > 0,
             "player_visible": bool(person_dets),
@@ -483,6 +537,121 @@ def _safe_track_id(ids, index: int) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+BALL_CANDIDATES_PER_FRAME = 5
+TEAM_CROPS_PER_TRACK = 6
+TEAM_CROP_GAP = 8  # processed frames between samples of one track
+TEAM_CROP_MIN_H = 32  # px — smaller crops carry no kit pattern
+
+
+def _sample_team_crop(frame, xyxy, tid: int, frame_no: int, crops: dict, last: dict) -> None:
+    """Keep up to TEAM_CROPS_PER_TRACK crops per track, spread over its lifetime."""
+    import cv2
+
+    if len(crops[tid]) >= TEAM_CROPS_PER_TRACK or frame_no - last.get(tid, -TEAM_CROP_GAP) < TEAM_CROP_GAP:
+        return
+    x1, y1, x2, y2 = (int(v) for v in xyxy)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+    if y2 - y1 < TEAM_CROP_MIN_H or x2 - x1 < 12:
+        return
+    crop = frame[y1:y2, x1:x2]
+    if crop.shape[0] > 160:  # bound memory; SigLIP resizes to 224 anyway
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * 160 / crop.shape[0])), 160))
+    crops[tid].append(crop.copy())
+    last[tid] = frame_no
+
+
+def _torso(crop):
+    h, w = crop.shape[:2]
+    return crop[int(0.15 * h) : max(int(0.15 * h) + 1, int(0.55 * h)), int(0.2 * w) : max(int(0.2 * w) + 1, int(0.8 * w))]
+
+
+def _embed_team_crops(crops: dict[int, list[Any]], device: str) -> dict[int, dict[str, list[float]]]:
+    """Per track: median torso jersey colour (Lab) and mean SigLIP torso embedding.
+
+    Colour is the primary team cue — on blurry CCTV crops whole-body SigLIP
+    clustered on background/blur (7/12 correct) vs torso colour 11/12.
+    """
+    import numpy as np
+
+    from app.services.team_assigner import jersey_colour_from_crop
+    from app.services.team_embed import embed_crops
+
+    out: dict[int, dict[str, list[float]]] = {}
+    for tid, cs in crops.items():
+        cols = [o[0] for c in cs if (o := jersey_colour_from_crop(c)) is not None]
+        if cols:
+            out.setdefault(tid, {})["team_colour"] = np.round(np.median(np.stack(cols), axis=0), 2).tolist()
+    order = [(tid, c) for tid, cs in crops.items() for c in cs]
+    embs = embed_crops([_torso(c) for _, c in order], device=device) if order else None
+    if embs is not None:
+        idx: dict[int, list[int]] = {}
+        for i, (tid, _) in enumerate(order):
+            idx.setdefault(tid, []).append(i)
+        for tid, rows in idx.items():
+            m = embs[rows].mean(axis=0)
+            out.setdefault(tid, {})["team_emb"] = np.round(m / (np.linalg.norm(m) + 1e-12), 4).tolist()
+    return out
+
+
+def ball_tiles(width: int, height: int, tile: int, overlap: float = 0.15) -> list[tuple[int, int, int, int]]:
+    """Native-resolution tiles (x0, y0, x1, y1) covering the frame; one tile if it already fits."""
+    if width <= tile * 1.1 and height <= tile * 1.1:
+        return [(0, 0, width, height)]
+
+    def spans(n: int) -> list[tuple[int, int]]:
+        if n <= tile:
+            return [(0, n)]
+        step = int(tile * (1 - overlap))
+        starts = list(range(0, n - tile, step)) + [n - tile]
+        return [(s, s + tile) for s in sorted(set(starts))]
+
+    return [(x0, y0, x1, y1) for y0, y1 in spans(height) for x0, x1 in spans(width)]
+
+
+def auto_imgsz(width: int, height: int, cap: int = 1920) -> int:
+    """Detector input size: never shrink below the frame's long side, up to `cap`.
+
+    Wide fixed cameras make players tiny (16–28 px on a 4096 px panorama); the
+    old fixed 640 shrank them to ~4 px and missed 84 % of them.
+    """
+    long_side = max(width, height)
+    if long_side <= 0:
+        return 640
+    return int(max(640, min(cap, (long_side + 31) // 32 * 32)))
+
+
+def reset_tracker(model) -> None:
+    """Drop Ultralytics tracker state so a new video starts with fresh track IDs.
+
+    `model.track(persist=True)` keeps trackers on the cached predictor, so camera B
+    (or the next clip) was being associated against camera A's last frame.
+    """
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None and hasattr(predictor, "trackers"):
+        del predictor.trackers
+
+
+def _flat_series(series_obs: list[dict[str, Any]], *, interpolate: bool) -> list[dict[str, Any]]:
+    """Public bbox_series shape (flat x1..y2), with ball gaps filled when asked."""
+    flat = [
+        {
+            "ts_ms": o["ts_ms"],
+            **o["bbox"],
+            "confidence": o["confidence"],
+            "frame_h": o.get("frame_h"),
+            "frame_w": o.get("frame_w"),
+        }
+        for o in series_obs
+    ]
+    if interpolate:
+        # Fill short gaps in ball track (football_analysis interpolate) — needs flat boxes
+        from app.services.possession import interpolate_bbox_series
+
+        flat = interpolate_bbox_series(flat, max_gap_ms=500)
+    return flat
 
 
 def _obs(

@@ -38,6 +38,28 @@ def jersey_ocr_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"} and _tesseract_ready()
 
 
+def jersey_reader():
+    """The shirt-number reader the pipeline should use, or None.
+
+    Trained classifier (app/services/jersey_cls.py) when VISION_JERSEY_MODEL points
+    at weights. Tesseract only on explicit VISION_JERSEY_OCR=tesseract: on SoccerNet
+    GSR valid (94 player tracks) it was right for 7 % of players and wrong 92 % of
+    the times it answered — no consensus rule got it above 50 % — and a wrong number
+    is worse than none (mislabels players, vetoes correct cross-camera links).
+    """
+    raw = os.environ.get("VISION_JERSEY_OCR", "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        return None
+    model = os.environ.get("VISION_JERSEY_MODEL", "")
+    if model and os.path.isfile(model):
+        from app.services.jersey_cls import read_jersey_number_cls
+
+        return read_jersey_number_cls
+    if raw == "tesseract" and _tesseract_ready():
+        return read_jersey_number
+    return None
+
+
 def read_jersey_number(frame, xyxy: list[float]) -> dict[str, Any] | None:
     """Return {number, confidence} or None from a person bbox on a video frame."""
     if not jersey_ocr_enabled():
@@ -280,3 +302,64 @@ def prefer_jersey_number(votes: list[tuple[int, float]]) -> tuple[int | None, fl
     if best >= 10:
         avg = avg / 1.6
     return best, round(min(0.95, avg), 3)
+
+
+# --- TrOCR reader (transformer scene-text OCR) ------------------------------------
+TROCR_MODEL = os.environ.get("VISION_TROCR_MODEL", "microsoft/trocr-small-printed")
+TROCR_MIN_CONF = 0.5
+_TROCR: tuple[Any, Any, str] | None = None
+
+
+def _trocr(device: str = "cpu"):
+    global _TROCR
+    if _TROCR is None or _TROCR[2] != device:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+        processor = TrOCRProcessor.from_pretrained(TROCR_MODEL)
+        model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL).to(device).eval()
+        _TROCR = (processor, model, device)
+    return _TROCR
+
+
+def read_jersey_number_trocr(frame, xyxy: list[float], device: str | None = None) -> dict[str, Any] | None:
+    """{number, confidence} from the torso of a person box via TrOCR; None if illegible.
+
+    Confidence = mean token probability of the decoded string; low-confidence or
+    non-numeric reads are dropped (the model's own legibility filter).
+    """
+    import cv2
+    import numpy as np
+    import torch
+
+    from app.services.reid import torch_device
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in xyxy]
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w - 1, x2), min(h - 1, y2)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 16 or bh < 36:
+        return None
+    crop = frame[y1 + int(bh * 0.12) : y1 + int(bh * 0.58), x1 + int(bw * 0.12) : x1 + int(bw * 0.88)]
+    if crop.size == 0:
+        return None
+    if crop.shape[0] < 64:
+        s = 64.0 / crop.shape[0]
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * s)), 64), interpolation=cv2.INTER_CUBIC)
+    dev = torch_device(device if device is not None else os.environ.get("VISION_DEVICE", "cpu"))
+    try:
+        processor, model, _ = _trocr(dev)
+    except Exception as exc:  # noqa: BLE001 — optional model
+        logger.info("TrOCR unavailable (%s)", exc)
+        return None
+    pixel_values = processor(images=np.ascontiguousarray(crop[:, :, ::-1]), return_tensors="pt").pixel_values.to(dev)
+    with torch.no_grad():
+        out = model.generate(pixel_values, max_new_tokens=4, output_scores=True, return_dict_in_generate=True)
+    text = processor.batch_decode(out.sequences, skip_special_tokens=True)[0].strip()
+    m = _NUMBER_RE.fullmatch(text.replace(" ", ""))
+    if not m:
+        return None
+    probs = [float(torch.softmax(s, dim=-1).max()) for s in out.scores]
+    conf = float(np.mean(probs)) if probs else 0.0
+    if conf < TROCR_MIN_CONF:
+        return None
+    return {"number": int(m.group(1)), "confidence": round(conf, 3)}

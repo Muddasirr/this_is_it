@@ -13,7 +13,10 @@
     "muddasirr/courtlens-code",
     "muddasirr/courtlens-test-video-2",
     "muddasirr/courtlens-yolov5x-football",
-    "saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv"
+    "saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv",
+    "alejopaullier/dfl-clips",
+    "muddasirr/courtlens-soccertrack-mot",
+    "muddasirr/courtlens-soccertrack-match"
   ],
   "competition_sources": [],
   "kernel_sources": [],

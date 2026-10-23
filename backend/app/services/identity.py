@@ -48,8 +48,10 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
         return []
 
     person_all = [t for t in tracks if (t.features or {}).get("class", "person") == "person"]
-    # Drop broadcast close-ups / sideline staff so they cannot top the leaderboard
-    on_court = [t for t in person_all if is_on_court_person(t.features)]
+    # Drop broadcast close-ups / sideline staff so they cannot top the leaderboard;
+    # on court-calibrated cameras, also anyone whose feet stay off the court.
+    court_ok = _court_filter(db, match_id)
+    on_court = [t for t in person_all if is_on_court_person(t.features) and court_ok(t)]
     closeups = [t for t in person_all if t not in on_court]
     person_tracks = on_court if on_court else person_all  # fall back if filter wiped everyone
     skipped_closeups = closeups if on_court else []
@@ -67,10 +69,11 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
     metas_by_camera = {cam: _camera_cluster_meta(ts) for cam, ts in sorted(by_camera.items())}
 
     cluster_meta = [m for metas in metas_by_camera.values() for m in metas]
-    _assign_kits(cluster_meta)
-    for metas in metas_by_camera.values():
-        _reconcile_same_colour_kits(metas)
-    _smooth_kits_by_neighbours(cluster_meta)
+    if not _assign_kits(cluster_meta):
+        # Colour-only split: repair lighting splits / fragment flips
+        for metas in metas_by_camera.values():
+            _reconcile_same_colour_kits(metas)
+        _smooth_kits_by_neighbours(cluster_meta)
     if len(metas_by_camera) > 1:
         cluster_meta = link_clusters_across_cameras(metas_by_camera)
 
@@ -148,6 +151,29 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
 
     db.commit()
     return links
+
+
+def _court_filter(db: Session, match_id: UUID):
+    """track → bool: True unless its camera is calibrated and the track lives off the court."""
+    from app.models import CameraSource
+    from app.services.court_calib import ON_COURT_MIN_FRAC, mapper, on_court_fraction
+
+    cals = {}
+    for cam in db.query(CameraSource).filter(CameraSource.match_id == match_id).all():
+        if cam.calibration:
+            try:
+                cals[cam.label.value] = (cam.calibration, mapper(cam.calibration))
+            except Exception:  # noqa: BLE001 — bad calibration ⇒ no filtering
+                continue
+
+    def ok(track) -> bool:
+        cal = cals.get(_camera_of(track))
+        if cal is None:
+            return True
+        series = (track.features or {}).get("bbox_series") or []
+        return on_court_fraction(series, cal[0], cal[1]) >= ON_COURT_MIN_FRAC
+
+    return ok
 
 
 def _camera_of(track) -> str:
@@ -524,16 +550,18 @@ def _smooth_kits_by_neighbours(cluster_meta: list[dict], sim_thresh: float = 0.9
             break
 
 
-def _assign_kits(cluster_meta: list[dict]) -> None:
-    """Split clusters into Kit A / Kit B (KMeans jersey crops → HSV fallback).
+def _assign_kits(cluster_meta: list[dict]) -> bool:
+    """Split clusters into Kit A / Kit B / Kit X. True when SigLIP embeddings decided.
 
-    Sticky kit via track_key / thumb. Refs (features.is_referee) → Kit X.
+    Colour first (KMeans jersey crops → HSV fallback) so every cluster has a kit,
+    then the SigLIP team split overrides wherever tracks carry `team_emb`.
+    Refs (features.is_referee) → Kit X.
     """
     import cv2
     from app.services.kit_color import assign_kits_from_descriptors, descriptor_from_thumb_path
 
     if not cluster_meta:
-        return
+        return False
     # Prefer thumb recompute — corpus hists are often grass-polluted
     for m in cluster_meta:
         sticky = None
@@ -559,6 +587,9 @@ def _assign_kits(cluster_meta: list[dict]) -> None:
             if d:
                 m["jersey_hsv"] = d
     assign_kits_from_descriptors(cluster_meta)
+    from app.services.team_embed import assign_kits_by_embedding
+
+    return assign_kits_by_embedding(cluster_meta)
 
 
 def _ensure_kit_roster(db: Session, match: Match, cluster_meta: list[dict]) -> list[MatchRoster]:

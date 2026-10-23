@@ -45,9 +45,9 @@ services:
       JWT_SECRET: dev-change-me
       CORS_ORIGINS: http://localhost:5173,http://localhost:5174
       VISION_BACKEND: yolo
-      YOLO_MODEL: yolov5x_football.pt
+      YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
-      VISION_FRAME_STRIDE: "5"
+      VISION_TARGET_FPS: "10"
       COURT_FORMAT: "5v5"
       ALLOW_SINGLE_CAMERA: "true"
     ports:
@@ -78,9 +78,9 @@ services:
       API_PUBLIC_URL: http://localhost:8001
       JWT_SECRET: dev-change-me
       VISION_BACKEND: yolo
-      YOLO_MODEL: yolov5x_football.pt
+      YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
-      VISION_FRAME_STRIDE: "5"
+      VISION_TARGET_FPS: "10"
       VISION_MAX_FRAMES: "0"
       VISION_JERSEY_OCR: "1"
       COURT_FORMAT: "5v5"

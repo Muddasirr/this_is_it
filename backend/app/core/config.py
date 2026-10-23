@@ -72,11 +72,18 @@ class Settings(BaseSettings):
 
     # Vision / Phase 0
     vision_backend: str = "yolo"  # yolo | stub
-    yolo_model: str = "yolov5x_football.pt"
+    # General COCO detector: Kaggle corpus run (5 futsal videos) found 4–80× more players
+    # per frame than the football fine-tune (yolov5x_football.pt), which misses futsal players.
+    yolo_model: str = "yolov8m.pt"
     vision_device: str = "cpu"  # cpu | 0 | cuda
-    vision_frame_stride: int = 5  # process every Nth frame
+    vision_frame_stride: int = 5  # process every Nth frame (when vision_target_fps = 0)
+    vision_target_fps: float = 10.0  # processed frames per video second; stride = fps / target
+    vision_team_embed: bool = True  # SigLIP crop embeddings → team split (falls back to colour)
     vision_conf: float = 0.25
-    vision_imgsz: int = 640
+    # 0 = auto: frame's long side, capped at VISION_IMGSZ_MAX. SoccerTrack v2 MOT
+    # (4096×1080 fixed panorama): recall 16 % @640 → 74 % @1280 → 89 % @1920.
+    vision_imgsz: int = 0
+    vision_imgsz_max: int = 1920
     vision_max_frames: int = 0  # 0 = no cap; use e.g. 300 for quick online-clip tests
     # Tracker: botsort (default, GMC) | bytetrack (legacy A/B)
     vision_tracker: str = "botsort"

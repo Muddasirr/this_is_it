@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 
 from app.models import EventParticipant, MatchEvent, Player, PlayerTrack, TrackIdentityLink
 from app.models.entities import ConfirmationState, EventType
+from app.services.court_calib import mapper, track_motion
+from app.services.possession import TrackIndex
 
 HEAT_W = 32
 HEAT_H = 18
@@ -57,6 +59,9 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
                 "distance": 0.0,
                 "minutes": 0.0,
                 "avg_speed": 0.0,
+                "distance_m": None,
+                "avg_speed_kmh": None,
+                "top_speed_kmh": None,
                 "conversion_pct": None,
                 "heatmap": _empty_heat(),
                 "possession_heatmap": _empty_heat(),
@@ -100,16 +105,39 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
 
     match_heat = _empty_heat()
     match_poss_heat = _empty_heat()
+    calibrations = _camera_calibrations(db, match_id)
+    # Per (player, camera): a player seen on 2+ angles must not be summed across them.
+    per_cam: dict[tuple[str, str], dict[str, float]] = defaultdict(
+        lambda: {"distance": 0.0, "presence_ms": 0.0, "distance_m": 0.0, "top_speed_kmh": 0.0}
+    )
     for t in persons:
         pid = track_player.get(t.id)
         series = (t.features or {}).get("bbox_series") or []
-        dist = _path_length(series)
         heat = _series_to_heat(series)
         _add_heat(match_heat, heat)
         if pid:
-            r = row(pid)
-            r["distance"] += dist
-            _add_heat(r["heatmap"], heat)
+            cam = getattr(t.camera_label, "value", t.camera_label) or "A"
+            agg = per_cam[(pid, cam)]
+            agg["distance"] += _path_length(series)
+            agg["presence_ms"] += max(0, t.end_ms - t.start_ms)
+            if cam in calibrations:
+                cal, H = calibrations[cam]
+                motion = track_motion(series, cal, H)
+                agg["distance_m"] += motion["distance_m"]
+                agg["top_speed_kmh"] = max(agg["top_speed_kmh"], motion["top_speed_kmh"])
+            _add_heat(row(pid)["heatmap"], heat)
+    best_cam: dict[str, tuple[str, dict[str, float]]] = {}
+    for (pid, cam), agg in per_cam.items():
+        if pid not in best_cam or agg["presence_ms"] > best_cam[pid][1]["presence_ms"]:
+            best_cam[pid] = (cam, agg)
+    for pid, (cam, agg) in best_cam.items():
+        r = row(pid)
+        r["distance"] = agg["distance"]
+        if cam in calibrations:
+            r["distance_m"] = round(agg["distance_m"], 1)
+            r["top_speed_kmh"] = agg["top_speed_kmh"]
+            minutes = agg["presence_ms"] / 60000.0
+            r["avg_speed_kmh"] = round(agg["distance_m"] / 1000.0 / (minutes / 60.0), 1) if minutes > 0 else None
 
     poss_ms, touches = _possession_and_touches(persons, balls, track_player)
     # Vidal-Codina §3.2.1: possession-informed heatmap (on-ball locations only)
@@ -119,11 +147,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
     event_touches = _event_touch_counts(db, events)
     # Blend ball-control with on-camera presence so sparse ball tracking
     # does not give one player ~100% possession.
-    presence_ms: dict[str, int] = defaultdict(int)
-    for t in persons:
-        pid = track_player.get(t.id)
-        if pid:
-            presence_ms[pid] += max(0, t.end_ms - t.start_ms)
+    presence_ms: dict[str, int] = {pid: int(agg["presence_ms"]) for pid, (_cam, agg) in best_cam.items()}
     total_poss = sum(poss_ms.values())
     total_pres = sum(presence_ms.values()) or 1
     all_pids = set(by_player) | set(poss_ms) | set(presence_ms)
@@ -171,6 +195,9 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
                 "distance": round(r["distance"], 1),
                 "minutes": r["minutes"],
                 "avg_speed": _avg_speed(r["distance"], r["minutes"]),
+                "distance_m": r["distance_m"],
+                "avg_speed_kmh": r["avg_speed_kmh"],
+                "top_speed_kmh": r["top_speed_kmh"],
                 "conversion_pct": _conversion_pct(r["goal"], r["shot"]),
                 "heatmap": _normalize_heat(r["heatmap"]),
                 "possession_heatmap": _normalize_heat(r["possession_heatmap"]),
@@ -208,6 +235,9 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             "possession": "Share of ball-control samples attributed to this player",
             "distance": "Relative path length in image space (not metres)",
             "avg_speed": "Relative distance per minute on camera (not km/h)",
+            "distance_m": "Metres run on the court (calibrated camera; foot point, jitter-filtered)",
+            "avg_speed_kmh": "Average speed while on camera (calibrated camera)",
+            "top_speed_kmh": "Fastest 1 s window (calibrated camera, capped at 36 km/h)",
             "minutes": "On-camera time from person tracks",
             "heatmap": "Where the player was detected most often in the camera frame",
             "possession_heatmap": "Where the player was while holding the ball (Vidal-Codina)",
@@ -280,6 +310,19 @@ def _latest_track_players(db: Session, tracks: list[PlayerTrack]) -> dict[UUID, 
     return out
 
 
+def _camera_calibrations(db: Session, match_id: UUID) -> dict[str, tuple[dict, Any]]:
+    from app.models import CameraSource
+
+    out = {}
+    for cam in db.query(CameraSource).filter(CameraSource.match_id == match_id).all():
+        if cam.calibration:
+            try:
+                out[cam.label.value] = (cam.calibration, mapper(cam.calibration))
+            except Exception:  # noqa: BLE001 — a bad calibration falls back to relative units
+                continue
+    return out
+
+
 def _center(pt: dict[str, Any]) -> tuple[float, float]:
     return ((pt.get("x1", 0) + pt.get("x2", 0)) / 2, (pt.get("y1", 0) + pt.get("y2", 0)) / 2)
 
@@ -339,12 +382,13 @@ def _accumulate_possession_heat(
     sample_h = float(ball_pts[0].get("frame_h") or 720)
     diag = (sample_w**2 + sample_h**2) ** 0.5
     radius = max(70.0, POSSESSION_RADIUS_FRAC * diag)
+    person_lookup = TrackIndex(person_series, PERSON_TIME_WINDOW_MS)
     for bp in ball_pts:
         ts = int(bp.get("ts_ms") or 0)
         best_tid = None
         best_d = radius
-        for tid, series in person_series.items():
-            pt = _person_at(series, ts)
+        for tid in person_lookup.active(ts):
+            pt = person_lookup.at(tid, ts)
             if not pt:
                 continue
             d = _ball_to_player_dist(bp, pt)
@@ -354,8 +398,7 @@ def _accumulate_possession_heat(
         if best_tid is None:
             continue
         pid = track_player.get(best_tid)
-        series = person_series[best_tid]
-        ppt = _person_at(series, ts)
+        ppt = person_lookup.at(best_tid, ts)
         if not ppt:
             continue
         cell = _series_to_heat([ppt])
@@ -455,6 +498,7 @@ def _possession_and_touches(
         # scale to look like percentages later
         return dict(poss_ms), dict(touches)
 
+    person_lookup = TrackIndex(person_series, PERSON_TIME_WINDOW_MS)
     for i, ball in enumerate(ball_pts):
         ts = int(ball.get("ts_ms", 0))
         w = float(ball.get("frame_w") or 1280)
@@ -464,8 +508,8 @@ def _possession_and_touches(
         best_pid = None
         best_dist = radius
         best_tid = None
-        for tid, series in person_series.items():
-            sample = _person_at(series, ts)
+        for tid in person_lookup.active(ts):
+            sample = person_lookup.at(tid, ts)
             if not sample:
                 continue
             dist = _ball_to_player_dist(ball, sample)

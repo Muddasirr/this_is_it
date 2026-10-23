@@ -20,6 +20,8 @@ from typing import Any
 
 from app.services.possession import (
     MIN_POSSESSION_MS,
+    ball_density_per_s,
+    build_person_index,
     build_possession_timeline,
     frame_diag,
     merge_ball_series,
@@ -49,6 +51,15 @@ MAX_SHOTS = 18
 MAX_GOALS = 8
 # Need this many ball samples before trusting possession events alone
 MIN_BALL_FOR_STRICT = 80
+# Short clips / short spells: enough ball if it is dense, even below 80 samples
+# (a 2.5 s labelled clip has ≤ 63 frames — the absolute gate rejected every one).
+MIN_BALL_DENSE_SAMPLES = 10
+# A pass moves the ball: holder flips with the ball standing still are challenges,
+# shielding or tracker ID switches (tuned on DFL labelled clips — see bench_events).
+MIN_PASS_BALL_DISP_FRAC = 0.0
+# Passer's last box ≈ receiver's first box ⇒ the tracker re-IDed one player, not a pass.
+ID_SWAP_IOU = 1.01
+MIN_BALL_DENSE_PER_S = 2.0
 
 
 def infer_event_candidates(
@@ -62,7 +73,7 @@ def infer_event_candidates(
         return []
 
     # Without enough ball, do NOT invent shot/pass floods — return empty estimated set
-    if len(ball_series) < MIN_BALL_FOR_STRICT:
+    if not _enough_ball(ball_series):
         return []
 
     poss = build_possession_timeline(detections)
@@ -76,7 +87,8 @@ def infer_event_candidates(
     shots = _shots_from_segments(
         segments, ball_series, camera_label, diag, receiver_window_ms=flight_limit
     )
-    passes = _passes_from_segments(segments, ball_series, camera_label, diag, flight_limit)
+    persons_index = build_person_index(persons)
+    passes = _passes_from_segments(segments, ball_series, camera_label, diag, flight_limit, persons_index)
     shot_ts = {s.camera_ts_ms for s in shots}
     # Drop pass that double-counts the same release already labeled a shot
     passes = [p for p in passes if p.camera_ts_ms not in shot_ts]
@@ -199,6 +211,48 @@ def _dribbles_from_segments(
         if len(out) >= MAX_DRIBBLES:
             break
     return out
+
+
+def _enough_ball(ball_series: list[dict]) -> bool:
+    if len(ball_series) >= MIN_BALL_FOR_STRICT:
+        return True
+    return len(ball_series) >= MIN_BALL_DENSE_SAMPLES and ball_density_per_s(ball_series) >= MIN_BALL_DENSE_PER_S
+
+
+def _ball_at(ball_series: list[dict[str, Any]], ts_ms: int, window_ms: int = 400) -> tuple[float, float] | None:
+    best = min(ball_series, key=lambda p: abs(int(p.get("ts_ms", 0)) - ts_ms), default=None)
+    if best is None or abs(int(best.get("ts_ms", 0)) - ts_ms) > window_ms:
+        return None
+    return ((best["x1"] + best["x2"]) / 2.0, (best["y1"] + best["y2"]) / 2.0)
+
+
+def _ball_displacement(ball_series: list[dict[str, Any]], t_release: int, t_receive: int) -> float | None:
+    a, b = _ball_at(ball_series, t_release), _ball_at(ball_series, t_receive)
+    if a is None or b is None:
+        return None
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _same_player_reid(persons_index, a_key: str, b_key: str, t_a: int, t_b: int) -> bool:
+    """Passer track ends where the receiver track starts, never co-existing ⇒ one player re-IDed."""
+    if ID_SWAP_IOU > 1.0:
+        return False
+    from app.services.possession import person_at
+
+    sa, sb = persons_index.get(a_key) or [], persons_index.get(b_key) or []
+    if not sa or not sb:
+        return False
+    overlap = min(sa[-1]["ts_ms"], sb[-1]["ts_ms"]) - max(sa[0]["ts_ms"], sb[0]["ts_ms"])
+    if overlap > 200:  # both tracks on screen together ⇒ two people
+        return False
+    pa, pb = person_at(sa, t_a), person_at(sb, t_b)
+    if pa is None or pb is None:
+        return False
+    ix = max(0.0, min(pa["x2"], pb["x2"]) - max(pa["x1"], pb["x1"]))
+    iy = max(0.0, min(pa["y2"], pb["y2"]) - max(pa["y1"], pb["y1"]))
+    inter = ix * iy
+    union = (pa["x2"] - pa["x1"]) * (pa["y2"] - pa["y1"]) + (pb["x2"] - pb["x1"]) * (pb["y2"] - pb["y1"]) - inter
+    return union > 0 and inter / union >= ID_SWAP_IOU
 
 
 def _pass_flight_limit_ms(ball_series: list[dict[str, Any]]) -> int:
@@ -340,6 +394,7 @@ def _passes_from_segments(
     camera_label: str,
     diag: float,
     flight_limit_ms: int | None = None,
+    persons_index: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[EventCandidate]:
     max_flight = MAX_FLIGHT_MS if flight_limit_ms is None else flight_limit_ms
     candidates: list[EventCandidate] = []
@@ -361,6 +416,11 @@ def _passes_from_segments(
         if (a_end - a_start) < MIN_POSSESSION_MS:
             continue
         if (b_end - b_start) < MIN_POSSESSION_MS:
+            continue
+        disp = _ball_displacement(ball_series, a_end, b_start)
+        if MIN_PASS_BALL_DISP_FRAC > 0 and (disp is None or disp < MIN_PASS_BALL_DISP_FRAC * diag):
+            continue
+        if persons_index and _same_player_reid(persons_index, a_key, b_key, a_end, b_start):
             continue
         conf = 0.62
         if flight < 2000:

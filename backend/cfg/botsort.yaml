@@ -4,7 +4,7 @@ tracker_type: botsort
 track_high_thresh: 0.25
 track_low_thresh: 0.1
 new_track_thresh: 0.25
-track_buffer: 45
+track_buffer: 60  # processed frames (~6 s at 10 Hz) — players leave and re-enter view
 match_thresh: 0.8
 fuse_score: True
 gmc_method: sparseOptFlow

@@ -21,6 +21,7 @@ _PG_PATCHES = [
     # Per-camera sync: legacy rows were "B relative to A"
     "ALTER TABLE camera_syncs ADD COLUMN IF NOT EXISTS camera_label cameralabel NOT NULL DEFAULT 'B'",
     "ALTER TABLE match_shares ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ",
+    "ALTER TABLE camera_sources ADD COLUMN IF NOT EXISTS calibration JSONB",
 ]
 
 
@@ -58,6 +59,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Frame-Width", "X-Frame-Height"],  # calibration frame size (cross-origin)
 )
 
 app.include_router(api_router, prefix="/api/v1")

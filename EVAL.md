@@ -28,6 +28,15 @@ kaggle kernels output muddasirr/courtlens-gpu-eval -p data/kaggle_out/gpu_eval
 # Same runner locally (1–4 cameras; needs ffmpeg)
 cd backend && python -m app.scripts.run_offline --out ../data/run/x --camera A=a.mp4 --camera B=b.mp4
 
+# Load a Kaggle run into the local app (one match per video; Run stats panel + facility table)
+python scripts/import_kaggle_run.py data/kaggle_out/gpu_eval/eval [--only test_video_2,dfl_]
+
+# Re-run identity → events → fuse → stats on saved detections, CPU, seconds
+cd backend && python -m app.scripts.run_offline --replay ../data/kaggle_out/gpu_eval/eval/<slug> --out /tmp/re
+
+# Pass precision/recall on labelled DFL clips (runs in the kernel; local needs the clips)
+cd backend && python -m app.scripts.bench_events --clips <dfl-clips dir> --out bench.json --per-class 150
+
 # Re-run events only on saved detections (no GPU) — event tuning loop
 PYTHONPATH=backend python scripts/eval/reinfer_events.py data/kaggle_out/gpu_eval/eval/test_video_2 data/eval/reinfer/test_video_2
 ```
@@ -66,9 +75,11 @@ python scripts/eval/dump_possession.py \
 | Roboflow Futsal-Object-Detection_v2 | Detection smoke | `data/eval/roboflow_futsal/` |
 | Manual GT for `test_video_2` | Event P/R | `data/eval/gt/test_video_2_events.json` — **placeholder (3 fake events); must be hand-labelled** |
 | Synthetic 3-camera set | Multi-cam sync / identity / fuse | generated in the Kaggle kernel from one clip (known offsets) |
+| **DFL labelled event clips** | **Pass precision / recall** | Kaggle `alejopaullier/dfl-clips`: ~2.5 s clips cut around the DFL competition labels — 2,849 `play` (pass), 598 `challenge`, 172 `throwin`, 1,802 `background`. `bench_events.py` → `bench_events.json` |
 
-**Honest notes.** The DFL dataset's `train.csv` is only a file list — it has **no event labels**
-(the original competition labels are no longer downloadable), so DFL clips can't score events.
+**Honest notes.** The DFL 460-clip dataset's `train.csv` is only a file list — **no event labels**
+(train/test are inherited folder names). Event ground truth comes from `alejopaullier/dfl-clips`
+instead (football broadcast — it scores the events engine, not futsal CCTV).
 Until `test_video_2` GT is labelled by watching the match, every event precision/recall number
 is meaningless — the Phase 4 gate below only checks "runs + no flood". There is **no real
 multi-angle court footage** yet; multi-cam is validated synthetically only.
@@ -79,7 +90,7 @@ Download Roboflow (needs `ROBOFLOW_API_KEY`):
 python scripts/eval/download_roboflow_futsal.py
 ```
 
-Product default: `YOLO_MODEL=yolov5x_football.pt` (football_analysis YOLOv5x, classes `ball/goalkeeper/player/referee` remapped to CourtLens `sports_ball|person|referee`). Better referee and ball than COCO `yolov8n.pt`; ~3–5× slower on CPU. Facility CCTV with 0 players still auto-falls back to `yolov8n.pt`. Optional `yolov8n_futsal.pt` / `backend/models/futsal_yolov8n.pt` for Roboflow-like futsal still works the same way.
+Product default: `YOLO_MODEL=yolov8m.pt` (Kaggle v6: best player and ball recall on all 5 futsal videos). Previously `YOLO_MODEL=yolov5x_football.pt` (football_analysis YOLOv5x, classes `ball/goalkeeper/player/referee` remapped to CourtLens `sports_ball|person|referee`). Better referee and ball than COCO `yolov8n.pt`; ~3–5× slower on CPU. Facility CCTV with 0 players still auto-falls back to `yolov8n.pt`. Optional `yolov8n_futsal.pt` / `backend/models/futsal_yolov8n.pt` for Roboflow-like futsal still works the same way.
 
 ## Gates (pass/fail)
 
@@ -89,7 +100,7 @@ Product default: `YOLO_MODEL=yolov5x_football.pt` (football_analysis YOLOv5x, cl
 | 1 | `summary.json` has ball + person tracks on facility smoke |
 | 2 | Kit/OCR unit tests (`pytest backend/tests/test_kit_identity.py backend/tests/test_jersey_ocr.py backend/tests/test_team_assigner.py`) + `python scripts/eval/build_identity_gallery.py data/kaggle_out/gpu_eval/eval` exits 0 (both kits on every run) + manual gallery confirm (one colour per kit letter). Tune with `run_offline --replay` — no GPU needed |
 | 3 | Possession timeline non-empty when ball samples ≥ 80 |
-| 4 | `score_events.py` runs; no flood (>40 shots on test_video_2). Real P/R gate blocked on hand-labelled GT |
+| 4 | No flood (>40 shots on test_video_2) + `bench_events.json` pass precision/recall reported (play vs background/challenge/throw-in). Futsal P/R still needs hand-labelled test_video_2 GT |
 | 5 | `run_product_smoke.py` + share/UI per-player heatmaps; docker when available; Kaggle `multicam_synthetic` row `pass: true` (sync error ≤ 200 ms for B and C, ≥ 50 % players linked across cameras, ≥ 50 % events fused) |
 
 ## Heatmaps

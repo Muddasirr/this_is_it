@@ -46,10 +46,10 @@ CourtLens copies this **pipeline shape**, not the stadium hardware.
 
 | League capability | CourtLens production v1 | Later (P1+) |
 | ----------------- | ----------------------- | ----------- |
-| Calibrated pitch metres | Image-plane units + relative distance; optional homography | Full court calibration |
+| Calibrated pitch metres | Per-camera landmark calibration (staff click once): 4 corners → perspective; 8 (+ halfway ends, centre-circle crossings) → lens distortion + perspective. SoccerTrack v2 wide camera: 11 m → 0.93 m mean error on held-out landmarks. Uncalibrated cameras stay relative | Automatic court-keypoint detection |
 | Multi-view re-ID | Per-camera clusters linked across angles by kit + shirt + OSNet (one-to-one per camera); staff merge | Learned cross-view re-ID |
-| Jersey OCR | **In pipeline** (Tesseract when available); kit colour always | Stronger OCR / trained reader |
-| Kit / team | Torso Lab k-means clustering → Kit A / Kit B (refs/outliers → Kit X) | Facility-trained kit models |
+| Jersey numbers | Trained classifier (`jersey_cls.py`: ResNet-18, legible/tens/units heads, trained on SoccerNet GSR crops) when `VISION_JERSEY_MODEL` is set; otherwise **no auto numbers** (staff rename). Measured on SN-GSR valid (94 player tracks): Tesseract 7 %, TrOCR 1 % — both removed from the default path | Fine-tuned PARSeq / pose-guided crops |
+| Kit / team | Per track: torso jersey colour (primary) + 0.25 × SigLIP torso embedding (secondary) → KMeans → Kit A / B / X. Facility CCTV, 12 labelled players: whole-body SigLIP 7/12 → this 11/12 | Facility-trained kit models |
 | Event ops room | Facility review UI | Optional ops tooling |
 | Event taxonomy | Pass, shot, goal, assist, dribble | Saves, tackles, set pieces |
 | Live | Deferred | Optional |
@@ -64,16 +64,19 @@ Upload Camera A [(optional) Cameras B, C, D]
     → Normalize (proxy for review; store original)
     → Synchronize (offset per camera onto A: audio onset xcorr → motion-energy xcorr → staff fix)
     → Detect & track (YOLO + BoT-SORT; persons + sports_ball)
-         · dense bbox_series (ts_ms, xyxy, frame_w/h, conf)
+         · stride from source fps → ~VISION_TARGET_FPS (10) processed frames / s on 25 and 60 fps video
+         · tracker state reset per video (no carry-over between cameras / clips)
+         · dense bbox_series (ts_ms, xyxy, frame_w/h, conf); ball gaps ≤ 0.5 s interpolated
          · ball kept even without tracker ID (synthetic ball track)
-         · secondary ball `predict` at conf≤0.12 / imgsz≥1280 when track miss
+         · secondary ball `predict` at conf≤0.12 / imgsz≥960 on a separate model instance (never the tracker's)
+         · up to 6 crops / track → median torso colour + SigLIP torso embedding (VISION_TEAM_EMBED=1)
          · OSNet ReID embeddings (EMA per track) when VISION_REID=1
          · upper-body HSV colour_hist (fragment merge)
-         · jersey OCR samples → majority number
+         · jersey number reads (trained classifier, if configured) → majority number
          · best in-match thumb crop per track
     → Resolve identity
          · merge fragments by ReID cosine, then colour
-         · assign Kit A / Kit B by torso Lab k-means (refs / outliers → Kit X)
+         · assign Kit A / Kit B / X by torso colour + SigLIP → KMeans (colour-only fallback)
          · fuse OCR shirt numbers (unique within kit)
          · create/update roster → TrackIdentityLink
          · staff rename / reassign in UI
@@ -95,7 +98,7 @@ Upload Camera A [(optional) Cameras B, C, D]
 | Queue | Redis + durable job rows |
 | Storage | Local (dev) or private S3-compatible (prod) |
 | Workers | `app.workers.runner` — media (CPU) + vision (GPU when `VISION_DEVICE=0`) |
-| Detection | Ultralytics YOLO (`yolov5x_football.pt` default, `yolov8n.pt` fallback) + BoT-SORT (default, `VISION_TRACKER`) / ByteTrack; OSNet ReID merge (`yolo_backend.py`, `reid.py`) |
+| Detection | Ultralytics YOLO (`yolov8m.pt` default) + BoT-SORT (default, `VISION_TRACKER`) / ByteTrack; OSNet ReID merge (`yolo_backend.py`, `reid.py`) |
 | Events | `events.py` possession heuristics |
 | Identity | `identity.py` kit + jersey clustering |
 | Stats | `match_stats.py` |
@@ -106,10 +109,12 @@ Upload Camera A [(optional) Cameras B, C, D]
 | Variable | Role | Production default |
 | -------- | ---- | ------------------ |
 | `VISION_BACKEND` | `yolo` \| `stub` | `yolo` |
-| `YOLO_MODEL` | Weights path | `yolov5x_football.pt` (football player/GK/ref/ball; resolves to `data/eval/football_analysis_model/best.pt`). Auto-falls back to `yolov8n.pt` if no persons (facility CCTV). `yolov8n_futsal.pt` remaps `player/gk/ball`. ~3–5× slower on CPU than `yolov8n.pt` |
+| `YOLO_MODEL` | Weights path | `yolov8m.pt` (COCO, auto-download). Measured on Kaggle across 5 futsal videos: 6–9 player boxes/frame vs 0.1–1.8 for `yolov5x_football.pt`, higher ball coverage too. `yolov8n.pt` for CPU speed |
 | `VISION_DEVICE` | `cpu` \| `0` | `0` on GPU workers |
-| `VISION_FRAME_STRIDE` | Process every Nth frame | `5` (balance quality/cost; raise on CPU) |
-| `VISION_CONF` / `VISION_IMGSZ` | Detector thresholds | `0.25` / `640` |
+| `VISION_TARGET_FPS` | Processed frames per video second (stride = fps / target) | `10`; `0` = use `VISION_FRAME_STRIDE` |
+| `VISION_FRAME_STRIDE` | Process every Nth frame (when target fps is 0) | `5` |
+| `VISION_TEAM_EMBED` | SigLIP team split | `1` |
+| `VISION_CONF` / `VISION_IMGSZ` | Detector threshold / input size | `0.25` / `0` = auto: frame's long side capped at `VISION_IMGSZ_MAX` (1920). SoccerTrack v2 MOT (4096 px panorama): player recall 16 % @640, 74 % @1280, 89 % @1920; IDF1 0.23 → 0.76 |
 | `COURT_FORMAT` | `5v5` \| `6v6` \| `7v7` | `5v5` |
 | `ALLOW_SINGLE_CAMERA` | 1-cam matches | `true` |
 
@@ -146,12 +151,12 @@ Only after a detected shot, if the ball **lingers** in the extreme goal band (�
 
 | Metric | Source |
 | ------ | ------ |
-| Distance | Path length of linked person tracks (relative units; metres only after homography) |
+| Distance | Calibrated camera: metres from foot points through the fitted court mapping (`court_calib.mapper`), steps ≥ 0.5 s, > 36 km/h steps dropped. Otherwise relative path length. Multi-cam: camera that saw the player longest (never summed across angles) |
 | Heatmap | Binned foot/centre positions on image plane |
 | Possession % | Blend of ball-holder time + on-camera presence (weights follow ball coverage) |
 | Touches | Possession holder changes (ball timeline); if no ball samples, pass/shot/goal primary roles |
 | Minutes | On-camera time from linked person tracks |
-| Avg speed | Relative distance / minutes (image plane; not km/h) |
+| Avg / top speed | Calibrated: km/h (top = fastest 1 s window, capped 36 km/h). Otherwise relative distance / minute |
 | Assist | Prior completed pass into a goal in the possession chain |
 | Dribble | Progressive carry while the same holder keeps the ball |
 | Pass received | Receiver role on completed passes |
@@ -181,8 +186,8 @@ Same-shirt numbers on opposite kits are allowed (**Kit A #10 ≠ Kit B #10**).
 1. **BoT-SORT** (default; ByteTrack optional) short-term continuity per camera, plus OSNet ReID to merge fragments.  
 2. **Colour:** mean L2-normalised HSV hist of upper-body crops (fragment merge only).  
 3. **Cluster:** merge non-overlapping tracks with cosine colour similarity ≥ threshold.  
-4. **Kit split:** per-player torso jersey colour (grass/skin/white masked, Lab k-means), then match-level k-means (k≤4): two largest distinct clusters → Kit A / Kit B, small clusters (refs, GKs, bibs) → Kit X (`team_assigner.py`; HSV fallback in `kit_color.py`).  
-5. **Jersey:** OCR votes → `prefer_jersey_number` (2-digit preference; anti “10→1”).  
+4. **Kit split:** per track, median torso jersey colour (Lab; grass/skin/white masked) as the primary cue plus 0.25 × the SigLIP embedding of torso crops (`team_embed.py`; clustering per the roboflow/sports TeamClassifier). Measured on facility CCTV (12 hand-labelled players): whole-body SigLIP 7/12, torso SigLIP 9/12, torso colour + SigLIP 11/12. Colour channels are scaled per dimension; the SigLIP block by one factor. k=3 when the smallest cluster is ≤ 20 % of the weight *and* far from both teams (refs / GKs / bibs → Kit X), else k=2. Fallback when transformers or the model are unavailable: torso jersey colour (grass/skin/white masked, Lab k-means; `team_assigner.py`, HSV in `kit_color.py`), which also keeps the kit of clusters without crops.  
+5. **Jersey:** classifier votes → `prefer_jersey_number`. Without a validated model no number is proposed — a wrong shirt number mislabels players and vetoes correct cross-camera links.  
 6. **Roster:** unique shirt within kit; auto-create `Kit A #N` / `Kit B #N` if needed.  
 7. **Avatars:** best in-match crop uploaded for player card.  
 8. **Staff:** rename, reassign track→player; confirmed links beat model proposals.
@@ -239,7 +244,7 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 - Grid `HEAT_W × HEAT_H` from person `bbox_series` foot/centre (image plane).  
 - Stored on each `by_player[].heatmap` and `heatmap.match`.  
 - Share + match UI must allow **per-player** selection (not match-only).  
-- Label: relative camera frame until homography (Phase 6).
+- Label: relative camera frame (heatmaps stay image-plane even on calibrated cameras for now).
 
 ### Multi-cam sync + fuse
 
@@ -264,7 +269,7 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | Limit | Product response |
 | ----- | ---------------- |
 | Sparse ball on wide CCTV | Surface ball coverage; keep shots/goals estimated; improve camera or model |
-| Image-plane ≠ metres | Label distance as relative until homography |
+| Image-plane ≠ metres | Metres only on court-calibrated cameras; everything else labelled relative |
 | OCR fails on blurry kits | Kit clustering + staff rename |
 | Heuristic events ≠ Opta | Review gate; never sell as official league feed |
 | CPU-only workers | Slow; production uses GPU workers + documented stride |
@@ -278,7 +283,7 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | Stage | Upgrade |
 | ----- | ------- |
 | **Now (prod v1)** | YOLO + BoT-SORT + ReID, kit+OCR identity, possession events, review, share, GPU workers |
-| **Next** | Court homography; stronger ball detector / SAHI; eval harness + auto-accept gates |
+| **Next** | Automatic court keypoints; stronger ball detector / SAHI; SoccerNet-style jersey OCR (legibility → pose crop → PARSeq); auto-accept gates from the DFL event benchmark |
 | **Later** | Trained event model on facility annotations; cross-camera re-ID; SSO/exports |
 | **Optional** | Broadcast-grade providers if venues install optical arrays |
 
@@ -289,7 +294,8 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | Concern | Module |
 | ------- | ------ |
 | Detect / track / colour / OCR / thumbs | `backend/app/services/yolo_backend.py` |
-| Jersey OCR helpers | `backend/app/services/jersey_ocr.py` |
+| Jersey reader selection / OCR helpers | `backend/app/services/jersey_ocr.py` (`jersey_reader`) |
+| Jersey classifier (train + infer) | `backend/app/services/jersey_cls.py`, `backend/app/scripts/train_jersey.py`, `bench_jersey.py` |
 | Possession (PZ / gain-loss) | `backend/app/services/possession.py` |
 | Possession → pass/shot/goal | `backend/app/services/events.py` |
 | Cross-cam fuse A–D | `backend/app/services/fuse.py` |
@@ -297,6 +303,10 @@ Delivery order (hard gates in `EVAL.md` / `PRD.md` §10):
 | Cross-camera identity link | `backend/app/services/identity.py` (`link_clusters_across_cameras`) |
 | Court format 5v5/6v6/7v7 | `backend/app/services/court_format.py` |
 | Kit + roster identity | `backend/app/services/identity.py` |
+| Team split (SigLIP → UMAP → KMeans) | `backend/app/services/team_embed.py` |
+| Court calibration (perspective / lens distortion) → metres / km/h, on-court filter | `backend/app/services/court_calib.py` |
+| Event benchmark (DFL labelled clips) | `backend/app/scripts/bench_events.py` |
+| Kaggle run → app UI | `scripts/import_kaggle_run.py` |
 | Avatars | `backend/app/services/avatars.py` |
 | Match / player stats (+ per-player heatmap) | `backend/app/services/match_stats.py` |
 | Job stages | `backend/app/workers/pipeline.py` |

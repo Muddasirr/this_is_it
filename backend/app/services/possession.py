@@ -10,6 +10,10 @@ from typing import Any
 from app.services.vision import Detection
 
 POSSESSION_RADIUS_FRAC = 0.14
+# Possession zone in median player heights (camera-independent). The frame-diagonal
+# rule above meant 1.7 player heights on futsal CCTV but 12.5 on a 4096 px panorama.
+# None = legacy diagonal rule.
+POSSESSION_RADIUS_PLAYER_H: float | None = None
 MIN_POSSESSION_SAMPLES = 3
 MIN_POSSESSION_MS = 220
 PERSON_TIME_WINDOW_MS = 2000
@@ -48,6 +52,11 @@ def build_possession_timeline(detections: list[Detection]) -> dict[str, Any]:
     # Sparse ball → slightly larger PZ (broadcast scale) + softer temporal gates
     r_frac = POSSESSION_RADIUS_FRAC if density >= 2.0 else min(0.22, POSSESSION_RADIUS_FRAC + 0.06)
     radius = max(70.0, r_frac * diag)
+    if POSSESSION_RADIUS_PLAYER_H:
+        player_h = median_player_height(person_index)
+        if player_h:
+            sparse = 1.0 if density >= 2.0 else (POSSESSION_RADIUS_FRAC + 0.06) / POSSESSION_RADIUS_FRAC
+            radius = max(8.0, POSSESSION_RADIUS_PLAYER_H * player_h * sparse)
     # Sparse: min_run=2 keeps short real holds, drops single-frame flybys.
     # Dense facility: keep paper-like run of 3.
     if density >= 2.0:
@@ -192,6 +201,52 @@ def person_at(series: list[dict[str, Any]], ts_ms: int) -> dict[str, Any] | None
     return best
 
 
+def median_player_height(person_index: dict[str, list[dict[str, Any]]]) -> float | None:
+    hs = [p["y2"] - p["y1"] for series in person_index.values() for p in series[::5] if p.get("y2") is not None]
+    return float(sorted(hs)[len(hs) // 2]) if hs else None
+
+
+class TrackIndex:
+    """Fast "where was each player at time t" for many queries.
+
+    Same answers as `person_at` (nearest sample within PERSON_TIME_WINDOW_MS, ties
+    → earlier sample) and the same key order, but binary search per track and
+    time buckets so each query only touches tracks on screen then. The naive
+    scan was ball samples × tracks × track length (~10⁹ on a 12-min half).
+    """
+
+    BUCKET_MS = 2000
+
+    def __init__(self, series_by_key: dict[str, list[dict[str, Any]]], window_ms: int = PERSON_TIME_WINDOW_MS):
+        import bisect  # noqa: F401  (used in at())
+
+        self.window = window_ms
+        self.series = {k: sorted(v, key=lambda s: s.get("ts_ms", 0)) for k, v in series_by_key.items() if v}
+        self.ts = {k: [int(s.get("ts_ms", 0)) for s in v] for k, v in self.series.items()}
+        self.order = {k: i for i, k in enumerate(self.series)}
+        self.buckets: dict[int, list[str]] = {}
+        for k, t in self.ts.items():
+            for b in range((t[0] - window_ms) // self.BUCKET_MS, (t[-1] + window_ms) // self.BUCKET_MS + 1):
+                self.buckets.setdefault(b, []).append(k)
+
+    def active(self, ts_ms: int) -> list[str]:
+        keys = [k for k in self.buckets.get(ts_ms // self.BUCKET_MS, ())
+                if self.ts[k][0] - self.window <= ts_ms <= self.ts[k][-1] + self.window]
+        return sorted(keys, key=self.order.__getitem__)
+
+    def at(self, key: str, ts_ms: int) -> dict[str, Any] | None:
+        import bisect
+
+        t = self.ts.get(key)
+        if not t:
+            return None
+        i = bisect.bisect_left(t, ts_ms)
+        cands = [j for j in (i - 1, i) if 0 <= j < len(t)]
+        j = min(cands, key=lambda j: (abs(t[j] - ts_ms), j))
+        j = bisect.bisect_left(t, t[j])  # first of any duplicate timestamps, like min()
+        return self.series[key][j] if abs(t[j] - ts_ms) <= self.window else None
+
+
 def ball_to_player_dist(ball: dict[str, Any], person: dict[str, Any]) -> float:
     bx, by = center(ball)
     x1, y1 = float(person.get("x1", 0)), float(person.get("y1", 0))
@@ -211,12 +266,13 @@ def possession_timeline(
     radius: float,
 ) -> list[dict[str, Any]]:
     timeline: list[dict[str, Any]] = []
+    index = TrackIndex(person_index)
     for ball in ball_series:
         ts = int(ball.get("ts_ms", 0))
         best_key = None
         best_dist = radius
-        for key, series in person_index.items():
-            sample = person_at(series, ts)
+        for key in index.active(ts):
+            sample = index.at(key, ts)
             if not sample:
                 continue
             dist = ball_to_player_dist(ball, sample)

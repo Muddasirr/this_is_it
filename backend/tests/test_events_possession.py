@@ -108,3 +108,13 @@ def test_possession_change_creates_multiple_passes():
     cands = infer_event_candidates(dets, "A")
     passes = [c for c in cands if c.event_type == "pass"]
     assert len(passes) >= 4, f"expected several passes, got {len(passes)}: {passes}"
+
+
+def test_short_dense_clip_is_not_rejected_by_absolute_ball_gate():
+    """A 2.5 s labelled clip has ≤ 63 ball samples; the old ≥ 80 gate returned [] always."""
+    from app.services.events import _enough_ball
+
+    dense_clip = [{"ts_ms": t} for t in range(0, 2500, 80)]  # 32 samples, 12.5/s
+    sparse = [{"ts_ms": t} for t in range(0, 60_000, 2000)]  # 30 samples, 0.5/s
+    assert _enough_ball(dense_clip)
+    assert not _enough_ball(sparse)

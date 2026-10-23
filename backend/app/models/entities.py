@@ -232,6 +232,8 @@ class CameraSource(Base):
     match_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("matches.id", ondelete="CASCADE"), index=True)
     label: Mapped[CameraLabel] = mapped_column(Enum(CameraLabel))
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 4 clicked court corners + court size → metres (services/court_calib.py)
+    calibration: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     match: Mapped[Match] = relationship(back_populates="camera_sources")
 

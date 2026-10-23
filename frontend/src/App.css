@@ -1077,3 +1077,55 @@ button:disabled {
   color: var(--muted);
   font-size: 0.8rem;
 }
+
+/* Run stats (processing-run quality per camera) */
+.table-scroll {
+  overflow-x: auto;
+}
+.run-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.run-table th,
+.run-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+.run-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.run-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Court calibration: click 4 corners on a camera still */
+.calib-frame {
+  position: relative;
+  max-width: 100%;
+  margin-block: 12px;
+}
+.calib-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: crosshair;
+}
+.calib-dot {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  border-radius: 50%;
+  background: var(--signal);
+  color: var(--signal-ink);
+  font-size: 12px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}

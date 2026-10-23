@@ -2,6 +2,48 @@ const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export type Facility = { id: string; name: string; timezone: string; created_at: string };
 export type FacilityRole = "owner" | "staff" | "reviewer";
+export type CourtCalibration = {
+  image_points: number[][];
+  court_points?: number[][];
+  model?: string;
+  fit_error_m?: number;
+  court_length_m: number;
+  court_width_m: number;
+  frame_w?: number | null;
+  frame_h?: number | null;
+};
+export type MatchCamera = { label: CameraLabel; has_video: boolean; calibration: CourtCalibration | null };
+export type RunCameraStats = {
+  camera: string;
+  model?: string;
+  device?: string;
+  tracker?: string;
+  imgsz?: number;
+  frames_processed?: number;
+  frame_stride?: number;
+  processing_fps?: number;
+  realtime_factor?: number;
+  video_seconds_probed?: number;
+  person_tracks?: number;
+  referee_tracks?: number;
+  person_boxes?: number;
+  boxes_per_track?: number;
+  ball_detections?: number;
+  ball_coverage_pct?: number;
+  reid_tracks?: number;
+  jersey_ocr_tracks?: number;
+  fallback_model?: string;
+};
+export type RunStats = {
+  available: boolean;
+  source?: string;
+  detect_seconds?: number | null;
+  wall_seconds?: number | null;
+  track_count?: number | null;
+  counts?: { tracks: number; players: number; canonical_events: number; multi_camera_events: number } | null;
+  cameras?: RunCameraStats[];
+  offsets?: { camera: string; offset_ms: number; confidence?: number | null; method?: string }[];
+};
 export type FacilityMember = { id: string; user_id: string; role: FacilityRole; email: string | null };
 export type Team = { id: string; facility_id: string; name: string; primary_color: string | null };
 export type Player = {
@@ -247,6 +289,31 @@ export const api = {
       `/api/v1/facilities/${facilityId}/matches/${matchId}/events/${eventId}/clip`,
       { method: "POST" },
     ),
+  listCameras: (facilityId: string, matchId: string) =>
+    request<MatchCamera[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/cameras`),
+  getCameraFrame: async (facilityId: string, matchId: string, label: CameraLabel, at = 0.2) => {
+    const res = await fetch(
+      `${API_URL}/api/v1/facilities/${facilityId}/matches/${matchId}/cameras/${label}/frame?at=${at}`,
+      { headers: authHeaders(false) },
+    );
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+    return {
+      url: URL.createObjectURL(await res.blob()),
+      width: Number(res.headers.get("X-Frame-Width")) || 0,
+      height: Number(res.headers.get("X-Frame-Height")) || 0,
+    };
+  },
+  setCalibration: (facilityId: string, matchId: string, label: CameraLabel, cal: CourtCalibration) =>
+    request<{ calibration: CourtCalibration }>(
+      `/api/v1/facilities/${facilityId}/matches/${matchId}/cameras/${label}/calibration`,
+      { method: "PUT", body: JSON.stringify(cal) },
+    ),
+  clearCalibration: (facilityId: string, matchId: string, label: CameraLabel) =>
+    request<void>(`/api/v1/facilities/${facilityId}/matches/${matchId}/cameras/${label}/calibration`, {
+      method: "DELETE",
+    }),
+  getRunStats: (facilityId: string, matchId: string) =>
+    request<RunStats>(`/api/v1/facilities/${facilityId}/matches/${matchId}/run-stats`),
   getStats: (facilityId: string, matchId: string) =>
     request<MatchStats>(`/api/v1/facilities/${facilityId}/matches/${matchId}/stats`),
   revokeShare: (facilityId: string, matchId: string) =>
@@ -286,6 +353,9 @@ export const api = {
         possession_pct: number;
         touches: number;
         distance: number;
+        distance_m?: number | null;
+        avg_speed_kmh?: number | null;
+        top_speed_kmh?: number | null;
         minutes?: number;
         avg_speed?: number;
         conversion_pct?: number | null;

@@ -17,6 +17,7 @@ email-validator==2.2.0
 # Vision deps (torch/torchvision installed separately from CPU wheels; ultralytics --no-deps)
 opencv-python-headless>=4.7.0
 numpy>=1.23.0
+scipy>=1.11  # court calibration (lens distortion fit), cross-camera assignment
 matplotlib>=3.3.0
 pillow>=7.1.2
 pyyaml>=5.3.1
@@ -33,3 +34,7 @@ torchreid>=0.2.5
 # tensorboard 2.21 wants protobuf>=6.31; that conflict is pre-existing and
 # tensorboard is not a CourtLens runtime dep.
 protobuf>=5.26.1,<6
+# Team split (SigLIP → UMAP → KMeans); imported lazily, colour fallback without them
+transformers>=4.44
+umap-learn>=0.5.6
+sentencepiece>=0.2  # TrOCR tokenizer (jersey numbers)

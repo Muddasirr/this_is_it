@@ -8,6 +8,8 @@ import {
   type Facility,
   type FacilityMember,
   type FacilityRole,
+  type RunStats,
+  type MatchCamera,
   type Match,
   type MatchEvent,
   type MatchStats,
@@ -172,6 +174,7 @@ function FacilityHome() {
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<FacilityRole>("staff");
   const [staffMessage, setStaffMessage] = useState("");
+  const [runs, setRuns] = useState<Record<string, RunStats>>({});
 
   async function refresh() {
     const [t, p, m, mem] = await Promise.all([
@@ -184,6 +187,8 @@ function FacilityHome() {
     setPlayers(p);
     setMatches(m);
     setMembers(mem);
+    const rs = await Promise.all(m.map((x) => api.getRunStats(facilityId, x.id).catch(() => null)));
+    setRuns(Object.fromEntries(m.map((x, i) => [x.id, rs[i]]).filter(([, r]) => r && (r as RunStats).available)));
   }
 
   useEffect(() => {
@@ -247,6 +252,60 @@ function FacilityHome() {
           </ul>
         </form>
       </section>
+
+      {Object.keys(runs).length > 0 && (
+        <section className="panel">
+          <h2>Processing runs</h2>
+          <p className="lede">
+            Detection quality per match (camera A). Low boxes/track = tracker keeps losing players; ball coverage drives
+            possession, passes and shots.
+          </p>
+          <div className="table-scroll">
+            <table className="run-table">
+              <thead>
+                <tr>
+                  <th>Match</th>
+                  <th>Model</th>
+                  <th className="num">Video s</th>
+                  <th className="num">× realtime</th>
+                  <th className="num">Player tracks</th>
+                  <th className="num">Boxes / track</th>
+                  <th className="num">Players</th>
+                  <th className="num">Ball cov.</th>
+                  <th className="num">Events</th>
+                  <th className="num">ReID</th>
+                  <th className="num">OCR</th>
+                </tr>
+              </thead>
+              <tbody>
+                {matches
+                  .filter((m) => runs[m.id])
+                  .map((m) => {
+                    const r = runs[m.id];
+                    const c = r.cameras?.[0] ?? { camera: "A" };
+                    return (
+                      <tr key={m.id}>
+                        <td>
+                          <Link to={`/facilities/${facilityId}/matches/${m.id}`}>{m.title}</Link>
+                        </td>
+                        <td>{c.model ?? "—"}</td>
+                        <td className="num">{fmt(c.video_seconds_probed)}</td>
+                        <td className="num">{fmt(c.realtime_factor, 2)}</td>
+                        <td className="num">{c.person_tracks ?? "—"}</td>
+                        <td className="num">{fmt(c.boxes_per_track, 1)}</td>
+                        <td className="num">{r.counts?.players ?? "—"}</td>
+                        <td className="num">{fmt(c.ball_coverage_pct, 1, "%")}</td>
+                        <td className="num">{r.counts?.canonical_events ?? "—"}</td>
+                        <td className="num">{c.reid_tracks ?? "—"}</td>
+                        <td className="num">{c.jersey_ocr_tracks ?? "—"}</td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <section className="panel">
         <h2>Staff</h2>
@@ -529,6 +588,234 @@ function statusPresentation(status?: string): { label: string; className: string
   }
 }
 
+function fmt(v: number | null | undefined, digits = 0, suffix = ""): string {
+  return v === null || v === undefined ? "—" : `${v.toFixed(digits)}${suffix}`;
+}
+
+// Click order. 4 corners = flat perspective; all 8 also fits lens distortion
+// (SoccerTrack v2 wide camera: 11 m → 0.9 m mean error).
+function courtLandmarks(L: number, W: number, R: number): { name: string; at: number[] }[] {
+  return [
+    { name: "near-left corner", at: [0, W] },
+    { name: "far-left corner", at: [0, 0] },
+    { name: "far-right corner", at: [L, 0] },
+    { name: "near-right corner", at: [L, W] },
+    { name: "halfway line, far end", at: [L / 2, 0] },
+    { name: "halfway line, near end", at: [L / 2, W] },
+    { name: "centre circle, far crossing", at: [L / 2, W / 2 - R] },
+    { name: "centre circle, near crossing", at: [L / 2, W / 2 + R] },
+  ];
+}
+
+function CourtCalibrationPanel({ facilityId, matchId }: { facilityId: string; matchId: string }) {
+  const [cameras, setCameras] = useState<MatchCamera[]>([]);
+  const [label, setLabel] = useState<CameraLabel | null>(null);
+  const [frame, setFrame] = useState<{ url: string; width: number; height: number } | null>(null);
+  const [points, setPoints] = useState<number[][]>([]);
+  const [length, setLength] = useState(40);
+  const [width, setWidth] = useState(20);
+  const [radius, setRadius] = useState(3);
+  const [note, setNote] = useState("");
+  const landmarks = courtLandmarks(length, width, radius);
+
+  async function load() {
+    setCameras(await api.listCameras(facilityId, matchId).catch(() => [] as MatchCamera[]));
+  }
+  useEffect(() => {
+    load();
+  }, [facilityId, matchId]);
+
+  async function open(cam: MatchCamera) {
+    setNote("");
+    setLabel(cam.label);
+    setPoints(cam.calibration?.image_points ?? []);
+    setLength(cam.calibration?.court_length_m ?? 40);
+    setWidth(cam.calibration?.court_width_m ?? 20);
+    try {
+      setFrame(await api.getCameraFrame(facilityId, matchId, cam.label));
+    } catch (err) {
+      setFrame(null);
+      setNote(err instanceof Error ? err.message : "Could not load a frame");
+    }
+  }
+
+  function onClick(e: React.MouseEvent<HTMLImageElement>) {
+    if (!frame || points.length >= landmarks.length) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = ((e.clientX - r.left) / r.width) * frame.width;
+    const y = ((e.clientY - r.top) / r.height) * frame.height;
+    setPoints([...points, [Math.round(x), Math.round(y)]]);
+  }
+
+  async function save() {
+    if (!label || !frame || points.length < 4) return;
+    try {
+      const saved = await api.setCalibration(facilityId, matchId, label, {
+        image_points: points,
+        court_points: landmarks.slice(0, points.length).map((l) => l.at),
+        court_length_m: length,
+        court_width_m: width,
+        frame_w: frame.width,
+        frame_h: frame.height,
+      });
+      const err = saved.calibration.fit_error_m;
+      setNote(
+        `Camera ${label} calibrated (${points.length} points${err !== undefined ? `, fit error ${err.toFixed(2)} m` : ""}) — distance and speed now in metres / km/h` +
+          (points.length < 8 ? ". Add points 5–8 for wide or distorted cameras." : ""),
+      );
+      await load();
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : "Calibration failed");
+    }
+  }
+
+  return (
+    <section className="panel">
+      <h2>Court calibration</h2>
+      <p className="lede">
+        Click court landmarks once per fixed camera, in the order shown. The 4 corners are enough for a flat
+        view; adding the halfway-line ends and centre-circle crossings (8 points) also corrects lens distortion —
+        recommended for wide CCTV. Distance and speed switch to metres and km/h.
+      </p>
+      <div className="inline">
+        {cameras
+          .filter((c) => c.has_video)
+          .map((c) => (
+            <button key={c.label} type="button" className={label === c.label ? "active" : ""} onClick={() => open(c)}>
+              Camera {c.label} {c.calibration ? "✓" : ""}
+            </button>
+          ))}
+        {!cameras.some((c) => c.has_video) && <span className="lede">Upload a camera video first.</span>}
+      </div>
+      {frame && label && (
+        <>
+          <div className="calib-frame">
+            <img src={frame.url} alt={`Camera ${label}`} onClick={onClick} />
+            {points.map((p, i) => (
+              <span
+                key={i}
+                className="calib-dot"
+                style={{ left: `${(100 * p[0]) / frame.width}%`, top: `${(100 * p[1]) / frame.height}%` }}
+              >
+                {i + 1}
+              </span>
+            ))}
+          </div>
+          <p className="lede">
+            {points.length < landmarks.length
+              ? `Click point ${points.length + 1}: ${landmarks[points.length].name}${points.length >= 4 ? " (optional)" : ""}`
+              : "All 8 landmarks set."}
+          </p>
+          <div className="inline">
+            <label>
+              Length (m) <input type="number" value={length} min={10} max={120} onChange={(e) => setLength(Number(e.target.value))} />
+            </label>
+            <label>
+              Width (m) <input type="number" value={width} min={5} max={90} onChange={(e) => setWidth(Number(e.target.value))} />
+            </label>
+            <label>
+              Centre circle radius (m){" "}
+              <input type="number" value={radius} min={1} max={10} step={0.05} onChange={(e) => setRadius(Number(e.target.value))} />
+            </label>
+            <button type="button" disabled={!points.length} onClick={() => setPoints(points.slice(0, -1))}>
+              Undo point
+            </button>
+            <button type="button" onClick={() => setPoints([])}>
+              Reset
+            </button>
+            <button className="primary" type="button" disabled={points.length < 4} onClick={save}>
+              Save calibration
+            </button>
+          </div>
+        </>
+      )}
+      {note && <p className="lede">{note}</p>}
+    </section>
+  );
+}
+
+function moveCell(row: { distance?: number; distance_m?: number | null; avg_speed_kmh?: number | null; top_speed_kmh?: number | null }) {
+  if (row.distance_m !== null && row.distance_m !== undefined) {
+    return (
+      <td className="num" title={`avg ${row.avg_speed_kmh ?? "—"} km/h · top ${row.top_speed_kmh ?? "—"} km/h`}>
+        {Math.round(row.distance_m)} m
+      </td>
+    );
+  }
+  return <td className="num">{Math.round(row.distance ?? 0)}</td>;
+}
+
+function RunStatsPanel({ stats }: { stats: RunStats | null }) {
+  if (!stats?.available) {
+    return (
+      <section className="panel">
+        <h2>Run stats</h2>
+        <p className="lede">No processing run recorded for this match yet.</p>
+      </section>
+    );
+  }
+  return (
+    <section className="panel">
+      <h2>Run stats</h2>
+      <p className="lede">
+        {stats.source === "offline" ? "Kaggle GPU run imported" : "Worker run"}
+        {stats.wall_seconds ? ` · ${fmt(stats.wall_seconds)} s total` : ""}
+        {stats.counts
+          ? ` · ${stats.counts.tracks} tracks → ${stats.counts.players} players · ${stats.counts.canonical_events} events`
+          : ""}
+      </p>
+      <div className="table-scroll">
+        <table className="run-table">
+          <thead>
+            <tr>
+              <th>Cam</th>
+              <th>Model</th>
+              <th className="num" title="Processed frames (every Nth)">Frames</th>
+              <th className="num" title="Video seconds per wall second">× realtime</th>
+              <th className="num">Player tracks</th>
+              <th className="num" title="Detections per track — low means the tracker keeps losing players">Boxes / track</th>
+              <th className="num">Ref tracks</th>
+              <th className="num" title="Processed frames with a ball">Ball cov.</th>
+              <th className="num">ReID tracks</th>
+              <th className="num">OCR tracks</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(stats.cameras ?? []).map((c) => (
+              <tr key={c.camera}>
+                <td>{c.camera}</td>
+                <td>
+                  {c.model ?? "—"}
+                  {c.imgsz ? ` @${c.imgsz}px` : ""}
+                </td>
+                <td className="num">
+                  {c.frames_processed ?? "—"}
+                  {c.frame_stride ? ` /${c.frame_stride}` : ""}
+                </td>
+                <td className="num">{fmt(c.realtime_factor, 2)}</td>
+                <td className="num">{c.person_tracks ?? "—"}</td>
+                <td className="num">{fmt(c.boxes_per_track, 1)}</td>
+                <td className="num">{c.referee_tracks ?? "—"}</td>
+                <td className="num">{fmt(c.ball_coverage_pct, 1, "%")}</td>
+                <td className="num">{c.reid_tracks ?? "—"}</td>
+                <td className="num">{c.jersey_ocr_tracks ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!!stats.offsets?.length && (
+        <p className="lede">
+          Sync:{" "}
+          {stats.offsets
+            .map((o) => `${o.camera} ${o.offset_ms >= 0 ? "+" : ""}${o.offset_ms} ms${o.method ? ` (${o.method})` : ""}`)
+            .join(" · ")}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function MatchPage() {
   const { facilityId = "", matchId = "" } = useParams();
   const [match, setMatch] = useState<Match | null>(null);
@@ -539,6 +826,7 @@ function MatchPage() {
   const [events, setEvents] = useState<MatchEvent[]>([]);
   const [stats, setStats] = useState<MatchStats | null>(null);
   const [syncs, setSyncs] = useState<CameraSync[]>([]);
+  const [runStats, setRunStats] = useState<RunStats | null>(null);
   const [offsetDraft, setOffsetDraft] = useState<Partial<Record<CameraLabel, number>>>({});
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -563,14 +851,16 @@ function MatchPage() {
     setJobs(j);
     setSyncs(sync);
     setOffsetDraft(Object.fromEntries(sync.map((s) => [s.camera_label, s.offset_ms])));
-    const [tr, ev, st] = await Promise.all([
+    const [tr, ev, st, rs] = await Promise.all([
       api.listTracks(facilityId, matchId).catch(() => [] as Track[]),
       api.listEvents(facilityId, matchId).catch(() => [] as MatchEvent[]),
       api.getStats(facilityId, matchId).catch(() => null),
+      api.getRunStats(facilityId, matchId).catch(() => null),
     ]);
     setTracks(tr);
     setEvents(ev);
     setStats(st);
+    setRunStats(rs);
   }
 
   useEffect(() => {
@@ -726,6 +1016,7 @@ function MatchPage() {
 
       {view === "center" && (
         <>
+          <RunStatsPanel stats={runStats} />
           <div className="bc-layout">
             <section className="bc-board">
               <div className="bc-board-head">
@@ -743,7 +1034,7 @@ function MatchPage() {
                         <th className="num" title="Ball touches">Touches</th>
                         <th
                           className="num"
-                          title="Relative movement in the camera view — not metres. Path length as % of frame diagonal."
+                          title="Metres run when the camera is court-calibrated (hover for km/h); otherwise relative movement in the camera view (% of frame diagonal)."
                         >
                           Move
                         </th>
@@ -796,7 +1087,7 @@ function MatchPage() {
                             <td className="num">{(row.possession_pct ?? 0).toFixed(0)}</td>
                             <td className="num">{(row.minutes ?? 0).toFixed(1)}</td>
                             <td className="num">{row.touches ?? 0}</td>
-                            <td className="num">{Math.round(row.distance ?? 0)}</td>
+                            {moveCell(row)}
                             <td className="num">{row.goal}</td>
                             <td className="num">{row.shot}</td>
                             <td className="num">{row.assist ?? 0}</td>
@@ -1034,6 +1325,8 @@ function MatchPage() {
               </ul>
             </div>
           </section>
+
+          <CourtCalibrationPanel facilityId={facilityId} matchId={matchId} />
 
           <section className="panel">
             <h2>Camera sync</h2>
@@ -1384,7 +1677,7 @@ function PublicReportPage() {
                 <th className="num" title="Ball touches">Touches</th>
                 <th
                   className="num"
-                  title="Relative movement in the camera view — not metres. Path length as % of frame diagonal."
+                  title="Metres run when the camera is court-calibrated (hover for km/h); otherwise relative movement in the camera view (% of frame diagonal)."
                 >
                   Move
                 </th>
@@ -1425,7 +1718,7 @@ function PublicReportPage() {
                   <td className="num">{(row.possession_pct ?? 0).toFixed(0)}</td>
                   <td className="num">{(row.minutes ?? 0).toFixed(1)}</td>
                   <td className="num">{row.touches ?? 0}</td>
-                  <td className="num">{Math.round(row.distance ?? 0)}</td>
+                  {moveCell(row)}
                   <td className="num">{row.goal}</td>
                   <td className="num">{row.shot}</td>
                   <td className="num">{row.assist ?? 0}</td>

@@ -4,8 +4,10 @@ Each camera's events engine already emits one candidate per action it sees.
 Fusing therefore only merges observations from *different* cameras that
 (1) have the same event type, (2) land within `bucket_ms` of each other on the
 canonical timeline (camera_ts + sync offset, Camera A = reference), and
-(3) do not name different resolved players. Raw tracker IDs are never
-compared across cameras — `A-p12` and `B-p12` are unrelated tracks.
+(3) beyond `same_moment_ms`, do not name different resolved players. Inside
+that window two angles disagreeing on the player is attribution noise (seen on
+Kaggle: one pass, passer Kit A #8 on B vs Kit B #2 on A, 120 ms apart), not two
+events. Raw tracker IDs are never compared across cameras.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ def group_event_candidates(
     bucket_ms: int = 1500,
     offsets_ms: dict[str, int] | None = None,
     player_of: Callable[[str], Any] | None = None,
+    same_moment_ms: int = 400,
 ) -> list[list[Any]]:
     """Group candidates into canonical events; each group is that event's observations.
 
@@ -57,7 +60,8 @@ def group_event_candidates(
                 continue
             if cam in g["cameras"]:
                 continue  # same camera ⇒ the events engine already split them
-            if player is not None and g["players"] and player not in g["players"]:
+            disagree = player is not None and g["players"] and player not in g["players"]
+            if disagree and ts - g["anchor_ts"] > same_moment_ms:
                 continue
             target = g
             break

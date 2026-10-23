@@ -63,3 +63,18 @@ def test_synthetic_digits_ocr_when_tesseract_available():
         hit = read_jersey_number_bgr(_draw(str(expected)))
         assert hit is not None, f"no OCR for {expected}"
         assert int(hit["number"]) == expected, f"expected {expected} got {hit}"
+
+
+def test_jersey_reader_prefers_trained_model_and_never_defaults_to_tesseract(monkeypatch, tmp_path):
+    from app.services import jersey_ocr
+
+    monkeypatch.delenv("VISION_JERSEY_MODEL", raising=False)
+    monkeypatch.setenv("VISION_JERSEY_OCR", "1")
+    assert jersey_ocr.jersey_reader() is None  # no model → no guesses
+    monkeypatch.setenv("VISION_JERSEY_OCR", "0")
+    assert jersey_ocr.jersey_reader() is None
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"x")
+    monkeypatch.setenv("VISION_JERSEY_OCR", "1")
+    monkeypatch.setenv("VISION_JERSEY_MODEL", str(weights))
+    assert jersey_ocr.jersey_reader().__name__ == "read_jersey_number_cls"

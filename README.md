@@ -27,7 +27,7 @@ docker compose up --build
 - App: http://localhost:5173  
 - API: http://localhost:8000/docs  
 
-Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov5x_football.pt` (football player/GK/ref/ball; ~3–5× slower on CPU than `yolov8n.pt`), `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`, `PIPELINE_PROXIES`, `PIPELINE_MAX_CLIPS`, `MIN_VIDEO_DURATION_S`.
+Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov8m.pt` (default; finds 4–80× more futsal players than the football fine-tune — see `EVAL.md`), `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`, `VISION_TARGET_FPS=10`, `VISION_TEAM_EMBED=1` (torso colour + SigLIP team split), `VISION_IMGSZ=0` (auto input size), `PIPELINE_PROXIES`, `PIPELINE_MAX_CLIPS`, `MIN_VIDEO_DURATION_S`. Court calibration (Setup → Court calibration) turns distance/speed into metres and km/h.
 
 ## GPU runs (Kaggle)
 

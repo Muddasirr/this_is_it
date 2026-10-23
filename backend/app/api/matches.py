@@ -1,6 +1,7 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -217,6 +218,182 @@ def playback_url(
     if not asset or asset.match_id != match_id:
         raise HTTPException(status_code=404, detail="Video not found")
     return {"url": presign_download(asset.object_key), "expires_in": get_settings().signed_url_expire_seconds}
+
+
+class CalibrationIn(BaseModel):
+    # Clicked on the frame from GET …/cameras/{label}/frame, in that frame's pixels.
+    # Order: near-left, far-left, far-right, near-right corner of the court.
+    image_points: list[list[float]] = Field(min_length=4, max_length=40)
+    # Court metres of each clicked point; omit for exactly the 4 corners. ≥ 8 points
+    # (corners + halfway ends + centre-circle crossings) fit lens distortion too.
+    court_points: list[list[float]] | None = None
+    court_length_m: float = 40.0
+    court_width_m: float = 20.0
+    frame_w: int | None = None
+    frame_h: int | None = None
+
+
+def _camera(db: Session, match_id: UUID, label: CameraLabel) -> CameraSource:
+    cam = db.query(CameraSource).filter(CameraSource.match_id == match_id, CameraSource.label == label).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail=f"Camera {label.value} not set up for this match")
+    return cam
+
+
+def _camera_video(db: Session, cam: CameraSource) -> VideoAsset | None:
+    return (
+        db.query(VideoAsset)
+        .filter(VideoAsset.camera_source_id == cam.id, VideoAsset.kind == VideoKind.original)
+        .order_by(VideoAsset.created_at.desc())
+        .first()
+    )
+
+
+@router.get("/{match_id}/cameras")
+def list_cameras(
+    facility_id: UUID,
+    match_id: UUID,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> list[dict]:
+    _get_match(db, facility_id, match_id)
+    cams = db.query(CameraSource).filter(CameraSource.match_id == match_id).all()
+    return [
+        {
+            "label": c.label.value,
+            "has_video": _camera_video(db, c) is not None,
+            "calibration": c.calibration,
+        }
+        for c in sorted(cams, key=lambda c: c.label.value)
+    ]
+
+
+@router.get("/{match_id}/cameras/{label}/frame")
+def camera_frame(
+    facility_id: UUID,
+    match_id: UUID,
+    label: CameraLabel,
+    at: float = 0.2,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> Response:
+    """JPEG still from the camera's original video (fraction `at` of its length) for corner clicks."""
+    import tempfile
+    from pathlib import Path
+
+    import cv2
+
+    from app.services.storage import download_to_path, local_path, use_local_storage
+
+    _get_match(db, facility_id, match_id)
+    asset = _camera_video(db, _camera(db, match_id, label))
+    if not asset:
+        raise HTTPException(status_code=404, detail="No video uploaded for this camera")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = local_path(asset.object_key) if use_local_storage() else Path(tmp) / "v.mp4"
+        if not use_local_storage():
+            download_to_path(asset.object_key, path)
+        cap = cv2.VideoCapture(str(path))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(0.0, min(0.95, at)) * n))
+        ok, frame = cap.read()
+        cap.release()
+    if not ok:
+        raise HTTPException(status_code=422, detail="Could not read a frame from this video")
+    ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return Response(content=jpg.tobytes(), media_type="image/jpeg",
+                    headers={"X-Frame-Width": str(frame.shape[1]), "X-Frame-Height": str(frame.shape[0])})
+
+
+@router.put("/{match_id}/cameras/{label}/calibration")
+def set_calibration(
+    facility_id: UUID,
+    match_id: UUID,
+    label: CameraLabel,
+    payload: CalibrationIn,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> dict:
+    from app.services.court_calib import validate_calibration
+
+    _get_match(db, facility_id, match_id)
+    cam = _camera(db, match_id, label)
+    try:
+        cam.calibration = validate_calibration(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    db.commit()
+    return {"label": label.value, "calibration": cam.calibration}
+
+
+@router.delete("/{match_id}/cameras/{label}/calibration", status_code=status.HTTP_204_NO_CONTENT)
+def clear_calibration(
+    facility_id: UUID,
+    match_id: UUID,
+    label: CameraLabel,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> None:
+    _get_match(db, facility_id, match_id)
+    _camera(db, match_id, label).calibration = None
+    db.commit()
+
+
+@router.get("/{match_id}/run-stats")
+def run_stats(
+    facility_id: UUID,
+    match_id: UUID,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> dict:
+    """Processing-run quality numbers for the latest successful job (live worker or offline import)."""
+    from app.models import ProcessingRun
+    from app.models.entities import JobStage, JobStatus
+
+    _get_match(db, facility_id, match_id)
+    job = (
+        db.query(ProcessingJob)
+        # A processed match waits for staff review — that is a finished run too
+        .filter(
+            ProcessingJob.match_id == match_id,
+            ProcessingJob.status.in_([JobStatus.succeeded, JobStatus.waiting_review]),
+        )
+        .order_by(ProcessingJob.created_at.desc())
+        .first()
+    )
+    if not job:
+        return {"available": False}
+    runs = {r.stage: r for r in db.query(ProcessingRun).filter(ProcessingRun.job_id == job.id).all()}
+    detect = (runs.get(JobStage.detect_track).checkpoint or {}) if JobStage.detect_track in runs else {}
+    sync = (runs.get(JobStage.synchronize).checkpoint or {}) if JobStage.synchronize in runs else {}
+    keep = (
+        "model", "device", "tracker", "imgsz", "frames_processed", "frame_stride", "processing_fps", "realtime_factor",
+        "video_seconds_probed", "person_tracks", "referee_tracks", "person_boxes", "ball_detections",
+        "ball_coverage_pct", "reid_tracks", "jersey_ocr_tracks", "thumbs_written", "fallback_model",
+    )
+    cameras = []
+    for v in detect.get("vision_stats") or []:
+        row = {k: v.get(k) for k in keep if k in v}
+        row["camera"] = v.get("camera_label", "A")
+        if row.get("model"):
+            row["model"] = str(row["model"]).rsplit("/", 1)[-1]
+        if row.get("person_tracks") and row.get("person_boxes"):
+            row["boxes_per_track"] = round(row["person_boxes"] / row["person_tracks"], 1)
+        cameras.append(row)
+    offsets = detect.get("offsets")
+    if offsets is None and sync.get("offsets_ms"):
+        offsets = [{"camera": k, "offset_ms": v} for k, v in sync["offsets_ms"].items() if k != "A"]
+    return {
+        "available": bool(cameras),
+        "source": detect.get("source", "worker"),
+        "job_finished_at": job.finished_at,
+        "detect_seconds": detect.get("seconds"),
+        "wall_seconds": detect.get("wall_seconds"),
+        "track_count": detect.get("track_count"),
+        "counts": detect.get("counts"),
+        "cameras": cameras,
+        "offsets": offsets or [],
+    }
 
 
 @router.put("/{match_id}/sync", response_model=CameraSyncOut)

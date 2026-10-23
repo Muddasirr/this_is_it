@@ -112,15 +112,20 @@ def xcorr_lag(ref, other, rate_hz: float, max_lag_ms: int = SYNC_MAX_LAG_MS) -> 
     max_lag = min(int(max_lag_ms * rate_hz / 1000.0), n // 2 - 1)
     lags = np.concatenate([np.arange(0, max_lag + 1), np.arange(-max_lag, 0)])
     vals = np.concatenate([corr[: max_lag + 1], corr[n - max_lag :]])
-    # Normalise by overlap so long lags are not penalised for fewer samples
+    # Normalise by overlap so long lags are not penalised for fewer samples, but
+    # never trust lags where the clips barely overlap — a few samples of noise
+    # then out-score the true peak (seen on Kaggle: +27.9 s on a 28 s clip).
     overlap = np.minimum(a.size - np.maximum(lags, 0), b.size + np.minimum(lags, 0)).clip(min=1)
-    vals = vals / overlap
+    vals = np.where(overlap >= 0.5 * min(a.size, b.size), vals / overlap, -np.inf)
+    if not np.isfinite(vals).any():
+        return 0, 0.0
     i = int(np.argmax(vals))
     peak = float(vals[i])
     # Sharpness: peak vs best value outside ±0.5 s of it
     guard = max(1, int(0.5 * rate_hz))
     mask = np.abs(lags - lags[i]) > guard
-    runner_up = float(vals[mask].max()) if mask.any() else 0.0
+    finite = mask & np.isfinite(vals)
+    runner_up = float(vals[finite].max()) if finite.any() else 0.0
     conf = 0.0 if peak <= 0 else max(0.0, min(1.0, (peak - max(runner_up, 0.0)) / peak))
     return int(round(lags[i] * 1000.0 / rate_hz)), round(conf, 3)
 

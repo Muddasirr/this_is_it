@@ -26,7 +26,7 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 | Sport / customer | Futsal facilities (indoor courts); multi-tenant SaaS |
 | Capture | Facility-owned fixed cameras; **1–4** views (A–D). Pilot runs 1 camera; production courts target 3–4 (both goals + wide) |
 | Timing | **Post-match, asynchronous** cloud processing; live deferred |
-| Identity | Auto: kit colour clustering + jersey OCR when readable; staff override always wins |
+| Identity | Auto: kit split (torso colour + SigLIP) + trained jersey-number classifier when validated; staff override always wins |
 | Events | Pass, shot, goal (and assist when attribution allows) from **possession changes**; see `ARCHITECTURE.md` |
 | Quality labels | Every published metric: `estimated` \| `confirmed` \| `unavailable` |
 | Review | High-confidence classes may auto-accept after validation gates; uncertain → review queue |
@@ -81,7 +81,7 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 **Vision & identity**
 
 - Player + ball detect/track (stable `VisionBackend` interface).
-- Dense track series, kit colour features, jersey OCR when available.
+- Dense track series, kit colour features, shirt numbers from the trained classifier when available (never from unvalidated OCR).
 - Proposed roster (Kit A/B + shirt number); staff rename / reassign.
 - Multi-cam: one player across angles — per-camera clusters linked by kit + shirt + appearance (one-to-one per camera); staff merge/split.
 - Unknown / low-confidence identity states preserved — never silently invent certainty.
@@ -104,7 +104,7 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 
 ### 4.2 Should ship soon after v1 (P1)
 
-- Calibrated pitch metres (homography) for true distance/speed.
+- Automatic court-keypoint calibration (v1 ships manual 4–8 landmark calibration per camera → metres / km/h; 8 points correct wide-lens distortion).
 - Stronger ball model or domain-tuned detector for wide CCTV.
 - Assists as first-class confirmed metric; defensive actions; GK saves.
 - Exports (CSV/PDF), webhook on publish, facility branding on share pages.
@@ -148,7 +148,7 @@ Report precision/recall **separately** for goal, shot, pass, and identity. Never
 
 ### 5.3 Honesty constraints (product copy & sales)
 
-- Do not promise Opta-level pass networks or calibrated metres until homography ships.
+- Do not promise Opta-level pass networks. Metres / km/h only on court-calibrated cameras.
 - Do not promise readable jersey OCR on all CCTV; kit clustering + rename is the fallback.
 - Sparse ball ⇒ possession/touches/shots degrade; UI must surface ball coverage.
 
@@ -302,7 +302,7 @@ Illustrative raw volume (25 matches × 60 min × 6 Mbps) ≈ **67 GB/month per c
 | **3 — Possession** | Vidal-Codina PZ + gain/loss (Δv/Δθ when possible) | Possession segments when ball samples ≥ 80 |
 | **4 — Events + stats** | Pass/shot/goal + touches/poss%/**per-player heatmap** | No shot flood; `score_events.py` runs; heatmaps on player rows |
 | **5 — Product + multi-cam** | Upload → process → review → share (avatars + **player heatmaps**); cameras A–D: per-camera sync, cross-camera identity + fuse | One docker/local match completes with share report; Kaggle synthetic 3-cam check passes (`EVAL.md`) |
-| **6 (later)** | Homography metres, multi-cam quality on **real** multi-angle court footage, SSO/exports | Separate PRD |
+| **6 (later)** | Automatic court keypoints, multi-cam quality on **real** multi-angle court footage, SSO/exports | Separate PRD |
 
 **Court formats:** `COURT_FORMAT=5v5|6v6|7v7` (field players per side). **Cameras:** A–D supported end-to-end; pilot uses A. **Heatmaps:** image-plane grids per player + match aggregate; always `estimated` until calibrated pitch.
 

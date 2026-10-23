@@ -50,6 +50,19 @@ def _load_encoder(device: str = "cpu"):
     return m
 
 
+def torch_device(device: str | int | None) -> str:
+    """Ultralytics-style device ("0", "0,1", "cuda", "cpu") → a torch device string."""
+    import torch
+
+    d = str(device if device is not None else "cpu").strip().lower()
+    if d in {"", "cpu"} or not torch.cuda.is_available():
+        return "cpu"
+    if d.startswith("cuda"):
+        return d
+    first = d.split(",")[0]
+    return f"cuda:{first}" if first.isdigit() else "cuda:0"
+
+
 def embed_bgr_crops(crops: list[Any], device: str | None = None) -> list[np.ndarray | None]:
     """Return L2-normalized embeddings for BGR crops (OpenCV). Empty → None."""
     if not crops:
@@ -60,9 +73,8 @@ def embed_bgr_crops(crops: list[Any], device: str | None = None) -> list[np.ndar
     if device is None:
         from app.core.config import get_settings
 
-        device = "cpu" if get_settings().vision_device in {"cpu", ""} else str(get_settings().vision_device)
-        if device == "0":
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = str(get_settings().vision_device or "cpu")
+    device = torch_device(device)
 
     model = _load_encoder(device)
     tensors = []
