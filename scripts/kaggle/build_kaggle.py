@@ -117,7 +117,7 @@ RUN = '''
 import json, os, shutil, subprocess, sys, time
 from pathlib import Path
 
-N_DFL = int(os.environ.get("COURTLENS_N_DFL", "8"))
+N_DFL = int(os.environ.get("COURTLENS_N_DFL", "0"))  # DFL 30 s clips already measured (v9)
 OUT = Path("/kaggle/working/eval"); OUT.mkdir(exist_ok=True)
 mp4 = {}
 for p in Path("/kaggle/input").rglob("*.mp4"):
@@ -152,8 +152,7 @@ def run(slug, cams, **extra):
 
 index = []
 # Detector comparison on futsal (the football fine-tune finds ~0.2 players/frame on CCTV)
-FUTSAL = ["test_video_2.mp4", "portugal_spain_euro_2026_final.mp4", "bangladesh_pakistan_saff_2026.mp4",
-          "spain_brazil_fifa_2012.mp4", "spain_france_u19_2023.mp4"]
+FUTSAL = [n for n in os.environ.get("COURTLENS_FUTSAL", "test_video_2.mp4,bangladesh_pakistan_saff_2026.mp4").split(",") if n]
 DETECTORS = [d for d in os.environ.get("COURTLENS_DETECTORS", PRIMARY).split(",") if d]
 for name in FUTSAL:
     if name not in mp4:
@@ -244,7 +243,7 @@ for gt in sorted(Path("/kaggle/input").rglob("*.txt")):
         continue
     out_json = OUT / f"bench_mot_{gt.stem}.json"
     r = subprocess.run([sys.executable, "-m", "app.scripts.bench_mot", "--clip", str(clip), "--gt", str(gt),
-                        "--imgsz", os.environ.get("COURTLENS_MOT_IMGSZ", "640,1280,1920"),
+                        "--imgsz", os.environ.get("COURTLENS_MOT_IMGSZ", "1920"),
                         "--max-frames", "600", "--out", str(out_json),
                         *(["--teams", str(t)] if (t := BACKEND / "app/scripts/bench_labels" / f"{gt.stem}_teams.json").exists() else [])],
                        cwd=BACKEND, env=env, capture_output=True, text=True)

@@ -53,6 +53,25 @@ class ReviewAction(BaseModel):
     canonical_ts_ms: int | None = None
 
 
+class EventCreate(BaseModel):
+    """Staff-added event (missed by the model). Stored confirmed — also futsal ground truth."""
+
+    event_type: str = Field(pattern="^(pass|shot|goal|assist|dribble)$")
+    canonical_ts_ms: int = Field(ge=0)
+    player_id: UUID | None = None
+    notes: str | None = None
+
+
+EVENT_TYPES = {
+    "goal": EventType.goal,
+    "shot": EventType.shot,
+    "pass": EventType.pass_event,
+    "assist": EventType.assist,
+    "dribble": EventType.dribble,
+}
+PRIMARY_ROLE = {"pass": "passer", "shot": "shooter", "goal": "scorer", "assist": "passer", "dribble": "carrier"}
+
+
 class StatsOut(BaseModel):
     match_id: UUID
     status: str
@@ -122,6 +141,61 @@ def list_events(
             )
         )
     return out
+
+
+@router.post("/{match_id}/events", response_model=EventOut, status_code=201)
+def create_event(
+    facility_id: UUID,
+    match_id: UUID,
+    payload: EventCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    _: FacilityUser = Depends(require_facility_member),
+) -> EventOut:
+    _match(db, facility_id, match_id)
+    event = MatchEvent(
+        match_id=match_id,
+        event_type=EVENT_TYPES[payload.event_type],
+        canonical_ts_ms=payload.canonical_ts_ms,
+        confirmation=ConfirmationState.confirmed,
+        confidence=1.0,
+        provenance={"source": "staff", "user_id": str(user.id)},
+        is_canonical=True,
+    )
+    db.add(event)
+    db.flush()
+    if payload.player_id is not None:
+        if not db.get(Player, payload.player_id):
+            raise HTTPException(status_code=404, detail="Player not found")
+        db.add(EventParticipant(event_id=event.id, player_id=payload.player_id,
+                                role=PRIMARY_ROLE[payload.event_type], confidence=1.0))
+    db.add(EventReview(event_id=event.id, reviewer_id=user.id, action="create", notes=payload.notes))
+    db.commit()
+    return _single_event(db, event)
+
+
+@router.get("/{match_id}/events/export")
+def export_ground_truth(
+    facility_id: UUID,
+    match_id: UUID,
+    db: Session = Depends(get_db),
+    _: FacilityUser = Depends(require_facility_member),
+) -> dict:
+    """Confirmed events as ground truth (scripts/eval/score_events.py format)."""
+    match = _match(db, facility_id, match_id)
+    events = (
+        db.query(MatchEvent)
+        .filter(MatchEvent.match_id == match_id, MatchEvent.confirmation == ConfirmationState.confirmed)
+        .order_by(MatchEvent.canonical_ts_ms)
+        .all()
+    )
+    return {
+        "video": match.title,
+        "notes": "Staff-confirmed events (accepted model events + staff-added); rejected and unreviewed excluded.",
+        "tolerance_ms": 3000,
+        "events": [{"ts_ms": e.canonical_ts_ms, "type": _event_type_value(e.event_type),
+                    "source": (e.provenance or {}).get("source", "model")} for e in events],
+    }
 
 
 @router.post("/{match_id}/events/{event_id}/review", response_model=EventOut)

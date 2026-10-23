@@ -745,6 +745,61 @@ function moveCell(row: { distance?: number; distance_m?: number | null; avg_spee
   return <td className="num">{Math.round(row.distance ?? 0)}</td>;
 }
 
+function parseClock(text: string): number | null {
+  const m = text.trim().match(/^(\d+):([0-5]?\d)(?:\.(\d))?$/);
+  if (!m) return null;
+  return (Number(m[1]) * 60 + Number(m[2])) * 1000 + (m[3] ? Number(m[3]) * 100 : 0);
+}
+
+function AddEventForm({
+  players,
+  onAdd,
+  onExport,
+}: {
+  players: Player[];
+  onAdd: (body: { event_type: string; canonical_ts_ms: number; player_id?: string }) => Promise<void>;
+  onExport: () => Promise<void>;
+}) {
+  const [type, setType] = useState("pass");
+  const [clock, setClock] = useState("");
+  const [playerId, setPlayerId] = useState("");
+  const ts = parseClock(clock);
+  return (
+    <form
+      className="inline"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        if (ts === null) return;
+        await onAdd({ event_type: type, canonical_ts_ms: ts, player_id: playerId || undefined });
+        setClock("");
+      }}
+    >
+      <select value={type} onChange={(e) => setType(e.target.value)}>
+        {["pass", "shot", "goal", "assist", "dribble"].map((t) => (
+          <option key={t} value={t}>
+            {t}
+          </option>
+        ))}
+      </select>
+      <input value={clock} onChange={(e) => setClock(e.target.value)} placeholder="mm:ss" size={6} />
+      <select value={playerId} onChange={(e) => setPlayerId(e.target.value)}>
+        <option value="">player (optional)</option>
+        {players.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.display_name}
+          </option>
+        ))}
+      </select>
+      <button className="primary" type="submit" disabled={ts === null}>
+        Add missed event
+      </button>
+      <button type="button" onClick={onExport} title="Confirmed events as JSON ground truth">
+        Export ground truth
+      </button>
+    </form>
+  );
+}
+
 function RunStatsPanel({ stats }: { stats: RunStats | null }) {
   if (!stats?.available) {
     return (
@@ -1114,6 +1169,23 @@ function MatchPage() {
                 <h2>Match timeline</h2>
                 <span>{timeline.length} moments</span>
               </div>
+              <AddEventForm
+                players={players}
+                onAdd={async (body) => {
+                  await api.createEvent(facilityId, matchId, body);
+                  setMessage(`Added ${body.event_type} at ${formatMatchClock(body.canonical_ts_ms)}`);
+                  await refreshResults();
+                }}
+                onExport={async () => {
+                  const gt = await api.exportGroundTruth(facilityId, matchId);
+                  const blob = new Blob([JSON.stringify(gt, null, 2)], { type: "application/json" });
+                  const a = document.createElement("a");
+                  a.href = URL.createObjectURL(blob);
+                  a.download = `ground-truth-${matchId}.json`;
+                  a.click();
+                  setMessage(`Exported ${gt.events.length} confirmed events`);
+                }}
+              />
               <div className="bc-timeline">
                 {timeline.length ? (
                   timeline.map((ev) => (

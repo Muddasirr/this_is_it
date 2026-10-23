@@ -122,6 +122,19 @@ def _clear_auto_analysis(db: Session, match_id: UUID) -> None:
     db.commit()
 
 
+def drop_self_passes(candidates: list, player_of: dict) -> list:
+    """Remove passes whose passer and receiver resolve to the same player."""
+    out = []
+    for c in candidates:
+        ev = c.evidence or {}
+        if c.event_type == "pass":
+            a, b = player_of.get(ev.get("passer")), player_of.get(ev.get("receiver"))
+            if a is not None and a == b:
+                continue
+        out.append(c)
+    return out
+
+
 def _participant_roles(
     event_type: str, track_keys: list[str], evidence: dict | None
 ) -> list[tuple[str, str]]:
@@ -390,6 +403,8 @@ def process_job(db: Session, job_id: UUID) -> None:
                 for link in links
                 if link.track_id in key_by_track_id
             }
+            # A "pass" between two fragments of the same resolved player is a track split, not a pass
+            candidates = drop_self_passes(candidates, player_by_track)
             groups = group_event_candidates(
                 candidates,
                 bucket_ms=1500,

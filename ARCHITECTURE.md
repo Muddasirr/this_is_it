@@ -68,7 +68,10 @@ Upload Camera A [(optional) Cameras B, C, D]
          · tracker state reset per video (no carry-over between cameras / clips)
          · dense bbox_series (ts_ms, xyxy, frame_w/h, conf); ball gaps ≤ 0.5 s interpolated
          · ball kept even without tracker ID (synthetic ball track)
-         · secondary ball `predict` at conf≤0.12 / imgsz≥960 on a separate model instance (never the tracker's)
+         · secondary ball `predict` at conf≤0.12 / imgsz≥960 on a separate model instance (never the tracker's);
+           frames wider than the input are tiled at native resolution (SAHI-style) so a ~10 px ball survives
+         · up to 5 ball candidates / frame → `ball_select`: static spares by the touchline suppressed,
+           then trajectory-consistent choice (SoccerTrack: spare balls had won every frame by confidence)
          · up to 6 crops / track → median torso colour + SigLIP torso embedding (VISION_TEAM_EMBED=1)
          · OSNet ReID embeddings (EMA per track) when VISION_REID=1
          · upper-body HSV colour_hist (fragment merge)
@@ -81,7 +84,8 @@ Upload Camera A [(optional) Cameras B, C, D]
          · create/update roster → TrackIdentityLink
          · staff rename / reassign in UI
     → Infer events (possession-centric)
-         · pass / shot / goal candidates + roles
+         · pass / shot / goal candidates + roles; flood caps scale per minute (a fixed 120-pass cap
+           dropped most passes of a full half); passes between fragments of one resolved player dropped
     → Fuse (same type within 1.5 s on the synced timeline, ≤1 obs per camera, players must agree)
     → Stats (match_stats from canonical events + tracks)
     → Review gate (clips; estimated → confirmed)
@@ -123,6 +127,12 @@ Upload Camera A [(optional) Cameras B, C, D]
 ## 5. Statistic definitions (locked)
 
 Must stay aligned with `backend/app/services/events.py` and the review UI.
+
+### Measured (event engine)
+
+- DFL labelled clips (400; `bench_events`): pass P 0.40 / R 0.51 / F1 0.45 — "background" clips are a noisy negative (football has a pass every ~2 s).
+- SoccerTrack v2 M2 first 12 min (167 labelled passes): with the *true* ball, caps removed → pass recall 0.81–0.87, precision ~0.30 (over-prediction from player-track fragmentation). With our *detected* ball on the 4096 px panorama, recall is ball-limited (the ~8 px match ball is rarely detected).
+- Not shipped (helped the panorama, hurt DFL): possession radius in player heights, minimum ball travel between passer and receiver. Futsal-specific tuning waits for labelled futsal matches (Review → *Add missed event* / *Export ground truth*).
 
 ### Pass (`estimated` until confirmed)
 

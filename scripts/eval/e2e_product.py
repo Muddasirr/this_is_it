@@ -50,6 +50,8 @@ def main() -> None:
     ap.add_argument("--api", default="http://localhost:8001")
     ap.add_argument("--timeout-min", type=float, default=40)
     args = ap.parse_args()
+    if not args.video.is_file():
+        raise SystemExit(f"video not found: {args.video}")
     check = Check()
     c = httpx.Client(base_url=args.api.rstrip("/"), timeout=120)
     tag = secrets.token_hex(3)

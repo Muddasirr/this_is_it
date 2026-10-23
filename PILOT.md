@@ -47,6 +47,7 @@ These are **not** a free always-on production GPU for your cloud API. Use them t
 - [ ] Processing completes without engineer help
 - [ ] Player board shows identity + POS% / P / heatmap
 - [ ] Court can fix wrong names in Identity tab
+- [ ] Court can add a missed goal/shot/pass on the timeline; *Export ground truth* gives our first labelled futsal match
 - [ ] Owner can add staff by email (Staff panel)
 - [ ] Share link opens a clean report without login; **Revoke share link** kills it
 - [ ] Court says “good enough to use again”

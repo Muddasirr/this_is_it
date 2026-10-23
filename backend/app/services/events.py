@@ -16,6 +16,7 @@ handoffs) are disabled when ball coverage is usable.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
 
 from app.services.possession import (
@@ -46,9 +47,18 @@ SHOT_MAX_RECEIVER_MS = 850
 PASS_DEDUP_MS = 1800
 SHOT_DEDUP_MS = 3500
 GOAL_DEDUP_MS = 10000
+# Flood guards, scaled with video length: a fixed MAX_PASSES = 120 cut a 12-min
+# SoccerTrack half (167 labelled passes) at ~115 and would drop ~80 % of a full half.
 MAX_PASSES = 120
 MAX_SHOTS = 18
 MAX_GOALS = 8
+MAX_PER_MIN = {"pass": 40.0, "shot": 3.0, "goal": 1.0, "dribble": 8.0, "assist": 1.0}
+_LIMITS: ContextVar[dict[str, int] | None] = ContextVar("event_limits", default=None)
+
+
+def _limit(kind: str, default: int) -> int:
+    limits = _LIMITS.get()
+    return max(default, limits.get(kind, default)) if limits else default
 # Need this many ball samples before trusting possession events alone
 MIN_BALL_FOR_STRICT = 80
 # Short clips / short spells: enough ball if it is dense, even below 80 samples
@@ -75,7 +85,15 @@ def infer_event_candidates(
     # Without enough ball, do NOT invent shot/pass floods — return empty estimated set
     if not _enough_ball(ball_series):
         return []
+    minutes = max(0.0, (int(ball_series[-1].get("ts_ms", 0)) - int(ball_series[0].get("ts_ms", 0))) / 60000.0)
+    token = _LIMITS.set({k: int(v * minutes) for k, v in MAX_PER_MIN.items()})
+    try:
+        return _infer(detections, persons, ball_series, camera_label)
+    finally:
+        _LIMITS.reset(token)
 
+
+def _infer(detections, persons, ball_series, camera_label: str) -> list[EventCandidate]:
     poss = build_possession_timeline(detections)
     segments = [
         (s["holder"], int(s["start_ms"]), int(s["end_ms"])) for s in (poss.get("segments") or [])
@@ -162,7 +180,7 @@ def _assists_from_goals(
                 },
             )
         )
-        if len(out) >= MAX_ASSISTS:
+        if len(out) >= _limit("assist", MAX_ASSISTS):
             break
     return out
 
@@ -208,7 +226,7 @@ def _dribbles_from_segments(
                 },
             )
         )
-        if len(out) >= MAX_DRIBBLES:
+        if len(out) >= _limit("dribble", MAX_DRIBBLES):
             break
     return out
 
@@ -418,7 +436,8 @@ def _passes_from_segments(
         if (b_end - b_start) < MIN_POSSESSION_MS:
             continue
         disp = _ball_displacement(ball_series, a_end, b_start)
-        if MIN_PASS_BALL_DISP_FRAC > 0 and (disp is None or disp < MIN_PASS_BALL_DISP_FRAC * diag):
+        # Reject only when the ball is seen standing still; unknown (ball missed) is not evidence
+        if MIN_PASS_BALL_DISP_FRAC > 0 and disp is not None and disp < MIN_PASS_BALL_DISP_FRAC * diag:
             continue
         if persons_index and _same_player_reid(persons_index, a_key, b_key, a_end, b_start):
             continue
@@ -446,7 +465,7 @@ def _passes_from_segments(
                 },
             )
         )
-        if len(candidates) >= MAX_PASSES:
+        if len(candidates) >= _limit("pass", MAX_PASSES):
             break
     return candidates
 
@@ -509,7 +528,7 @@ def _shots_from_segments(
                 },
             )
         )
-        if len(candidates) >= MAX_SHOTS:
+        if len(candidates) >= _limit("shot", MAX_SHOTS):
             break
     return candidates
 
@@ -591,7 +610,7 @@ def _goals_after_shots(
                 },
             )
         )
-        if len(candidates) >= MAX_GOALS:
+        if len(candidates) >= _limit("goal", MAX_GOALS):
             break
     return candidates
 

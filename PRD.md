@@ -53,7 +53,7 @@ This is **not** a live broadcast Opta replacement, 3D reconstruction product, or
 2. **Create match** — metadata, cameras A–D, retention policy.  
 3. **Upload** — signed URLs; validate codec, duration, FPS, resolution, integrity.  
 4. **Process** — ingest → sync (multi-cam) → detect/track → identity → events → fuse → stats.  
-5. **Review** — fix identity, accept/reject/edit events; audit trail.  
+5. **Review** — fix identity, accept/reject/edit events, add missed events; audit trail. Confirmed events export as ground truth for accuracy tracking.  
 6. **Publish & share** — match centre + player reports + clips; share token.  
 7. **Retain / delete** — policy enforcement; verified deletion.
 

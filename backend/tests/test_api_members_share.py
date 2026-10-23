@@ -57,3 +57,16 @@ def test_run_stats_shown_for_match_awaiting_review(client, register):
     db.commit()
     r = client.get(f"/api/v1/facilities/{fac['id']}/matches/{match['id']}/run-stats", headers=owner).json()
     assert r["available"] and r["cameras"][0]["person_tracks"] == 5
+
+
+def test_staff_adds_missed_event_and_exports_ground_truth(client, register):
+    owner = register("labels@example.com")
+    fac = client.post("/api/v1/facilities", headers=owner, json={"name": "Labels"}).json()
+    match = client.post(f"/api/v1/facilities/{fac['id']}/matches", headers=owner, json={"title": "Sat"}).json()
+    base = f"/api/v1/facilities/{fac['id']}/matches/{match['id']}"
+    r = client.post(f"{base}/events", headers=owner, json={"event_type": "goal", "canonical_ts_ms": 61000})
+    assert r.status_code == 201 and r.json()["confirmation"] == "confirmed"
+    assert client.post(f"{base}/events", headers=owner, json={"event_type": "tackle", "canonical_ts_ms": 1}).status_code == 422
+    assert client.get(f"{base}/stats", headers=owner).json()["totals"]["goal"] == 1
+    gt = client.get(f"{base}/events/export", headers=owner).json()
+    assert gt["events"] == [{"ts_ms": 61000, "type": "goal", "source": "staff"}]

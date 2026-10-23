@@ -273,6 +273,19 @@ export const api = {
     }),
   listEvents: (facilityId: string, matchId: string) =>
     request<MatchEvent[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/events`),
+  createEvent: (
+    facilityId: string,
+    matchId: string,
+    body: { event_type: string; canonical_ts_ms: number; player_id?: string; notes?: string },
+  ) =>
+    request<MatchEvent>(`/api/v1/facilities/${facilityId}/matches/${matchId}/events`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  exportGroundTruth: (facilityId: string, matchId: string) =>
+    request<{ events: { ts_ms: number; type: string; source: string }[] }>(
+      `/api/v1/facilities/${facilityId}/matches/${matchId}/events/export`,
+    ),
   reviewEvent: (
     facilityId: string,
     matchId: string,

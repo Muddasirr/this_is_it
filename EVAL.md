@@ -100,7 +100,7 @@ Product default: `YOLO_MODEL=yolov8m.pt` (Kaggle v6: best player and ball recall
 | 1 | `summary.json` has ball + person tracks on facility smoke |
 | 2 | Kit/OCR unit tests (`pytest backend/tests/test_kit_identity.py backend/tests/test_jersey_ocr.py backend/tests/test_team_assigner.py`) + `python scripts/eval/build_identity_gallery.py data/kaggle_out/gpu_eval/eval` exits 0 (both kits on every run) + manual gallery confirm (one colour per kit letter). Tune with `run_offline --replay` — no GPU needed |
 | 3 | Possession timeline non-empty when ball samples ≥ 80 |
-| 4 | No flood (>40 shots on test_video_2) + `bench_events.json` pass precision/recall reported (play vs background/challenge/throw-in). Futsal P/R still needs hand-labelled test_video_2 GT |
+| 4 | No flood (>40 shots on test_video_2) + `bench_events.json` pass precision/recall reported (play vs background/challenge/throw-in) + `bench_soccertrack_*.json` (full half). Futsal P/R: label a match in the app (Match centre → accept/reject + *Add missed event*), *Export ground truth*, score with `score_events.py --gt <export>` |
 | 5 | `run_product_smoke.py` + share/UI per-player heatmaps; docker when available; Kaggle `multicam_synthetic` row `pass: true` (sync error ≤ 200 ms for B and C, ≥ 50 % players linked across cameras, ≥ 50 % events fused) |
 
 ## Heatmaps

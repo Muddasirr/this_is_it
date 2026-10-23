@@ -118,3 +118,15 @@ def test_short_dense_clip_is_not_rejected_by_absolute_ball_gate():
     sparse = [{"ts_ms": t} for t in range(0, 60_000, 2000)]  # 30 samples, 0.5/s
     assert _enough_ball(dense_clip)
     assert not _enough_ball(sparse)
+
+
+def test_pass_between_fragments_of_one_player_is_dropped():
+    from app.services.vision import EventCandidate
+    from app.workers.pipeline import drop_self_passes
+
+    def p(a, b):
+        return EventCandidate("pass", "A", 1000, 0.6, [a, b], {"passer": a, "receiver": b})
+
+    players = {"A-p1": "kitA#7", "A-p9": "kitA#7", "A-p2": "kitB#3"}
+    kept = drop_self_passes([p("A-p1", "A-p9"), p("A-p1", "A-p2"), p("A-p5", "A-p6")], players)
+    assert [(c.evidence["passer"], c.evidence["receiver"]) for c in kept] == [("A-p1", "A-p2"), ("A-p5", "A-p6")]

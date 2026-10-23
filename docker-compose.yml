@@ -1,5 +1,6 @@
 services:
   db:
+    restart: unless-stopped
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: futsal
@@ -17,6 +18,7 @@ services:
       retries: 10
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     # Host 6379 often already taken by a local Redis — keep Redis internal-only.
     # ports:
@@ -32,6 +34,7 @@ services:
   # To use S3 later: set STORAGE_BACKEND=s3 and add a reachable MinIO/S3 endpoint.
 
   api:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -66,6 +69,7 @@ services:
         condition: service_healthy
 
   worker:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -99,6 +103,7 @@ services:
         condition: service_healthy
 
   frontend:
+    restart: unless-stopped
     build:
       context: ./frontend
       dockerfile: Dockerfile
