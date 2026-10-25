@@ -314,3 +314,83 @@ def test_same_player_not_both_kit_a_and_b():
     ]
     _reconcile_same_colour_kits(meta)
     assert meta[0]["kit"] == meta[1]["kit"]
+
+
+def test_player_clusters_never_mix_kits_decided_per_track(monkeypatch):
+    """Futsal phone clip regression: colour-hist clustering joined both teams' tracks
+    (65 % pure players, 10 v 4 roster). Kits are now decided per track first."""
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services import identity
+
+    monkeypatch.setattr("app.services.reid.reid_enabled", lambda: False)
+    grass_hist = [0.2, 0.6, 0.2]  # the polluted histogram both kits share
+    tracks = []
+    for i in range(12):
+        red = i % 2 == 0
+        tracks.append(SimpleNamespace(
+            id=uuid4(), track_key=f"A-p{i}", start_ms=i * 1000, end_ms=i * 1000 + 900, camera_label="A",
+            class_name="person",
+            features={"class": "person", "color_hist": grass_hist,
+                      "team_colour": [55.0, 60.0, 40.0] if red else [40.0, -5.0, -40.0],
+                      "team_emb": [1.0, 0.0, 0.1] if red else [0.0, 1.0, 0.1]},
+        ))
+    red_ids = {t.id for t in tracks[::2]}
+    metas = identity._camera_cluster_meta(tracks)
+    for m in metas:
+        ids = {t.id for t in m["tracks"]}
+        assert ids <= red_ids or not (ids & red_ids)
+        assert m["track_kit"] in {"A", "B"}
+    assert {m["track_kit"] for m in metas} == {"A", "B"}
+
+
+def test_keeper_clusters_never_take_kit_slots(client, register, monkeypatch):
+    """Kit X (keepers / refs) used to take any free roster slot, pushing kit players into the other kit."""
+    from uuid import UUID
+
+    from app.core.database import get_db
+    from app.main import app
+    from app.models import PlayerTrack, ProcessingJob, ProcessingRun, Team, TrackIdentityLink
+    from app.models.entities import CameraLabel, JobStage
+    from app.services.identity import propose_identity_links
+
+    monkeypatch.setattr("app.services.reid.reid_enabled", lambda: False)
+    owner = register("roster@example.com")
+    fac = client.post("/api/v1/facilities", headers=owner, json={"name": "Court"}).json()
+    match = client.post(f"/api/v1/facilities/{fac['id']}/matches", headers=owner, json={"title": "M"}).json()
+    db = next(app.dependency_overrides[get_db]())
+    job = ProcessingJob(match_id=UUID(match["id"]), idempotency_key="roster-test")
+    db.add(job)
+    db.flush()
+    run = ProcessingRun(job_id=job.id, stage=JobStage.detect_track)
+    db.add(run)
+    db.flush()
+    profiles = {"red": [1.0] + [0.0] * 10, "black": [0.0] * 3 + [1.0] + [0.0] * 7, "keeper": [0.0] * 7 + [1.0] + [0.0] * 3}
+    tracks, colour_of = [], {}
+    # keeper tracks are the longest (rank first), then 6 red and 6 black players at once
+    plan = [("keeper", 0, 25000)] * 2 + [("red", 0, 20000)] * 6 + [("black", 0, 20000)] * 6  # keepers ~15 % of time
+    for i, (colour, t0, t1) in enumerate(plan):
+        x = 100 + 120 * i
+        series = [{"ts_ms": t, "x1": x, "y1": 300, "x2": x + 40, "y2": 420, "frame_w": 1920, "frame_h": 1080}
+                  for t in range(t0, t1 + 1, 500)]
+        t = PlayerTrack(match_id=UUID(match["id"]), processing_run_id=run.id, camera_label=CameraLabel.A,
+                        track_key=f"A-p{i}", start_ms=t0, end_ms=t1, confidence=0.9,
+                        features={"class": "person", "bbox_series": series, "colour_profile": profiles[colour],
+                                  "role_score": 0.1, "color_hist": [0.2, 0.6, 0.2]})
+        db.add(t)
+        tracks.append(t)
+        colour_of[i] = colour
+    db.commit()
+    propose_identity_links(db, UUID(match["id"]), tracks)
+    team_name = {t.id: t.name for t in db.query(Team).all()}
+    from app.models import Player
+
+    kit_of_player = {p.id: team_name.get(p.team_id) for p in db.query(Player).all()}
+    kits = {}
+    for i, t in enumerate(tracks):
+        link = db.query(TrackIdentityLink).filter(TrackIdentityLink.track_id == t.id).first()
+        kits.setdefault(colour_of[i], set()).add(kit_of_player.get(link.player_id) if link and link.player_id else None)
+    assert len(kits["red"] - {None}) == 1 and len(kits["black"] - {None}) == 1
+    assert kits["red"] - {None} != kits["black"] - {None}
+    assert kits["keeper"] == {None}

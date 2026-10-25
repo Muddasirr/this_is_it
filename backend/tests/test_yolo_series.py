@@ -50,3 +50,70 @@ def test_ball_tiles_cover_wide_panorama_at_native_resolution():
     assert all(x1 - x0 == 1920 for x0, _, x1, _ in tiles)
     assert tiles[0][0] == 0 and tiles[-1][2] == 4096  # full width covered
     assert all(b[0] < a[2] for a, b in zip(tiles, tiles[1:]))  # overlapping, no gaps
+
+
+def test_reid_load_failure_is_cached_not_retried_every_frame(monkeypatch):
+    import pytest
+
+    from app.services import reid
+
+    calls = []
+
+    def boom(device):
+        calls.append(device)
+        raise ImportError("No module named 'gdown'")
+
+    monkeypatch.setattr(reid, "_ENCODER", None)
+    monkeypatch.setattr(reid, "_ENCODER_FAILED", None)
+    monkeypatch.setattr(reid, "_build_encoder", boom)
+    for _ in range(3):
+        with pytest.raises(Exception):
+            reid._load_encoder("cpu")
+    assert len(calls) == 1
+
+
+def test_dedicated_ball_model_loads_its_own_ball_classes(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from app.services import yolo_backend as yb
+
+    loaded = []
+
+    class FakeYOLO:
+        def __init__(self, weights):
+            loaded.append(weights)
+            self.names = {0: "ball"} if "ball" in str(weights) else {0: "person", 32: "sports ball"}
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FakeYOLO))
+    monkeypatch.setattr(yb, "resolve_yolo_weights", lambda w: w)
+    backend = yb.YoloTrackBackend()
+    backend.ball_model_path = "ball_yolov8m.pt"
+    backend._load_ball_model()
+    assert loaded == ["ball_yolov8m.pt"]
+    assert backend._ball_class_ids == [0]
+
+
+def test_camera_is_static_tells_fixed_from_panning(tmp_path):
+    import cv2
+    import numpy as np
+
+    from app.services.yolo_backend import camera_is_static
+
+    rng = np.random.default_rng(0)
+    scene = (rng.random((360, 1400)) * 255).astype(np.uint8)
+    scene = cv2.GaussianBlur(cv2.cvtColor(scene, cv2.COLOR_GRAY2BGR), (5, 5), 0)
+
+    def write(name, pan_px_per_frame):
+        path = tmp_path / name
+        out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 25, (640, 360))
+        for i in range(150):
+            x = int(i * pan_px_per_frame) % (scene.shape[1] - 640)
+            frame = scene[:, x : x + 640].copy()
+            cv2.circle(frame, (100 + 2 * i, 200), 12, (0, 0, 255), -1)  # a moving "player"
+            out.write(frame)
+        out.release()
+        return str(path)
+
+    assert camera_is_static(write("fixed.avi", 0)) is True
+    assert camera_is_static(write("pan.avi", 4)) is False

@@ -292,7 +292,7 @@ Illustrative raw volume (25 matches × 60 min × 6 Mbps) ≈ **67 GB/month per c
 
 ## 10. Implementation roadmap (production)
 
-**Lock:** do not start the next phase until the prior **exit gate** passes. See `EVAL.md`.
+**Lock:** do not start the next phase until the prior **exit gate** passes. See `EVAL.md`. The concrete plan from today's measured state to these gates — workstreams, data, target numbers, order — is `ROADMAP.md`.
 
 | Phase | Outcome | Exit gate |
 | ----- | ------- | --------- |

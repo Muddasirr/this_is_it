@@ -244,7 +244,7 @@ for gt in sorted(Path("/kaggle/input").rglob("*.txt")):
     out_json = OUT / f"bench_mot_{gt.stem}.json"
     r = subprocess.run([sys.executable, "-m", "app.scripts.bench_mot", "--clip", str(clip), "--gt", str(gt),
                         "--imgsz", os.environ.get("COURTLENS_MOT_IMGSZ", "1920"),
-                        "--max-frames", "600", "--out", str(out_json),
+                        "--max-frames", "600", "--out", str(out_json), "--reid", "--save-log", str(OUT / "mot_logs"),
                         *(["--teams", str(t)] if (t := BACKEND / "app/scripts/bench_labels" / f"{gt.stem}_teams.json").exists() else [])],
                        cwd=BACKEND, env=env, capture_output=True, text=True)
     (OUT / f"bench_mot_{gt.stem}.log").write_text(r.stdout + "\\n" + r.stderr)
@@ -301,8 +301,30 @@ print("bundles", Path("/kaggle/working/results.zip").stat().st_size // 1_000_000
 '''
 
 
-def build_kernel() -> Path:
+ALL_FUTSAL = ("test_video_2.mp4,bangladesh_pakistan_saff_2026.mp4,portugal_spain_euro_2026_final.mp4,"
+              "spain_brazil_fifa_2012.mp4,spain_france_u19_2023.mp4")
+
+
+# Minimal state the MOT cell needs when the RUN cell is skipped
+MOT_ENV = '''
+import json
+env = dict(os.environ, PYTHONPATH=str(BACKEND), VISION_DEVICE="0", VISION_TARGET_FPS="10", YOLO_MODEL="yolov8m.pt")
+OUT = Path("/kaggle/working/eval"); OUT.mkdir(exist_ok=True)
+'''
+
+
+def build_kernel(only: str | None = None) -> Path:
+    """only: None = everything; "corpus" = product runs on every futsal video + 8 DFL clips
+    (for the UI, no benchmarks); "mot" = the SoccerTrack tracking benchmark alone."""
     KERNEL_DIR.mkdir(exist_ok=True)
+    run_cell = RUN
+    if only == "corpus":
+        run_cell = (RUN.replace('"COURTLENS_N_DFL", "0"', '"COURTLENS_N_DFL", "8"')
+                    .replace('"test_video_2.mp4,bangladesh_pakistan_saff_2026.mp4"', f'"{ALL_FUTSAL}"'))
+    elif only == "mot":
+        run_cell = MOT_ENV
+    benches = {"corpus": [], "mot": [_cell(MOT)]}.get(
+        only, [_cell(MULTICAM), _cell(BENCH), _cell(MOT), _cell(MATCH), _cell(JERSEY)])
     for old in KERNEL_DIR.glob("*.ipynb"):
         old.unlink()
     nb = {
@@ -315,12 +337,8 @@ def build_kernel() -> Path:
             ),
             _cell(SETUP.replace("__BUILD_ID__", BUILD_ID)),
             _cell(GPU),
-            _cell(RUN),
-            _cell(MULTICAM),
-            _cell(BENCH),
-            _cell(MOT),
-            _cell(MATCH),
-            _cell(JERSEY),
+            _cell(run_cell),
+            *benches,
             _cell(BUNDLE),
         ],
         "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
@@ -381,9 +399,11 @@ def push() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--push", action="store_true")
+    ap.add_argument("--only", choices=["corpus", "mot"], default=None,
+                    help="corpus = product runs for the UI; mot = tracking benchmark only")
     args = ap.parse_args()
     print("code  →", build_code_zip())
-    print("kernel→", build_kernel())
+    print("kernel→", build_kernel(args.only))
     if args.push:
         push()
 

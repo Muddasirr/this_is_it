@@ -164,6 +164,40 @@ def assign_kits_by_embedding(metas: list[dict], min_coverage: float = 0.7) -> bo
     return True
 
 
+def track_kits(tracks: list, min_coverage: float = 0.7) -> dict[Any, str]:
+    """Kit letter per *track* (keyed by track id), {} when too few tracks carry features.
+
+    Deciding kits per track before grouping tracks into players keeps a player
+    cluster from mixing both teams: clustering on the old colour histogram first
+    gave 65 % pure clusters on the futsal phone clip and a 10 v 4 / 76 % possession
+    split; the per-track split of the same tracks is ~54 / 41 / 5 (A / B / X).
+    """
+    profiled = [t for t in tracks if (getattr(t, "features", None) or {}).get("colour_profile")]
+    if profiled and len(profiled) >= max(2, min_coverage * len(tracks)):
+        # Zero-shot colour profile (role_filter.py): 97 % vs 50 % for torso Lab on the phone clip
+        prof = np.asarray([t.features["colour_profile"] for t in profiled], dtype=np.float64)
+        w = [float(max(1, int(t.end_ms) - int(t.start_ms))) for t in profiled]
+        kits = split_teams(prof.tolist(), w, reduce=False)
+        return {(getattr(t, "id", None) or getattr(t, "track_key", None)): k for t, k in zip(profiled, kits)}
+    rows, ids = [], []
+    for t in tracks:
+        feats = getattr(t, "features", None) or {}
+        col, emb = feats.get("team_colour"), feats.get("team_emb")
+        if not col and not emb:
+            continue
+        e = None
+        if emb:
+            e = np.asarray(emb, dtype=np.float64)
+            e = e / (np.linalg.norm(e) + 1e-12)
+        rows.append((len(rows), np.asarray(col, dtype=np.float64) if col else None, e,
+                     float(max(1, int(getattr(t, "end_ms", 0)) - int(getattr(t, "start_ms", 0))))))
+        ids.append(getattr(t, "id", None) or getattr(t, "track_key", None))
+    if len(rows) < max(2, min_coverage * len(tracks)):
+        return {}
+    kits = split_teams(_team_features(rows), [r[3] for r in rows], reduce=False)
+    return dict(zip(ids, kits))
+
+
 def _per_dim(x: np.ndarray) -> np.ndarray:
     """Colour block: every Lab channel matters — CCTV labels: 11/12 vs 8–10/12 with one global scale."""
     return (x - x.mean(axis=0)) / (x.std(axis=0) + 1e-6)

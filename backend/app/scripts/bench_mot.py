@@ -13,6 +13,11 @@ count as false positives, so precision is a lower bound.
 --teams <match>_teams.json (white/blue/goalkeeper GT ids) also scores the SigLIP
 team split: each matched detection's predicted kit vs its true team, best A/B
 mapping, goalkeepers excluded.
+
+--save-log DIR keeps the raw per-frame tracks (+ ReID embeddings with --reid) so
+offline tracklet stitching can be tuned without a GPU:
+
+  python -m app.scripts.bench_mot --replay DIR/117093_1920.json --gt mot/117093.txt
 """
 
 from __future__ import annotations
@@ -98,21 +103,55 @@ def team_accuracy(gt: dict, log: list[tuple], frames: list[int], kit_of: dict[in
             "kit_x_tracks": sum(1 for k in kit_of.values() if k == "X")}
 
 
+def stitched_log(log: list[tuple], fps: float, emb: dict[int, list[float]] | None = None) -> list[tuple]:
+    """Frame log with track ids replaced by their stitched chain id (track_stitch)."""
+    from app.services.track_stitch import stitch
+
+    tracks: dict[int, list] = defaultdict(list)
+    for f, tid, x1, y1, x2, y2, _c in log:
+        if tid is not None:
+            tracks[int(tid)].append((int(round(f * 1000 / fps)), [x1, y1, x2, y2]))
+    for v in tracks.values():
+        v.sort(key=lambda o: o[0])
+    head = stitch(tracks, emb=emb)
+    return [(f, head.get(int(tid), tid) if tid is not None else None, x1, y1, x2, y2, c)
+            for f, tid, x1, y1, x2, y2, c in log]
+
+
+def replay(path: Path, gt: dict) -> dict:
+    data = json.loads(path.read_text())
+    log = [tuple(r) for r in data["log"]]
+    emb = {int(k): v for k, v in (data.get("emb") or {}).items()}
+    frames = data["frames"]
+    raw = score(gt, log, frames)
+    out = {"replay": str(path), "raw": raw,
+           "stitched_motion": score(gt, stitched_log(log, data["fps"]), frames)}
+    if emb:
+        out["stitched_motion_reid"] = score(gt, stitched_log(log, data["fps"], emb), frames)
+    print(json.dumps(out, indent=1))
+    return out
+
+
 def main(argv: list[str] | None = None) -> dict:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--clip", type=Path, required=True)
+    ap.add_argument("--clip", type=Path)
     ap.add_argument("--gt", type=Path, required=True)
     ap.add_argument("--imgsz", default="640", help="comma-separated input sizes to compare")
     ap.add_argument("--max-frames", type=int, default=0, help="processed-frame cap per run (0 = whole clip)")
     ap.add_argument("--teams", type=Path, default=None, help="<match>_teams.json → score team split")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--reid", action="store_true", help="OSNet embeddings on (needed for appearance stitching)")
+    ap.add_argument("--save-log", type=Path, default=None, help="dir for raw tracks + embeddings per run")
+    ap.add_argument("--replay", type=Path, default=None, help="saved log → score raw vs stitched (no GPU)")
     args = ap.parse_args(argv)
 
     gt = load_gt(args.gt)
+    if args.replay:
+        return replay(args.replay, gt)
     teams = json.loads(args.teams.read_text()) if args.teams else None
     results = []
     for size in [int(s) for s in args.imgsz.split(",") if s != ""]:
-        os.environ.update(VISION_IMGSZ=str(size), VISION_REID="0", VISION_JERSEY_OCR="0",
+        os.environ.update(VISION_IMGSZ=str(size), VISION_REID="1" if args.reid else "0", VISION_JERSEY_OCR="0",
                           VISION_TEAM_EMBED="1" if teams else "0", VISION_MAX_FRAMES=str(args.max_frames))
         from app.core.config import get_settings
 
@@ -137,6 +176,16 @@ def main(argv: list[str] | None = None) -> dict:
             "seconds": round(time.time() - t0, 1),
             **score(gt, backend.frame_log, frames),
         }
+        import cv2
+
+        fps = cv2.VideoCapture(str(args.clip)).get(cv2.CAP_PROP_FPS) or 25.0  # frame_log uses video frame indices
+        emb = {int(d.track_key.rsplit("p", 1)[1]): d.features["reid_emb"] for d in dets
+               if d.class_name == "person" and (d.features or {}).get("reid_emb")}
+        row["stitched"] = score(gt, stitched_log(backend.frame_log, fps, emb or None), frames)
+        if args.save_log:
+            args.save_log.mkdir(parents=True, exist_ok=True)
+            (args.save_log / f"{args.clip.stem}_{size}.json").write_text(json.dumps(
+                {"fps": fps, "frames": frames, "log": backend.frame_log, "emb": emb}))
         if teams:
             import numpy as np
 

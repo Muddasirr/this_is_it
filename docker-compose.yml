@@ -81,7 +81,9 @@ services:
       LOCAL_STORAGE_PATH: /data/videos
       API_PUBLIC_URL: http://localhost:8001
       JWT_SECRET: dev-change-me
-      VISION_BACKEND: yolo
+      # yolo = local (CPU here). modal = detect/track on a Modal GPU (falls back to local yolo);
+      # Modal paused 2026-10-25 (credits) — set VISION_BACKEND=modal to use it again.
+      VISION_BACKEND: ${VISION_BACKEND:-yolo}
       YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
       VISION_TARGET_FPS: "10"
@@ -96,6 +98,7 @@ services:
       - ./data/eval/football_analysis_model/best.pt:/app/yolov5x_football.pt:ro
       - ./yolov8n.pt:/app/yolov8n.pt:ro
       - ./yolov8n_futsal.pt:/app/yolov8n_futsal.pt:ro
+      - ${HOME}/.modal.toml:/root/.modal.toml:ro  # Modal CLI token (modal token new)
     depends_on:
       db:
         condition: service_healthy

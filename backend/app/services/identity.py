@@ -5,6 +5,8 @@ Same shirt number on opposite kits is allowed (Kit A #10 ≠ Kit B #10).
 
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -12,6 +14,8 @@ from sqlalchemy.orm import Session
 from app.models import Match, MatchRoster, Player, PlayerTrack, Team, TrackIdentityLink
 from app.models.entities import IdentityState
 from app.services.court_format import max_auto_players
+
+logger = logging.getLogger(__name__)
 
 COLOR_SIM_THRESHOLD = 0.72
 # Broadcast cutaways (manager/bench) fill a huge fraction of the frame.
@@ -55,6 +59,10 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
     closeups = [t for t in person_all if t not in on_court]
     person_tracks = on_court if on_court else person_all  # fall back if filter wiped everyone
     skipped_closeups = closeups if on_court else []
+    bystanders = _bystanders(person_tracks)
+    if bystanders:
+        person_tracks = [t for t in person_tracks if t.id not in bystanders]
+        skipped_closeups = skipped_closeups + [t for t in person_all if t.id in bystanders]
     other_tracks = [
         t for t in tracks if (t.features or {}).get("class", "person") != "person"
     ] + skipped_closeups
@@ -103,12 +111,13 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
                     conf = min(0.95, conf + 0.1)
                 source = "model_kit_number"
 
-        if player_id is None and roster:
-            # Prefer unused roster slot on same kit team
+        # Only a slot of the player's own kit. Kit X (keepers / refs / odd kits) has no team and
+        # takes none: the old "any unused slot" fallback let X clusters take kit slots, and the
+        # kit players they displaced spilled into the *other* kit (phone clip: team accuracy
+        # 96 % → 64 % once stitching made X chains long enough to rank early).
+        if player_id is None and roster and team_id is not None:
             for entry in roster:
-                if entry.player_id in used_roster_ids:
-                    continue
-                if team_id and entry.team_id != team_id:
+                if entry.player_id in used_roster_ids or entry.team_id != team_id:
                     continue
                 player_id = entry.player_id
                 used_roster_ids.add(entry.player_id)
@@ -116,16 +125,6 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
                 conf = 0.55 if meta["has_color"] else 0.35
                 source = "model_kit"
                 break
-            if player_id is None:
-                for entry in roster:
-                    if entry.player_id in used_roster_ids:
-                        continue
-                    player_id = entry.player_id
-                    used_roster_ids.add(entry.player_id)
-                    state = IdentityState.proposed
-                    conf = 0.4
-                    source = "model_color"
-                    break
 
         for track in cluster:
             link = TrackIdentityLink(
@@ -151,6 +150,28 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
 
     db.commit()
     return links
+
+
+# Never let the role filter remove most people: a camera / lighting the prompts
+# don't fit would otherwise empty the roster.
+ROLE_FILTER_MAX_DROP = 0.6
+
+
+def _bystanders(tracks: list[PlayerTrack]) -> set:
+    """Track ids the zero-shot role filter calls spectators / coaches (role_filter.py)."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not tracks or not getattr(settings, "vision_role_filter", True):
+        return set()
+    from app.services.role_filter import annotate_tracks
+
+    annotate_tracks(tracks, settings.vision_device)  # also the colour profile track_kits uses
+    drop = {t.id for t in tracks if ((t.features or {}).get("role_score") or 0.0) < 0}
+    if len(drop) > ROLE_FILTER_MAX_DROP * len(tracks):
+        logger.warning("Role filter would drop %d/%d tracks — not applied", len(drop), len(tracks))
+        return set()
+    return drop
 
 
 def _court_filter(db: Session, match_id: UUID):
@@ -182,7 +203,35 @@ def _camera_of(track) -> str:
 
 
 def _camera_cluster_meta(tracks: list[PlayerTrack]) -> list[dict]:
-    """Cluster one camera's person tracks into candidate players."""
+    """Cluster one camera's person tracks into candidate players.
+
+    Kits are decided per track first (team_embed.track_kits) and tracks are only
+    grouped — and fragments only merged — within one kit, so a player never mixes
+    both teams' tracks. Without team features: legacy colour-histogram clustering.
+    """
+    from app.services.team_embed import track_kits
+
+    kit_of = track_kits(tracks)
+    if kit_of:
+        groups: dict[str | None, list[PlayerTrack]] = defaultdict(list)
+        for t in tracks:
+            groups[kit_of.get(t.id) or kit_of.get(t.track_key)].append(t)
+        metas: list[dict] = []
+        for kit, group in groups.items():
+            if kit is None:
+                # No full-body crop → no kit and no role evidence. On the phone clip these were
+                # blurred spectators at the fence (127 tracks) that became two "Kit B" players.
+                continue
+            for meta in _cluster_meta(group):
+                meta["track_kit"] = kit
+                metas.append(meta)
+        metas.sort(key=lambda m: -int(m.get("duration") or 0))
+        return metas[: max_auto_players()]
+    return _cluster_meta(tracks)[: max_auto_players()]
+
+
+def _cluster_meta(tracks: list[PlayerTrack]) -> list[dict]:
+    """Colour-histogram clusters → fragment merges (ReID, then colour) → metas, longest first."""
     clusters = _cluster_tracks(tracks)
     clusters = sorted(
         clusters,
@@ -589,7 +638,14 @@ def _assign_kits(cluster_meta: list[dict]) -> bool:
     assign_kits_from_descriptors(cluster_meta)
     from app.services.team_embed import assign_kits_by_embedding
 
-    return assign_kits_by_embedding(cluster_meta)
+    decided = assign_kits_by_embedding(cluster_meta)
+    # Players grouped within a per-track kit keep it (a cluster average re-decides
+    # nothing better); detector referees stay Kit X.
+    keep = [m for m in cluster_meta if m.get("track_kit") and m.get("class_name") != "referee"]
+    for m in keep:
+        m["kit"] = m["track_kit"]
+        m["kit_method"] = "track_kits"
+    return decided or bool(keep)
 
 
 def _ensure_kit_roster(db: Session, match: Match, cluster_meta: list[dict]) -> list[MatchRoster]:
@@ -691,19 +747,46 @@ def _ensure_kit_roster(db: Session, match: Match, cluster_meta: list[dict]) -> l
     return roster
 
 
+def _stitch_chains(tracks: list[PlayerTrack]) -> list[list[PlayerTrack]]:
+    """Offline tracklet stitching (track_stitch.py): one chain per player stretch.
+
+    SoccerTrack MOT, ReID on: IDF1 0.461 → 0.579 and 0.490 → 0.569, ID switches
+    164 → 126 and 156 → 95. Chains never overlap in time; callers pass one kit only.
+    """
+    import os
+
+    from app.services.track_stitch import stitch
+
+    if os.environ.get("IDENTITY_STITCH", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return [[t] for t in tracks]
+    series = {}
+    for t in tracks:
+        pts = [(int(p["ts_ms"]), [p["x1"], p["y1"], p["x2"], p["y2"]])
+               for p in (t.features or {}).get("bbox_series") or [] if "x1" in p and not p.get("interpolated")]
+        if pts:
+            series[t.id] = sorted(pts, key=lambda o: o[0])
+    head = stitch(series, emb={t.id: (t.features or {}).get("reid_emb") for t in tracks}) if series else {}
+    chains: dict = defaultdict(list)
+    for t in tracks:
+        chains[head.get(t.id, t.id)].append(t)
+    return list(chains.values())
+
+
 def _cluster_tracks(tracks: list[PlayerTrack]) -> list[list[PlayerTrack]]:
+    """Stitched chains → colour-histogram clusters of chains that never overlap in time."""
     if not tracks:
         return []
 
-    ordered = sorted(tracks, key=lambda t: t.end_ms - t.start_ms, reverse=True)
+    units = sorted(_stitch_chains(tracks), key=lambda u: sum(t.end_ms - t.start_ms for t in u), reverse=True)
     clusters: list[list[PlayerTrack]] = []
     centroids: list[list[float] | None] = []
 
-    for track in ordered:
-        hist = (track.features or {}).get("color_hist")
+    for unit in units:
+        hists = [(t.features or {}).get("color_hist") for t in unit if (t.features or {}).get("color_hist")]
+        hist = _mean_hist(hists) if hists else None
         placed = False
         for i, cluster in enumerate(clusters):
-            if _overlaps_any(track, cluster):
+            if any(_overlaps_any(track, cluster) for track in unit):
                 continue
             cent = centroids[i]
             if hist and cent:
@@ -711,17 +794,17 @@ def _cluster_tracks(tracks: list[PlayerTrack]) -> list[list[PlayerTrack]]:
                 if abs(_kit_lightness(hist) - _kit_lightness(cent)) > 0.32:
                     continue
                 if _cosine(hist, cent) >= COLOR_SIM_THRESHOLD:
-                    cluster.append(track)
+                    cluster.extend(unit)
                     centroids[i] = _mean_hist([cent, hist])
                     placed = True
                     break
             elif hist is None and cent is None:
-                if _temporal_gap_ok(track, cluster):
-                    cluster.append(track)
+                if _temporal_gap_ok(unit[0], cluster):
+                    cluster.extend(unit)
                     placed = True
                     break
         if not placed:
-            clusters.append([track])
+            clusters.append(list(unit))
             centroids.append(list(hist) if hist else None)
 
     return clusters

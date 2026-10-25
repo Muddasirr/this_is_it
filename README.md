@@ -1,6 +1,6 @@
 # CourtLens — facility-first futsal analytics
 
-Cloud post-match analytics for futsal facilities. Docs: `PRD.md` (requirements), `ARCHITECTURE.md` (pipeline + stat definitions), `EVAL.md` (phase gates), `PILOT.md` (pilot plan).
+Cloud post-match analytics for futsal facilities. Docs: `PRD.md` (requirements), `ARCHITECTURE.md` (pipeline + stat definitions), `EVAL.md` (phase gates), `PILOT.md` (pilot plan), **`ROADMAP.md` (steps and accuracy gates to production)**.
 
 ## Phases in this repo
 
@@ -27,7 +27,7 @@ docker compose up --build
 - App: http://localhost:5173  
 - API: http://localhost:8000/docs  
 
-Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov8m.pt` (default; finds 4–80× more futsal players than the football fine-tune — see `EVAL.md`), `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`, `VISION_TARGET_FPS=10`, `VISION_TEAM_EMBED=1` (torso colour + SigLIP team split), `VISION_IMGSZ=0` (auto input size), `PIPELINE_PROXIES`, `PIPELINE_MAX_CLIPS`, `MIN_VIDEO_DURATION_S`. Court calibration (Setup → Court calibration) turns distance/speed into metres and km/h.
+Env knobs: `VISION_BACKEND=yolo|stub`, `YOLO_MODEL=yolov8m.pt` (default; finds 4–80× more futsal players than the football fine-tune — see `EVAL.md`), `VISION_DEVICE=cpu`, `VISION_FRAME_STRIDE=5`, `ALLOW_SINGLE_CAMERA=true`, `VISION_TARGET_FPS=10`, `VISION_TEAM_EMBED=1` (torso colour + SigLIP team split), `VISION_ROLE_FILTER=1` (zero-shot SigLIP: drop spectators/coaches, kit colour profile), `VISION_IMGSZ=0` (auto input size), `PIPELINE_PROXIES`, `PIPELINE_MAX_CLIPS`, `MIN_VIDEO_DURATION_S`. Court calibration (Setup → Court calibration) turns distance/speed into metres and km/h.
 
 ## GPU runs (Kaggle)
 

@@ -18,6 +18,7 @@ from app.models import (
     Match,
     MatchEvent,
     ModelVersion,
+    Player,
     PlayerTrack,
     ProcessingJob,
     ProcessingRun,
@@ -122,14 +123,19 @@ def _clear_auto_analysis(db: Session, match_id: UUID) -> None:
     db.commit()
 
 
-def drop_self_passes(candidates: list, player_of: dict) -> list:
-    """Remove passes whose passer and receiver resolve to the same player."""
+def drop_self_passes(candidates: list, player_of: dict, team_of: dict | None = None) -> list:
+    """Remove passes whose passer and receiver resolve to the same player (a track split), or to
+    players of different teams (the ball changed sides: a turnover / interception, not a pass)."""
+    team_of = team_of or {}
     out = []
     for c in candidates:
         ev = c.evidence or {}
         if c.event_type == "pass":
             a, b = player_of.get(ev.get("passer")), player_of.get(ev.get("receiver"))
             if a is not None and a == b:
+                continue
+            ta, tb = team_of.get(a), team_of.get(b)
+            if ta is not None and tb is not None and ta != tb:
                 continue
         out.append(c)
     return out
@@ -403,8 +409,11 @@ def process_job(db: Session, job_id: UUID) -> None:
                 for link in links
                 if link.track_id in key_by_track_id
             }
-            # A "pass" between two fragments of the same resolved player is a track split, not a pass
-            candidates = drop_self_passes(candidates, player_by_track)
+            # A "pass" between two fragments of the same resolved player is a track split, and one
+            # to the other team is a turnover — neither is a completed pass
+            linked = {p for p in player_by_track.values() if p is not None}
+            team_by_player = {p.id: p.team_id for p in db.query(Player).filter(Player.id.in_(linked)).all()} if linked else {}
+            candidates = drop_self_passes(candidates, player_by_track, team_by_player)
             groups = group_event_candidates(
                 candidates,
                 bucket_ms=1500,

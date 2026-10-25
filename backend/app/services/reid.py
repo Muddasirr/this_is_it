@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 _ENCODER = None
 _ENCODER_DEVICE = "cpu"
+# Set after a failed load (missing weights / gdown / offline): retrying on every
+# frame cost seconds each time and dropped a CPU worker to 0.2 fps.
+_ENCODER_FAILED: str | None = None
 
 # Cosine sim to treat two tracklets as the same person
 REID_MERGE_SIM = 0.72
@@ -28,10 +31,22 @@ def reid_enabled() -> bool:
 
 
 def _load_encoder(device: str = "cpu"):
-    global _ENCODER, _ENCODER_DEVICE
+    global _ENCODER, _ENCODER_DEVICE, _ENCODER_FAILED
     if _ENCODER is not None and _ENCODER_DEVICE == device:
         return _ENCODER
-    import torch
+    if _ENCODER_FAILED is not None:
+        raise RuntimeError(f"ReID encoder unavailable: {_ENCODER_FAILED}")
+    try:
+        return _build_encoder(device)
+    except Exception as exc:
+        _ENCODER_FAILED = str(exc)
+        logger.warning("ReID encoder failed to load (%s) — continuing without ReID for this process", exc)
+        raise
+
+
+def _build_encoder(device: str):
+    global _ENCODER, _ENCODER_DEVICE
+    import torch  # noqa: F401
     from torchreid import models
 
     name = "osnet_x0_25"

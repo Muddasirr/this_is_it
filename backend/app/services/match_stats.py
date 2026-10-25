@@ -6,13 +6,15 @@ pitch meters). Always treat as estimated unless staff-confirmed events say other
 
 from __future__ import annotations
 
-from collections import defaultdict
+import hashlib
+import threading
+from collections import OrderedDict, defaultdict
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.models import EventParticipant, MatchEvent, Player, PlayerTrack, TrackIdentityLink
+from app.models import EventParticipant, Match, MatchEvent, Player, PlayerTrack, TrackIdentityLink
 from app.models.entities import ConfirmationState, EventType
 from app.services.court_calib import mapper, track_motion
 from app.services.possession import TrackIndex
@@ -21,6 +23,59 @@ HEAT_W = 32
 HEAT_H = 18
 POSSESSION_RADIUS_FRAC = 0.18
 PERSON_TIME_WINDOW_MS = 2500
+
+
+# Rebuilding stats walks every track sample (~30 s for a 10-min highlight); the UI
+# and share page ask for them on every load. Cache per match, keyed by a hash of
+# everything the result depends on, so any review / rename / calibration / reprocess
+# invalidates it.
+STATS_CACHE_SIZE = 64
+_stats_cache: OrderedDict[UUID, tuple[str, dict[str, Any]]] = OrderedDict()
+_stats_lock = threading.Lock()
+
+
+def stats_fingerprint(db: Session, match_id: UUID) -> str:
+    from app.models.entities import CameraSource
+
+    h = hashlib.sha1()
+    match = db.get(Match, match_id)
+    h.update(repr((match.updated_at, match.status) if match else None).encode())
+    rows = [
+        db.query(MatchEvent.id, MatchEvent.event_type, MatchEvent.canonical_ts_ms, MatchEvent.confirmation,
+                 MatchEvent.is_canonical).filter(MatchEvent.match_id == match_id).order_by(MatchEvent.id).all(),
+        db.query(EventParticipant.event_id, EventParticipant.role, EventParticipant.track_id, EventParticipant.player_id)
+        .join(MatchEvent, MatchEvent.id == EventParticipant.event_id)
+        .filter(MatchEvent.match_id == match_id).order_by(EventParticipant.id).all(),
+        db.query(PlayerTrack.id).filter(PlayerTrack.match_id == match_id).order_by(PlayerTrack.id).all(),
+        db.query(TrackIdentityLink.track_id, TrackIdentityLink.player_id, TrackIdentityLink.state)
+        .join(PlayerTrack, PlayerTrack.id == TrackIdentityLink.track_id)
+        .filter(PlayerTrack.match_id == match_id).order_by(TrackIdentityLink.id).all(),
+        db.query(CameraSource.label, CameraSource.calibration).filter(CameraSource.match_id == match_id)
+        .order_by(CameraSource.label).all(),
+    ]
+    if match is not None:
+        rows.append(db.query(Player.id, Player.display_name, Player.team_id, Player.default_shirt_number,
+                             Player.avatar_key).filter(Player.facility_id == match.facility_id)
+                    .order_by(Player.id).all())
+    for group in rows:
+        h.update(repr([tuple(r) for r in group]).encode())
+    return h.hexdigest()
+
+
+def build_match_stats_cached(db: Session, match_id: UUID) -> dict[str, Any]:
+    key = stats_fingerprint(db, match_id)
+    with _stats_lock:
+        hit = _stats_cache.get(match_id)
+        if hit and hit[0] == key:
+            _stats_cache.move_to_end(match_id)
+            return hit[1]
+    built = build_match_stats(db, match_id)
+    with _stats_lock:
+        _stats_cache[match_id] = (key, built)
+        _stats_cache.move_to_end(match_id)
+        while len(_stats_cache) > STATS_CACHE_SIZE:
+            _stats_cache.popitem(last=False)
+    return built
 
 
 def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:

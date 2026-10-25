@@ -12,6 +12,7 @@ python-multipart==0.0.20
 boto3==1.35.76
 redis==5.2.1
 httpx==0.28.1
+modal==1.6.2  # GPU detect/track (VISION_BACKEND=modal)
 email-validator==2.2.0
 
 # Vision deps (torch/torchvision installed separately from CPU wheels; ultralytics --no-deps)
@@ -30,11 +31,14 @@ ultralytics-platform>=0.1.45
 lap>=0.5.12
 pytesseract>=0.3.10
 torchreid>=0.2.5
+gdown>=5.1  # torchreid downloads OSNet weights with it
 # Keep protobuf <6 so google-cloud / grpcio-status stay compatible.
-# tensorboard 2.21 wants protobuf>=6.31; that conflict is pre-existing and
-# tensorboard is not a CourtLens runtime dep.
 protobuf>=5.26.1,<6
+# torchreid imports its training engine (→ tensorboard) on `import torchreid`;
+# without it OSNet ReID silently fails. 2.19+ needs protobuf 6, so stay below.
+tensorboard>=2.16,<2.19
 # Team split (SigLIP → UMAP → KMeans); imported lazily, colour fallback without them
 transformers>=4.44
+timm==1.0.30  # vendored PARSeq jersey-number reader (app/vendor/parseq)
 umap-learn>=0.5.6
 sentencepiece>=0.2  # TrOCR tokenizer (jersey numbers)

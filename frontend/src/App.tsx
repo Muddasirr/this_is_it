@@ -760,7 +760,7 @@ function AddEventForm({
   onAdd: (body: { event_type: string; canonical_ts_ms: number; player_id?: string }) => Promise<void>;
   onExport: () => Promise<void>;
 }) {
-  const [type, setType] = useState("pass");
+  const [type, setType] = useState("goal");
   const [clock, setClock] = useState("");
   const [playerId, setPlayerId] = useState("");
   const ts = parseClock(clock);
@@ -775,7 +775,7 @@ function AddEventForm({
       }}
     >
       <select value={type} onChange={(e) => setType(e.target.value)}>
-        {["pass", "shot", "goal", "assist", "dribble"].map((t) => (
+        {["goal", "shot", "pass", "assist", "dribble"].map((t) => (
           <option key={t} value={t}>
             {t}
           </option>
@@ -791,12 +791,55 @@ function AddEventForm({
         ))}
       </select>
       <button className="primary" type="submit" disabled={ts === null}>
-        Add missed event
+        {type === "goal" ? "Add goal" : "Add missed event"}
       </button>
       <button type="button" onClick={onExport} title="Confirmed events as JSON ground truth">
         Export ground truth
       </button>
     </form>
+  );
+}
+
+function TeamStatsPanel({
+  teams,
+  names,
+}: {
+  teams: NonNullable<MatchStats["by_team"]>;
+  names: Record<string, string>;
+}) {
+  if (!teams.length) return null;
+  return (
+    <section className="panel">
+      <h2>Team stats</h2>
+      <table className="bc-table">
+        <thead>
+          <tr>
+            <th>Team</th>
+            <th className="num" title="Share of ball-control time (estimated)">Possession</th>
+            <th className="num">Goals</th>
+            <th className="num" title="Estimated">Shots</th>
+            <th className="num" title="Estimated">Passes</th>
+            <th className="num" title="Estimated">Dribbles</th>
+            <th className="num">Assists</th>
+            <th className="num">Players</th>
+          </tr>
+        </thead>
+        <tbody>
+          {teams.map((t, i) => (
+            <tr key={t.team_id ?? i}>
+              <td>{(t.team_id && names[t.team_id]) || (t.team_id ? `Team ${i + 1}` : "Unassigned")}</td>
+              <td className="num">{(t.possession_pct ?? 0).toFixed(0)}%</td>
+              <td className="num">{t.goal}</td>
+              <td className="num">{t.shot}</td>
+              <td className="num">{t.pass}</td>
+              <td className="num">{t.dribble}</td>
+              <td className="num">{t.assist}</td>
+              <td className="num">{t.players}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
   );
 }
 
@@ -882,6 +925,7 @@ function MatchPage() {
   const [stats, setStats] = useState<MatchStats | null>(null);
   const [syncs, setSyncs] = useState<CameraSync[]>([]);
   const [runStats, setRunStats] = useState<RunStats | null>(null);
+  const [teamNames, setTeamNames] = useState<Record<string, string>>({});
   const [offsetDraft, setOffsetDraft] = useState<Partial<Record<CameraLabel, number>>>({});
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -916,6 +960,10 @@ function MatchPage() {
     setEvents(ev);
     setStats(st);
     setRunStats(rs);
+    api
+      .listTeams(facilityId)
+      .then((ts) => setTeamNames(Object.fromEntries(ts.map((t) => [t.id, t.name]))))
+      .catch(() => undefined);
   }
 
   useEffect(() => {
@@ -1021,22 +1069,26 @@ function MatchPage() {
           </div>
           <div className="bc-stat is-shot">
             <div className="bc-stat-value">{shots}</div>
-            <div className="bc-stat-label">Shots</div>
+            <div className="bc-stat-label">Shots <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat is-pass">
             <div className="bc-stat-value">{passes}</div>
-            <div className="bc-stat-label">Passes</div>
+            <div className="bc-stat-label">Passes <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{assists}</div>
-            <div className="bc-stat-label">Assists</div>
+            <div className="bc-stat-label">Assists <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{dribbles}</div>
-            <div className="bc-stat-label">Dribbles</div>
+            <div className="bc-stat-label">Dribbles <em className="bc-est">est.</em></div>
           </div>
         </div>
 
+        <p className="bc-est-note">
+          Goals count only after staff confirm or add them on the timeline. Shots, passes, assists and dribbles are
+          model estimates until reviewed.
+        </p>
         <div className="bc-confidence">
           <span>Confirmed {stats?.totals.confirmed ?? 0}</span>
           <span>Estimated {stats?.totals.estimated ?? 0}</span>
@@ -1072,6 +1124,7 @@ function MatchPage() {
       {view === "center" && (
         <>
           <RunStatsPanel stats={runStats} />
+          <TeamStatsPanel teams={stats?.by_team ?? []} names={teamNames} />
           <div className="bc-layout">
             <section className="bc-board">
               <div className="bc-board-head">
@@ -1156,7 +1209,10 @@ function MatchPage() {
                   </table>
                               <p className="bc-table-note">
                     POS% possession · Min on camera · A assist · D dribble · Rec = passes received.
-                    Move is relative camera distance (not metres). Tap a player for their pitch map.
+                    {leaderboard.some((r) => r.distance_m != null)
+                      ? " Move is metres run on the calibrated court (hover for km/h)."
+                      : " Move is relative camera distance, not metres — calibrate the court (Setup) for metres and km/h."}{" "}
+                    Tap a player for their pitch map.
                   </p>
                 </>
               ) : (
@@ -1714,19 +1770,19 @@ function PublicReportPage() {
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{data.totals.shot ?? 0}</div>
-            <div className="bc-stat-label">Shots</div>
+            <div className="bc-stat-label">Shots <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{data.totals.pass ?? 0}</div>
-            <div className="bc-stat-label">Passes</div>
+            <div className="bc-stat-label">Passes <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{data.totals.assist ?? 0}</div>
-            <div className="bc-stat-label">Assists</div>
+            <div className="bc-stat-label">Assists <em className="bc-est">est.</em></div>
           </div>
           <div className="bc-stat">
             <div className="bc-stat-value">{data.totals.dribble ?? 0}</div>
-            <div className="bc-stat-label">Dribbles</div>
+            <div className="bc-stat-label">Dribbles <em className="bc-est">est.</em></div>
           </div>
         </div>
         <div className="bc-confidence">

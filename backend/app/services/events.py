@@ -637,3 +637,52 @@ def _dedupe(candidates: list[EventCandidate]) -> list[EventCandidate]:
         seen.add(key)
         out.append(c)
     return out
+
+
+# How far around a spotted event to look for the player in possession
+SPOT_HOLDER_BEFORE_MS = 1500
+SPOT_RECEIVER_AFTER_MS = 4000
+
+
+def events_from_spotting(
+    spotted: list[dict[str, Any]], detections: list[Detection], camera_label: str
+) -> list[EventCandidate]:
+    """Events from the learned spotter (action_spotting.py: *what* + *when*) + the possession
+    timeline (*who*). Pass: passer = holder at / just before the spot, receiver = next different
+    holder within SPOT_RECEIVER_AFTER_MS. Dribble / shot / goal: holder at / just before.
+    Events whose actor cannot be placed stay unattributed (track_keys = []), never guessed."""
+    poss = build_possession_timeline(detections)
+    segs = sorted(((str(s["holder"]), int(s["start_ms"]), int(s["end_ms"])) for s in poss.get("segments") or []),
+                  key=lambda s: s[1])
+
+    def holder_at(ts: int) -> tuple[str | None, int]:
+        best, idx = None, -1
+        for i, (h, start, end) in enumerate(segs):
+            if start > ts:
+                break
+            if end >= ts - SPOT_HOLDER_BEFORE_MS:
+                best, idx = h, i
+        return best, idx
+
+    from app.services.action_spotting import THRESHOLDS
+
+    out: list[EventCandidate] = []
+    for e in sorted(spotted, key=lambda e: e["ts_ms"]):
+        ts, kind = int(e["ts_ms"]), e["event_type"]
+        if float(e["confidence"]) < THRESHOLDS.get(kind, 0.3):
+            continue
+        actor, idx = holder_at(ts)
+        keys = [actor] if actor else []
+        evidence: dict[str, Any] = {"method": "tdeed_soccertrack", "label": e.get("label"), "spot_confidence": e["confidence"]}
+        if kind == "pass" and actor is not None:
+            receiver = next((h for h, start, _ in segs[idx + 1 :]
+                             if h != actor and start <= ts + SPOT_RECEIVER_AFTER_MS), None)
+            if receiver:
+                keys = [actor, receiver]
+                evidence.update(passer=actor, receiver=receiver)
+        out.append(EventCandidate(event_type=kind, camera_label=camera_label, camera_ts_ms=ts,
+                                  confidence=float(e["confidence"]), track_keys=keys, evidence=evidence))
+    passes = [c for c in out if c.event_type == "pass" and len(c.track_keys) == 2]
+    goals = [c for c in out if c.event_type == "goal"]
+    out.extend(_assists_from_goals(goals, passes, camera_label))
+    return out

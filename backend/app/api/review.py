@@ -389,10 +389,10 @@ def match_stats(
     db: Session = Depends(get_db),
     _: FacilityUser = Depends(require_facility_member),
 ) -> StatsOut:
-    from app.services.match_stats import build_match_stats
+    from app.services.match_stats import build_match_stats_cached
 
     match = _match(db, facility_id, match_id)
-    built = build_match_stats(db, match_id)
+    built = build_match_stats_cached(db, match_id)
     return StatsOut(
         match_id=match.id,
         status=match.status.value,

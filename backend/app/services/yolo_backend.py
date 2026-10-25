@@ -33,6 +33,9 @@ class YoloTrackBackend(VisionBackend):
         settings = get_settings()
         self.model_name = resolve_yolo_weights(settings.yolo_model)
         self.device = settings.vision_device
+        # FP16 measured on Modal L4 (SoccerTrack MOT): +8–18 % fps but stitched IDF1
+        # 0.579 → 0.562 / 0.569 → 0.551 and more ID switches — accuracy wins, stay FP32.
+        self.half = False
         self.frame_stride = max(1, settings.vision_frame_stride)
         self.target_fps = float(getattr(settings, "vision_target_fps", 0) or 0)
         self.team_embed_on = bool(getattr(settings, "vision_team_embed", True))
@@ -46,14 +49,21 @@ class YoloTrackBackend(VisionBackend):
         self._model = None
         self._coco_ball_model = None
         self._ball_model = None
+        self.ball_model_path = (getattr(settings, "vision_ball_model", "") or "").strip()
+        self._ball_class_ids: list[int] = []
+        # camera → learned spotter output (action_spotting.py); empty = heuristic events
+        self.spotted: dict[str, list[dict[str, Any]]] = {}
         # Benchmarks set a list here to receive every processed frame's person boxes
         # (frame_idx, track_id, x1, y1, x2, y2, conf) — bbox_series is downsampled.
         self.frame_log: list[tuple] | None = None
         self._class_map: dict[int, str] | None = None
         self.last_run_stats: dict[str, Any] = {}
 
-    def _tracker_cfg(self) -> str:
+    def _tracker_cfg(self, static_camera: bool = False) -> str:
         name = self.tracker_name if self.tracker_name in {"botsort", "bytetrack"} else "botsort"
+        gmc = (getattr(get_settings(), "vision_gmc", "auto") or "auto").strip().lower()
+        if name == "botsort" and (gmc == "off" or (gmc == "auto" and static_camera)):
+            name = "botsort_static"
         path = _CFG_DIR / f"{name}.yaml"
         if path.is_file():
             return str(path)
@@ -82,8 +92,16 @@ class YoloTrackBackend(VisionBackend):
         if self._ball_model is None:
             from ultralytics import YOLO
 
-            self._load()  # resolves self.model_name to a weights path
-            self._ball_model = YOLO(self.model_name)
+            if self.ball_model_path:
+                weights = resolve_yolo_weights(self.ball_model_path)
+                logger.info("Loading dedicated ball model %s on %s", weights, self.device)
+                self._ball_model = YOLO(weights)
+                self._ball_class_ids = [
+                    cid for cid, name in _build_class_map(self._ball_model).items() if name == "sports_ball"
+                ]
+            else:
+                self._load()  # resolves self.model_name to a weights path
+                self._ball_model = YOLO(self.model_name)
         return self._ball_model
 
     def _load_coco_ball(self):
@@ -111,6 +129,7 @@ class YoloTrackBackend(VisionBackend):
         is_coco = PERSON in class_map and SPORTS_BALL in class_map and class_map.get(PERSON) == "person"
         # Futsal fine-tunes often can't see the ball — keep a COCO sports_ball retry.
         need_coco_ball = not is_coco
+        dedicated_ball = bool(self.ball_model_path)
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
@@ -153,26 +172,33 @@ class YoloTrackBackend(VisionBackend):
         ocr_per_frame = 6 if fast_reader else 1
         ocr_per_track = 8 if fast_reader else 2
         ball_every = 1
-        tracker_cfg = self._tracker_cfg()
+        static_camera = camera_is_static(video_path)
+        tracker_cfg = self._tracker_cfg(static_camera)
         # Per-job dir when configured: a shared temp dir lets later videos on the
         # same machine overwrite earlier crops that kit assignment still reads.
         thumb_root = Path(get_settings().vision_thumb_dir or Path(tempfile.gettempdir()) / "courtlens_thumbs")
         thumb_dir = thumb_root / camera_label
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
+        # Seconds per stage (decode / tracker / ball pass / ReID / crop models) → last_run_stats
+        timing: dict[str, float] = defaultdict(float)
         try:
             while True:
+                t_read = time.perf_counter()
                 if frame_idx % self.frame_stride != 0:
                     if not cap.grab():
                         break
                     frame_idx += 1
+                    timing["decode"] += time.perf_counter() - t_read
                     continue
                 ok, frame = cap.read()
+                timing["decode"] += time.perf_counter() - t_read
                 if not ok:
                     break
                 if self.max_frames and frames_processed >= self.max_frames:
                     break
 
+                t_track = time.perf_counter()
                 results = model.track(
                     frame,
                     persist=True,
@@ -181,8 +207,10 @@ class YoloTrackBackend(VisionBackend):
                     device=self.device,
                     classes=track_classes,
                     tracker=tracker_cfg,
+                    half=self.half,
                     verbose=False,
                 )
+                timing["track"] += time.perf_counter() - t_track
                 frames_processed += 1
                 ts_ms = int((frame_idx / fps) * 1000)
                 result = results[0]
@@ -205,6 +233,8 @@ class YoloTrackBackend(VisionBackend):
 
                         mapped = class_map.get(cls_id)
                         if mapped == "sports_ball":
+                            if dedicated_ball:
+                                continue  # the dedicated ball pass below replaces these
                             # Balls often lack tracker IDs — still keep the observation.
                             ball_hits += 1
                             ball_seen_this_frame = True
@@ -283,37 +313,49 @@ class YoloTrackBackend(VisionBackend):
                         try:
                             from app.services.reid import embed_frame_boxes, ema_update
 
+                            t_reid = time.perf_counter()
                             embs = embed_frame_boxes(frame, reid_boxes, device=self.device)
+                            timing["reid"] += time.perf_counter() - t_reid
                             for tid, emb in zip(reid_tids, embs):
                                 if emb is None:
                                     continue
                                 reid_embs[tid] = ema_update(reid_embs.get(tid), emb)
                         except Exception as e:
-                            logger.warning("ReID embed failed: %s", e)
+                            logger.warning("ReID embed failed: %s — ReID off for the rest of this video", e)
+                            self.reid_on = False
 
                 # Futsal balls are tiny on wide CCTV — sparse second pass (not every frame)
-                # Hi-res ball pass also when a ball was seen: the primary may only see a
-                # spare ball by the touchline (every 2nd frame to bound cost).
-                if (not ball_seen_this_frame or frames_processed % 2 == 0) and frames_processed % ball_every == 0:
-                    ball_imgsz = max(imgsz, 960)
+                # Ball pass: always when no ball was seen; on frames too wide for the input
+                # (tiled, native resolution) also every 2nd frame — the primary may only
+                # see a spare ball there. On frames that fit, a second pass at the same
+                # resolution adds nothing but a lower threshold, so skip it (CPU cost).
+                ball_imgsz = max(imgsz, 960)
+                tiled = len(ball_tiles(frame.shape[1], frame.shape[0], ball_imgsz)) > 1
+                if (not ball_seen_this_frame or (tiled and frames_processed % 2 == 0)) and frames_processed % ball_every == 0:
                     ball_conf = min(self.conf, 0.12)
                     ball_cls_ids = [cid for cid, name in class_map.items() if name == "sports_ball"]
                     ball_model = self._load_ball_model()
-                    if need_coco_ball:
+                    if dedicated_ball:
+                        ball_cls_ids = self._ball_class_ids
+                    elif need_coco_ball:
                         ball_model = self._load_coco_ball()
                         ball_cls_ids = [SPORTS_BALL]
                     if ball_cls_ids:
                         # Frames wider than the detector input are shrunk and a ~10 px ball vanishes:
                         # tile at native resolution instead (SAHI-style), offsets mapped back.
                         tiles = ball_tiles(frame.shape[1], frame.shape[0], ball_imgsz)
+                        t_ball = time.perf_counter()
+                        timing["ball_passes"] += 1
                         ball_results = ball_model.predict(
                             [frame[y0:y1, x0:x1] for x0, y0, x1, y1 in tiles] if len(tiles) > 1 else frame,
                             conf=ball_conf,
                             imgsz=ball_imgsz,
                             device=self.device,
                             classes=ball_cls_ids,
+                            half=self.half,
                             verbose=False,
                         )
+                        timing["ball"] += time.perf_counter() - t_ball
                         found = []
                         for (x0, y0, _x1, _y1), res in zip(tiles, ball_results):
                             bb = res.boxes
@@ -352,7 +394,10 @@ class YoloTrackBackend(VisionBackend):
             person_tracks[100000] = [
                 _obs(c[0], c[5], list(c[1:5]), dims[c[0]][0], dims[c[0]][1], "sports_ball") for c in chosen_ball
             ]
+        t_crops = time.perf_counter()
         team_embs = _embed_team_crops(team_crops, self.device) if self.team_embed_on else {}
+        crop_sem = _crop_semantics(best_thumbs, person_tracks, self.device)
+        timing["crop_models"] += time.perf_counter() - t_crops
         detections: list[Detection] = []
         for tid, obs in person_tracks.items():
             if not obs:
@@ -392,6 +437,8 @@ class YoloTrackBackend(VisionBackend):
                 feats["thumb_score"] = float(best_thumbs[tid][0])
             if class_name == "person" and tid in team_embs:
                 feats.update(team_embs[tid])
+            if class_name == "person" and tid in crop_sem:
+                feats.update(crop_sem[tid])  # role_score + colour_profile (identity: bystanders, kits)
             if class_name == "person" and tid in reid_embs and reid_embs[tid] is not None:
                 feats["reid_emb"] = np.asarray(reid_embs[tid], dtype=float).tolist()
             if class_name == "person" and jersey_hsv_sums.get(tid):
@@ -442,6 +489,9 @@ class YoloTrackBackend(VisionBackend):
             "frame_stride": self.frame_stride,
             "elapsed_sec": round(elapsed, 3),
             "processing_fps": round(frames_processed / elapsed, 3) if elapsed else 0,
+            "static_camera": static_camera,
+            "tracker_cfg_name": Path(tracker_cfg).stem,
+            "stage_seconds": {k: round(v, 1) for k, v in timing.items()},
             "realtime_factor": round(video_seconds / elapsed, 3) if elapsed and video_seconds else None,
             "person_tracks": len(person_dets),
             "referee_tracks": sum(1 for d in detections if d.class_name == "referee"),
@@ -483,12 +533,28 @@ class YoloTrackBackend(VisionBackend):
             finally:
                 self._coco_fallback_attempted = False
 
+        from app.services import action_spotting
+
+        if action_spotting.available():
+            t_spot = time.perf_counter()
+            self.spotted[camera_label] = action_spotting.spot(video_path, detections, _cuda(self.device))
+            self.last_run_stats["spotted_events"] = len(self.spotted[camera_label])
+            self.last_run_stats["spotted"] = self.spotted[camera_label]  # raw (≥0.05) → summary.json for tuning
+            self.last_run_stats.setdefault("stage_seconds", {})["spotting"] = round(time.perf_counter() - t_spot, 1)
         return detections
 
     def infer_events(self, detections: list[Detection], camera_label: str) -> list[EventCandidate]:
-        from app.services.events import infer_event_candidates
+        from app.services.events import events_from_spotting, infer_event_candidates
 
+        if self.spotted.get(camera_label):
+            return events_from_spotting(self.spotted[camera_label], detections, camera_label)
         return infer_event_candidates(detections, camera_label)
+
+
+def _cuda(device: str) -> str:
+    from app.services.reid import torch_device
+
+    return torch_device(device)
 
 
 def _build_class_map(model) -> dict[int, str]:
@@ -594,6 +660,56 @@ def _embed_team_crops(crops: dict[int, list[Any]], device: str) -> dict[int, dic
             m = embs[rows].mean(axis=0)
             out.setdefault(tid, {})["team_emb"] = np.round(m / (np.linalg.norm(m) + 1e-12), 4).tolist()
     return out
+
+
+def _crop_semantics(best_thumbs: dict, person_tracks: dict, device: str) -> dict[int, dict]:
+    """Zero-shot role score + kit colour profile per person track from its best thumbnail (role_filter.py)."""
+    import cv2
+
+    from app.core.config import get_settings
+
+    if not getattr(get_settings(), "vision_role_filter", True):
+        return {}
+    tids = [tid for tid in best_thumbs if person_tracks.get(tid) and person_tracks[tid][0].get("class_name", "person") == "person"]
+    imgs = [cv2.imread(str(best_thumbs[tid][1])) for tid in tids]
+    from app.services.role_filter import crop_semantics
+
+    return {tid: sem for tid, sem in zip(tids, crop_semantics(imgs, device)) if sem}
+
+
+STATIC_SAMPLES = 30
+STATIC_MAX_SHIFT = 1.0  # px at 320 px width (90th percentile frame-to-frame shift)
+
+
+def camera_is_static(video_path: str) -> bool:
+    """True when the view does not pan / zoom: phase-correlation shift between frame pairs
+    sampled across the video stays under STATIC_MAX_SHIFT (players moving barely shift it)."""
+    import cv2
+    import numpy as np
+
+    cap = cv2.VideoCapture(str(video_path))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if n < 10:
+        cap.release()
+        return False
+    gap = max(1, int(round(fps / 5)))  # 0.2 s apart
+    shifts = []
+    for start in np.linspace(0, max(0, n - gap - 1), STATIC_SAMPLES).astype(int):
+        pair = []
+        for f in (start, start + gap):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(f))
+            ok, frame = cap.read()
+            if not ok:
+                break
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            g = cv2.resize(g, (320, max(1, int(320 * g.shape[0] / g.shape[1]))))
+            pair.append(np.float32(g))
+        if len(pair) == 2:
+            (dx, dy), _ = cv2.phaseCorrelate(pair[0], pair[1])
+            shifts.append(float(np.hypot(dx, dy)))
+    cap.release()
+    return bool(shifts) and float(np.percentile(shifts, 90)) < STATIC_MAX_SHIFT
 
 
 def ball_tiles(width: int, height: int, tile: int, overlap: float = 0.15) -> list[tuple[int, int, int, int]]:

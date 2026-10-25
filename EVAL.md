@@ -75,6 +75,7 @@ python scripts/eval/dump_possession.py \
 | Roboflow Futsal-Object-Detection_v2 | Detection smoke | `data/eval/roboflow_futsal/` |
 | Manual GT for `test_video_2` | Event P/R | `data/eval/gt/test_video_2_events.json` — **placeholder (3 fake events); must be hand-labelled** |
 | Synthetic 3-camera set | Multi-cam sync / identity / fuse | generated in the Kaggle kernel from one clip (known offsets) |
+| Futsal goal GT (no public labelled futsal set exists) | Goal recall | `backend/data/futsal_gt/`: Portugal–Spain 4 (video ends at 2-2, then recap), Spain–Brazil 1 (overlay frozen at 2-2 until the winner), Spain–France 7 (= 5-2 final). Bangladesh–Pakistan has no overlay → count only (6). `test_video_2` is a handheld phone clip; the wall LED is a clock, not the score, so its events still need hand labels in the app |
 | **DFL labelled event clips** | **Pass precision / recall** | Kaggle `alejopaullier/dfl-clips`: ~2.5 s clips cut around the DFL competition labels — 2,849 `play` (pass), 598 `challenge`, 172 `throwin`, 1,802 `background`. `bench_events.py` → `bench_events.json` |
 
 **Honest notes.** The DFL 460-clip dataset's `train.csv` is only a file list — **no event labels**
@@ -106,6 +107,27 @@ Product default: `YOLO_MODEL=yolov8m.pt` (Kaggle v6: best player and ball recall
 ## Heatmaps
 
 Per-player grids live on `stats.by_player[].heatmap` and `possession_heatmap` (share report too). Match aggregates on `stats.heatmap.match` and `match_possession`. Always image-plane / `estimated`.
+
+## Measured results (Kaggle v11, 2026-10-23)
+
+| Feature | Ground truth | Result |
+|---|---|---|
+| Player detection | SoccerTrack v2 MOT (4096 px panorama, 2 clips) | recall 0.84 / 0.78 at auto 1920 px input (0.16 / 0.13 at the old 640) |
+| Tracking | same | IDF1 0.46 / 0.48, ~155 ID switches per 600 frames — still the weakest link |
+| Team split | same + 12 hand-labelled futsal CCTV players | 87 % / 85 % (SoccerTrack), 11/12 (CCTV) — torso colour + 0.25 × SigLIP |
+| Team split + bystander filter (2026-10-24) | 60 hand-labelled tracks each on `test_video_2` and Spain–France (`bench_labels/*_roles.json`, `bench_teams.py`) | team accuracy **96 % / 100 %** (was 64 % / 52 %); spectators/coaches counted as players 0/20 and 2/24 (was 9/20, 9/24); possession 51/49 and 49/51 (was 76/24, 70/30). Kits decided per track from a zero-shot SigLIP colour profile, bystanders dropped by a zero-shot player prompt, players grouped within a kit (`role_filter.py`, `team_embed.track_kits`) |
+| Passes | DFL labelled clips (400) | P 0.41 / R 0.66 / F1 0.50 |
+| Passes | SoccerTrack M2, first 12 min, 167 labelled passes | P 0.38 / R 0.43 / F1 0.40 (ball-limited: ~8 px ball) |
+| Shots / goals | SoccerTrack | 0 / 5 shots found — not yet reliable |
+| Goals (futsal) | 12 broadcast-scoreboard goals (`backend/data/futsal_gt/*_goals.json`, `scoreboard_goals.py` + frame check) | Kaggle v9 predictions, `bench_goals.py` (window goal −15 s … +2 s): goal recall **1/12**, goal precision 1/5, a shot or goal before **3/12** goals. Edge-of-frame goal bands do not work on panning broadcast; needs calibrated goal mouths |
+| Tracking + offline stitching (2026-10-24) | SoccerTrack MOT 117093 / 132877 (600 frames, ReID on, Modal L4) | IDF1 0.461 → **0.579** / 0.490 → **0.569**; ID switches 164 → 126 / 156 → 95 (`track_stitch.py`, `bench_mot --reid`). FP16 tried: +8–18 % fps but stitched IDF1 −0.02 → kept FP32 |
+| Identity: roster slots (2026-10-24) | labelled phone clip + Spain–France | Kit X clusters no longer take kit roster slots (they pushed kit players into the other kit): team accuracy **100 % / 100 %** with stitching (was 64 % with stitching) |
+| Jersey numbers, PARSeq (vendored, Apache-2.0) | SoccerNet GSR valid, 94 players (eval only) | 15 % of players correct, 30–48 % precision when it answers → auto numbers stay **off** |
+| GPU processing (Modal) | 30 s DFL clip through `VISION_BACKEND=modal` | 143 s round trip incl. cold start; ~7.6 processed fps on L4 → a 40-min match ≈ 50 min (gate 30 min: needs profiling) |
+| Calibration | 61 held-out SoccerTrack landmarks | 0.93 m mean error (8 points) vs 11 m (4 corners) |
+| Jersey numbers | SoccerNet GSR valid, 94 players | trained classifier 11 %, Tesseract 7 % → auto numbers **off** (staff rename) |
+| Multi-camera | synthetic 3-camera check | PASS (sync 0 ms, 15/16 players linked) |
+| Product end to end | live app, 18 steps | PASS (CPU worker: 65 s of video in ~43 min; GPU needed for full matches) |
 
 ## Multi-camera (A–D)
 

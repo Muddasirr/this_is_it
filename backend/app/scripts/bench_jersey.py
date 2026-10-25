@@ -37,6 +37,10 @@ def _reader(name: str):
         from app.services.jersey_cls import read_jersey_number_cls
 
         return read_jersey_number_cls
+    if name == "parseq":
+        from app.services.jersey_ocr import read_jersey_number_parseq
+
+        return read_jersey_number_parseq
     if name == "trocr":
         from app.services.jersey_ocr import read_jersey_number_trocr
 

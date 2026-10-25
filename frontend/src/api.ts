@@ -137,6 +137,9 @@ export type MatchStats = {
     possession_pct?: number;
     touches?: number;
     distance?: number;
+    distance_m?: number | null;
+    avg_speed_kmh?: number | null;
+    top_speed_kmh?: number | null;
     minutes?: number;
     avg_speed?: number;
     conversion_pct?: number | null;

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import re
 from functools import lru_cache
 from typing import Any
@@ -361,5 +362,61 @@ def read_jersey_number_trocr(frame, xyxy: list[float], device: str | None = None
     probs = [float(torch.softmax(s, dim=-1).max()) for s in out.scores]
     conf = float(np.mean(probs)) if probs else 0.0
     if conf < TROCR_MIN_CONF:
+        return None
+    return {"number": int(m.group(1)), "confidence": round(conf, 3)}
+
+
+# PARSeq (vendored, Apache-2.0 — app/vendor/parseq): commercially usable scene-text
+# recogniser; replaces the CC BY-NC jersey-number pipeline we cannot ship.
+PARSEQ_WEIGHTS = os.environ.get("VISION_PARSEQ_WEIGHTS", str(Path(__file__).resolve().parents[2] / "models" / "parseq-bb5792a6.pt"))
+PARSEQ_MIN_CONF = 0.6
+_PARSEQ: tuple[Any, Any, str] | None = None
+
+
+def _parseq(device: str = "cpu"):
+    global _PARSEQ
+    if _PARSEQ is None or _PARSEQ[2] != device:
+        from app.vendor import parseq
+
+        model, tok = parseq.load(PARSEQ_WEIGHTS, device)
+        _PARSEQ = (model, tok, device)
+    return _PARSEQ
+
+
+def read_jersey_number_parseq(frame, xyxy: list[float], device: str | None = None) -> dict[str, Any] | None:
+    """{number, confidence} from the torso of a person box via PARSeq; None if illegible.
+
+    Confidence = product of the per-character probabilities; anything that is not a
+    clean 1–2 digit number at PARSEQ_MIN_CONF is dropped (a wrong number is worse than none).
+    """
+    import torch
+
+    from app.services.reid import torch_device
+    from app.vendor import parseq
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in xyxy]
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w - 1, x2), min(h - 1, y2)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 16 or bh < 36:
+        return None
+    crop = frame[y1 + int(bh * 0.12) : y1 + int(bh * 0.58), x1 + int(bw * 0.12) : x1 + int(bw * 0.88)]
+    if crop.size == 0:
+        return None
+    dev = torch_device(device if device is not None else os.environ.get("VISION_DEVICE", "cpu"))
+    try:
+        model, tok, _ = _parseq(dev)
+    except Exception as exc:  # noqa: BLE001 — weights missing / checksum mismatch
+        logger.info("PARSeq unavailable (%s)", exc)
+        return None
+    with torch.no_grad():
+        probs = model(tok, parseq.preprocess([crop]).to(dev)).softmax(-1)
+    labels, confs = tok.decode(probs)
+    text, char_p = labels[0].replace(" ", ""), confs[0]
+    m = _NUMBER_RE.fullmatch(text)
+    if not m:
+        return None
+    conf = float(char_p.prod()) if len(char_p) else 0.0
+    if conf < PARSEQ_MIN_CONF:
         return None
     return {"number": int(m.group(1)), "confidence": round(conf, 3)}

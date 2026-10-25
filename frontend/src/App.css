@@ -1129,3 +1129,16 @@ button:disabled {
   place-items: center;
   pointer-events: none;
 }
+
+.bc-est {
+  font-style: normal;
+  font-size: 0.7em;
+  opacity: 0.65;
+  text-transform: lowercase;
+}
+
+.bc-est-note {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}

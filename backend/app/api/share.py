@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models import Facility, HighlightClip, Match, MatchShare, VideoAsset
 from app.models.entities import MatchStatus
-from app.services.match_stats import build_match_stats
+from app.services.match_stats import build_match_stats_cached
 from app.services.storage import presign_download
 
 router = APIRouter()
@@ -37,7 +37,7 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
     if not match or match.status == MatchStatus.deleted:
         raise HTTPException(status_code=404, detail="Match not found")
     facility = db.get(Facility, match.facility_id)
-    stats = build_match_stats(db, match.id)
+    stats = build_match_stats_cached(db, match.id)
     # Include per-player heatmaps (image-plane, estimated) for share report
     players = []
     for row in stats["by_player"]:

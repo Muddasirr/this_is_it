@@ -79,6 +79,10 @@ def get_vision_backend() -> VisionBackend:
     settings = get_settings()
     if settings.vision_backend == "stub":
         return StubVisionBackend()
+    if settings.vision_backend == "modal":
+        from app.services.modal_backend import ModalTrackBackend
+
+        return ModalTrackBackend()
     from app.services.yolo_backend import YoloTrackBackend
 
     return YoloTrackBackend()

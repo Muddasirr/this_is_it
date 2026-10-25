@@ -76,8 +76,9 @@ Upload Camera A [(optional) Cameras B, C, D]
          · OSNet ReID embeddings (EMA per track) when VISION_REID=1
          · upper-body HSV colour_hist (fragment merge)
          · jersey number reads (trained classifier, if configured) → majority number
-         · best in-match thumb crop per track
-    → Resolve identity
+         · best in-match thumb crop per track → zero-shot SigLIP role score (player vs bystander) +
+           kit colour profile (VISION_ROLE_FILTER=1, `role_filter.py`)
+    → Resolve identity (bystanders dropped; kit per track; players grouped within a kit)
          · merge fragments by ReID cosine, then colour
          · assign Kit A / Kit B / X by torso colour + SigLIP → KMeans (colour-only fallback)
          · fuse OCR shirt numbers (unique within kit)
@@ -118,6 +119,7 @@ Upload Camera A [(optional) Cameras B, C, D]
 | `VISION_TARGET_FPS` | Processed frames per video second (stride = fps / target) | `10`; `0` = use `VISION_FRAME_STRIDE` |
 | `VISION_FRAME_STRIDE` | Process every Nth frame (when target fps is 0) | `5` |
 | `VISION_TEAM_EMBED` | SigLIP team split | `1` |
+| `VISION_ROLE_FILTER` | Zero-shot SigLIP on each track's thumb: drop spectators/coaches; colour profile drives the kit split | `1` |
 | `VISION_CONF` / `VISION_IMGSZ` | Detector threshold / input size | `0.25` / `0` = auto: frame's long side capped at `VISION_IMGSZ_MAX` (1920). SoccerTrack v2 MOT (4096 px panorama): player recall 16 % @640, 74 % @1280, 89 % @1920; IDF1 0.23 → 0.76 |
 | `COURT_FORMAT` | `5v5` \| `6v6` \| `7v7` | `5v5` |
 | `ALLOW_SINGLE_CAMERA` | 1-cam matches | `true` |
