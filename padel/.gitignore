@@ -1,0 +1,7 @@
+.venv/
+data/
+models/*
+!models/README.md
+*.pt
+web/node_modules/
+web/dist/

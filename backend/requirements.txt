@@ -40,5 +40,7 @@ tensorboard>=2.16,<2.19
 # Team split (SigLIP → UMAP → KMeans); imported lazily, colour fallback without them
 transformers>=4.44
 timm==1.0.30  # vendored PARSeq jersey-number reader (app/vendor/parseq)
+SoccerNet==0.1.62  # imported by T-DEED's eval utilities (learned event spotter, GPU runs)
+tabulate>=0.9
 umap-learn>=0.5.6
 sentencepiece>=0.2  # TrOCR tokenizer (jersey numbers)

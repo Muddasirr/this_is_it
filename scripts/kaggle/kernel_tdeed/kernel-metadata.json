@@ -1,0 +1,27 @@
+{
+  "id": "muddasirr/courtlens-tdeed-futsal",
+  "title": "courtlens-tdeed-futsal",
+  "code_file": "courtlens_gpu_eval.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "muddasirr/courtlens-code",
+    "muddasirr/courtlens-test-video-2",
+    "muddasirr/courtlens-yolov5x-football",
+    "saberghaderi/-dfl-bundesliga-460-mp4-videos-in-30sec-csv",
+    "alejopaullier/dfl-clips",
+    "muddasirr/courtlens-soccertrack-mot",
+    "muddasirr/courtlens-soccertrack-match",
+    "muddasirr/courtlens-ball-weights",
+    "muddasirr/courtlens-tdeed-weights",
+    "muddasirr/courtlens-futsal-models"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

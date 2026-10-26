@@ -250,6 +250,10 @@ export const api = {
     ),
   listVideos: (facilityId: string, matchId: string) =>
     request<VideoAsset[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/videos`),
+  getPlaybackUrl: (facilityId: string, matchId: string, assetId: string) =>
+    request<{ url: string; expires_in: number }>(
+      `/api/v1/facilities/${facilityId}/matches/${matchId}/videos/${assetId}/playback-url`,
+    ),
   getSync: (facilityId: string, matchId: string) =>
     request<CameraSync[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/sync`),
   updateSync: (facilityId: string, matchId: string, camera_label: CameraLabel, offset_ms: number, notes?: string) =>

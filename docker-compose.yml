@@ -84,6 +84,11 @@ services:
       # yolo = local (CPU here). modal = detect/track on a Modal GPU (falls back to local yolo);
       # Modal paused 2026-10-25 (credits) — set VISION_BACKEND=modal to use it again.
       VISION_BACKEND: ${VISION_BACKEND:-yolo}
+      # Learned event spotter: T-DEED fine-tuned on hand-labelled futsal (EVAL.md: pass F1 0.44 → 0.55,
+      # shots 0/7 → 3/7 on unseen footage). GPU only; on this CPU worker the heuristics run instead.
+      TDEED_REPO: /app/data/third_party/tdeed
+      TDEED_WEIGHTS: /app/models/tdeed_futsal.pt
+      TDEED_THRESHOLDS: '{"pass": 0.4, "shot": 0.15, "dribble": 0.3}'
       YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
       VISION_TARGET_FPS: "10"

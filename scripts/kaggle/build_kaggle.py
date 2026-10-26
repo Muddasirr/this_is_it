@@ -221,13 +221,16 @@ BENCH = '''
 clips_root = next((p.parent for p in Path("/kaggle/input").rglob("play-*.mp4")), None)
 if clips_root is not None:
     root = clips_root.parents[1] if clips_root.name == "clips" else clips_root
-    r = subprocess.run([sys.executable, "-m", "app.scripts.bench_events", "--clips", "/kaggle/input",
-                        "--out", str(OUT / "bench_events.json"), "--per-class", "150",
-                        "--save-dets", str(OUT / "bench_dets")],
-                       cwd=BACKEND, env=dict(env, VISION_JERSEY_OCR="0", VISION_TEAM_EMBED="0"),
-                       capture_output=True, text=True)
-    (OUT / "bench_events.log").write_text(r.stdout + "\\n" + r.stderr)
-    print(r.stdout[-3000:])
+    # A/B: COCO sports_ball (current default) vs the trained ball detector when its weights are attached
+    ball_w = next(iter(Path("/kaggle/input").rglob("ball_yolov8m.pt")), None)
+    for tag, extra in [("", {})] + ([("_ball", {"VISION_BALL_MODEL": str(ball_w)})] if ball_w else []):
+        r = subprocess.run([sys.executable, "-m", "app.scripts.bench_events", "--clips", "/kaggle/input",
+                            "--out", str(OUT / f"bench_events{tag}.json"), "--per-class", "150",
+                            "--save-dets", str(OUT / f"bench_dets{tag}")],
+                           cwd=BACKEND, env=dict(env, VISION_JERSEY_OCR="0", VISION_TEAM_EMBED="0", **extra),
+                           capture_output=True, text=True)
+        (OUT / f"bench_events{tag}.log").write_text(r.stdout + "\\n" + r.stderr)
+        print(tag or "coco", r.stdout[-1500:])
 else:
     print("dfl-clips not attached")
 '''
@@ -313,6 +316,38 @@ OUT = Path("/kaggle/working/eval"); OUT.mkdir(exist_ok=True)
 '''
 
 
+TDEED = '''
+# T-DEED learned event spotter (app/services/action_spotting.py) on the labelled futsal clip,
+# once per checkpoint; raw spotter output (≥0.05) lands in summary.json for threshold tuning.
+subprocess.call([sys.executable, "-m", "pip", "install", "-q", "SoccerNet==0.1.62", "tabulate"])
+if not Path("/kaggle/working/tdeed").exists():
+    subprocess.check_call("git clone -q https://github.com/arturxe2/T-DEED.git /kaggle/working/tdeed && "
+                          "git -C /kaggle/working/tdeed checkout -q d953b4de8a2ad941c565e1683c5b07255cbe644e", shell=True)
+video = mp4.get("test_video_2.mp4")
+for w in sorted(Path("/kaggle/input").rglob("tdeed_*.pt")):
+    index.append(run(f"test_video_2__{w.stem}", {"A": video}, TDEED_REPO="/kaggle/working/tdeed",
+                     TDEED_WEIGHTS=str(w), FFMPEG="ffmpeg"))
+    (OUT / "eval_index.json").write_text(json.dumps(index, indent=2))
+'''
+
+
+FUTSAL = '''
+# Product candidate on the labelled futsal clip: trained ball detector + futsal-fine-tuned T-DEED
+subprocess.call([sys.executable, "-m", "pip", "install", "-q", "SoccerNet==0.1.62", "tabulate"])
+if not Path("/kaggle/working/tdeed").exists():
+    subprocess.check_call("git clone -q https://github.com/arturxe2/T-DEED.git /kaggle/working/tdeed && "
+                          "git -C /kaggle/working/tdeed checkout -q d953b4de8a2ad941c565e1683c5b07255cbe644e", shell=True)
+w = next(Path("/kaggle/input").rglob("tdeed_futsal.pt"))
+ball = next(Path("/kaggle/input").rglob("ball_yolov8m.pt"))
+# A/B the ball detector under the futsal spotter (trained ball found 17 % vs COCO 48 % on this clip)
+for tag, extra in [("futsal_coco", {}), ("futsal_ball", {"VISION_BALL_MODEL": str(ball)})][: int(os.environ.get("COURTLENS_FUTSAL_VARIANTS", "1"))]:
+    index.append(run(f"test_video_2__{tag}", {"A": mp4["test_video_2.mp4"]}, TDEED_REPO="/kaggle/working/tdeed",
+                     TDEED_WEIGHTS=str(w), FFMPEG="ffmpeg",
+                     TDEED_THRESHOLDS='{"pass": 0.4, "shot": 0.15, "dribble": 0.3}', **extra))
+(OUT / "eval_index.json").write_text(json.dumps(index, indent=2))
+'''
+
+
 def build_kernel(only: str | None = None) -> Path:
     """only: None = everything; "corpus" = product runs on every futsal video + 8 DFL clips
     (for the UI, no benchmarks); "mot" = the SoccerTrack tracking benchmark alone."""
@@ -323,7 +358,13 @@ def build_kernel(only: str | None = None) -> Path:
                     .replace('"test_video_2.mp4,bangladesh_pakistan_saff_2026.mp4"', f'"{ALL_FUTSAL}"'))
     elif only == "mot":
         run_cell = MOT_ENV
-    benches = {"corpus": [], "mot": [_cell(MOT)]}.get(
+    elif only == "bench":
+        run_cell = MOT_ENV
+    elif only in ("tdeed", "futsal"):
+        # RUN defines run()/index; no futsal or DFL runs of its own
+        run_cell = RUN.replace('"test_video_2.mp4,bangladesh_pakistan_saff_2026.mp4"', '""')
+    benches = {"corpus": [], "mot": [_cell(MOT)], "bench": [_cell(BENCH)], "tdeed": [_cell(TDEED)],
+               "futsal": [_cell(FUTSAL)]}.get(
         only, [_cell(MULTICAM), _cell(BENCH), _cell(MOT), _cell(MATCH), _cell(JERSEY)])
     for old in KERNEL_DIR.glob("*.ipynb"):
         old.unlink()
@@ -351,7 +392,7 @@ def build_kernel(only: str | None = None) -> Path:
         json.dumps(
             {
                 "id": KERNEL_SLUG,
-                "title": "courtlens-gpu-eval",
+                "title": KERNEL_SLUG.split("/", 1)[1],
                 "code_file": path.name,
                 "language": "python",
                 "kernel_type": "notebook",
@@ -368,6 +409,9 @@ def build_kernel(only: str | None = None) -> Path:
                     "alejopaullier/dfl-clips",
                     f"{OWNER}/courtlens-soccertrack-mot",
                     f"{OWNER}/courtlens-soccertrack-match",
+                    f"{OWNER}/courtlens-ball-weights",
+                    f"{OWNER}/courtlens-tdeed-weights",
+                    f"{OWNER}/courtlens-futsal-models",
                 ],
                 "competition_sources": [],
                 "kernel_sources": [],
@@ -399,9 +443,12 @@ def push() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--push", action="store_true")
-    ap.add_argument("--only", choices=["corpus", "mot"], default=None,
+    ap.add_argument("--only", choices=["corpus", "mot", "bench", "tdeed", "futsal"], default=None,
                     help="corpus = product runs for the UI; mot = tracking benchmark only")
     args = ap.parse_args()
+    if args.only in ("tdeed", "futsal"):  # own kernel: never replaces a run in progress on courtlens-gpu-eval
+        global KERNEL_SLUG, KERNEL_DIR
+        KERNEL_SLUG, KERNEL_DIR = f"{OWNER}/courtlens-tdeed-futsal", HERE / "kernel_tdeed"
     print("code  →", build_code_zip())
     print("kernel→", build_kernel(args.only))
     if args.push:

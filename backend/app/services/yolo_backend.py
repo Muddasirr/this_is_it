@@ -535,7 +535,7 @@ class YoloTrackBackend(VisionBackend):
 
         from app.services import action_spotting
 
-        if action_spotting.available():
+        if action_spotting.available(self.device):
             t_spot = time.perf_counter()
             self.spotted[camera_label] = action_spotting.spot(video_path, detections, _cuda(self.device))
             self.last_run_stats["spotted_events"] = len(self.spotted[camera_label])

@@ -33,17 +33,24 @@ W, H, FPS = 796, 448, 25
 PANORAMA_ASPECT = 2.2
 LABEL_TO_EVENT = {"PASS": "pass", "HIGH PASS": "pass", "CROSS": "pass", "DRIVE": "dribble", "SHOT": "shot",
                   "GOAL": "goal"}
-# Per-class confidence from the held-out sweep (best F1 on M2 + M7)
-THRESHOLDS = {"pass": 0.2, "dribble": 0.3, "shot": 0.3, "goal": 0.3}
+# Per-class confidence from the held-out sweep (best F1 on M2 + M7); TDEED_THRESHOLDS='{"pass": 0.4}'
+# overrides per deployment (futsal fine-tune: pass 0.4 on the labelled futsal test window)
+THRESHOLDS = {"pass": 0.2, "dribble": 0.3, "shot": 0.3, "goal": 0.3,
+              **json.loads(os.environ.get("TDEED_THRESHOLDS") or "{}")}
 # T-DEED SoccerTrack fine-tune config (scripts/modal/tdeed_soccertrack.py) — inference needs only these
 CONFIG = {"clip_len": 100, "feature_arch": "rny008_gsf", "temporal_arch": "ed_sgp_mixer", "n_layers": 2,
           "sgp_ks": 9, "sgp_r": 4, "num_classes": 12, "radi_displacement": 4, "modality": "rgb", "crop_dim": None,
           "dataset": "soccernetball", "batch_size": 4, "num_workers": 0, "pretrain": None}
 
 
-def available() -> bool:
+def available(device: str | None = None) -> bool:
+    """Repo + weights present, and a GPU (CPU runs ~7x slower than real time: a 40-min match takes
+    hours — the heuristics are used there unless TDEED_ALLOW_CPU=1)."""
     repo, weights = os.environ.get("TDEED_REPO"), os.environ.get("TDEED_WEIGHTS")
-    return bool(repo and weights and Path(repo).is_dir() and Path(weights).is_file())
+    if not (repo and weights and Path(repo).is_dir() and Path(weights).is_file()):
+        return False
+    on_cpu = str(device or "").lower() in {"", "cpu"}
+    return not on_cpu or os.environ.get("TDEED_ALLOW_CPU", "").strip().lower() in {"1", "true", "yes"}
 
 
 def crop_centres(detections: list, n_frames: int, fps: float, width: int) -> np.ndarray:
@@ -128,7 +135,7 @@ def _model(device: str):
 
 def spot(video_path: str, detections: list, device: str = "cuda") -> list[dict[str, Any]]:
     """[{ts_ms, label, event_type, confidence}] for the video (camera time), or [] if unavailable."""
-    if not available():
+    if not available(device):
         return []
     repo = os.environ["TDEED_REPO"]
     cwd = os.getcwd()
@@ -152,10 +159,24 @@ def spot(video_path: str, detections: list, device: str = "cuda") -> list[dict[s
                                             stride=2, dataset="soccernetball", size=(W, H))
             out = Path("inference_output/results_inference.json")
             out.unlink(missing_ok=True)
-            # num_workers=0: the dataset is iterable — every worker would replay the whole video
-            # CPU: one 100-frame clip at a time (4 at once was OOM-killed on the worker)
-            batch = CONFIG["batch_size"] if str(device).startswith("cuda") else 1
-            inference(model, DataLoader(ds, batch_size=batch, num_workers=0), classes, threshold=0.05)
+            # num_workers=0: the dataset is iterable — every worker would replay the whole video.
+            # Batch: 4 clips only on ≥ 20 GB GPUs; the 16 GB Kaggle T4 (detector / ReID / SigLIP
+            # still resident) and the CPU worker both ran out of memory at 4 → one clip at a time.
+            import torch
+
+            batch = 1
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
+                if torch.cuda.get_device_properties(0).total_memory >= 20 * 1024**3:
+                    batch = CONFIG["batch_size"]
+            try:
+                inference(model, DataLoader(ds, batch_size=batch, num_workers=0), classes, threshold=0.05)
+            except torch.cuda.OutOfMemoryError:
+                if batch == 1:
+                    raise
+                torch.cuda.empty_cache()
+                logger.warning("Spotting OOM at batch %d — retrying one clip at a time", batch)
+                inference(model, DataLoader(ds, batch_size=1, num_workers=0), classes, threshold=0.05)
             raw = json.loads(out.read_text())["predictions"]
     except Exception as exc:  # noqa: BLE001 — never fail detection for the spotter
         logger.warning("Action spotting failed (%s) — heuristic events will be used", exc)

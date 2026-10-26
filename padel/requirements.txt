@@ -1,0 +1,17 @@
+# torch/torchvision: install from https://download.pytorch.org/whl/cpu (or a CUDA index) first
+ultralytics==8.4.189
+numpy
+scipy
+opencv-python-headless
+lightgbm
+scikit-learn
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+python-multipart
+httpx
+pytest
+remotezip
+requests
+kaggle

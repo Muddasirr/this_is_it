@@ -21,6 +21,7 @@ import {
   uploadFile,
 } from "./api";
 import "./App.css";
+import { LabelPage } from "./LabelPage";
 
 function useAuth() {
   const [ready, setReady] = useState(false);
@@ -1046,6 +1047,7 @@ function MatchPage() {
       <header className="bc-nav">
         <p className="brand">CourtLens</p>
         <div className="bc-nav-meta">
+          <Link to={`/facilities/${facilityId}/matches/${matchId}/label`}>Label events</Link>{" "}
           <Link to={`/facilities/${facilityId}`}>All matches</Link>
         </div>
       </header>
@@ -1921,6 +1923,7 @@ function AppShell() {
       <Route path="/phase0" element={authed ? <Phase0Page /> : <Navigate to="/" />} />
       <Route path="/facilities/:facilityId" element={authed ? <FacilityHome /> : <Navigate to="/" />} />
       <Route path="/facilities/:facilityId/matches/:matchId" element={authed ? <MatchPage /> : <Navigate to="/" />} />
+      <Route path="/facilities/:facilityId/matches/:matchId/label" element={authed ? <LabelPage /> : <Navigate to="/" />} />
     </Routes>
   );
 }
