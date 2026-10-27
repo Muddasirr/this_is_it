@@ -33,7 +33,7 @@ def test_event_without_a_holder_stays_unattributed():
     assert len(out) == 1 and out[0].track_keys == []
 
 
-def test_pass_to_the_other_team_is_not_counted():
+def test_pass_to_the_other_team_becomes_an_interception():
     from types import SimpleNamespace
 
     from app.workers.pipeline import drop_self_passes
@@ -44,4 +44,30 @@ def test_pass_to_the_other_team_is_not_counted():
     player_of = {"t1": "P1", "t2": "P2", "t3": "P3", "t4": "P1"}
     team_of = {"P1": "red", "P2": "red", "P3": "black"}
     kept = drop_self_passes([p("t1", "t2"), p("t1", "t3"), p("t1", "t4")], player_of, team_of)
-    assert [(c.evidence["passer"], c.evidence["receiver"]) for c in kept] == [("t1", "t2")]
+    assert [(c.event_type, c.evidence["passer"], c.evidence["receiver"]) for c in kept] == [
+        ("pass", "t1", "t2"), ("interception", "t1", "t3")]
+    assert kept[1].evidence["from_pass"] is True
+
+
+def test_spot_nms_keeps_the_strongest_of_a_burst():
+    from app.services.events import _spot_nms
+
+    spots = [{"ts_ms": 25000, "event_type": "shot", "confidence": 0.16},
+             {"ts_ms": 25600, "event_type": "shot", "confidence": 0.9},
+             {"ts_ms": 25300, "event_type": "pass", "confidence": 0.5},  # other type: kept
+             {"ts_ms": 29600, "event_type": "shot", "confidence": 0.54}]
+    kept = sorted((e["ts_ms"], e["event_type"]) for e in _spot_nms(spots))
+    assert kept == [(25300, "pass"), (25600, "shot"), (29600, "shot")]
+
+
+def test_football_format_uses_the_football_model_and_thresholds(monkeypatch):
+    from app.services import action_spotting
+
+    monkeypatch.setenv("TDEED_WEIGHTS", "/m/tdeed_futsal.pt")
+    monkeypatch.setenv("TDEED_WEIGHTS_FOOTBALL", "/m/tdeed_soccertrack.pt")
+    monkeypatch.setenv("COURT_FORMAT", "11v11")
+    assert action_spotting.weights_path() == "/m/tdeed_soccertrack.pt"
+    assert action_spotting.thresholds() == action_spotting.FOOTBALL_THRESHOLDS
+    monkeypatch.setenv("COURT_FORMAT", "5v5")
+    assert action_spotting.weights_path() == "/m/tdeed_futsal.pt"
+    assert action_spotting.thresholds() == action_spotting.THRESHOLDS

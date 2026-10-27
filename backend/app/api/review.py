@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -26,7 +26,7 @@ from app.models import (
     User,
     VideoAsset,
 )
-from app.models.entities import ConfirmationState, EventType, MatchStatus, VideoKind
+from app.models.entities import EVENT_TYPE_BY_NAME, ConfirmationState, EventType, MatchStatus, VideoKind
 from app.services.clips import render_and_store_clip
 from app.services.storage import download_to_path, presign_download
 
@@ -56,20 +56,26 @@ class ReviewAction(BaseModel):
 class EventCreate(BaseModel):
     """Staff-added event (missed by the model). Stored confirmed — also futsal ground truth."""
 
-    event_type: str = Field(pattern="^(pass|shot|goal|assist|dribble)$")
+    event_type: str  # any EVENT_TYPE_BY_NAME key (pass, shot, goal, foul, save, yellow_card …)
     canonical_ts_ms: int = Field(ge=0)
     player_id: UUID | None = None
+    # Team-level events (corner, kick-in, foul when the player is unknown): which team it counts for
+    team_id: UUID | None = None
+    on_target: bool | None = None  # shots: staff call; else derived (followed by a goal or a save)
     notes: str | None = None
 
+    @field_validator("event_type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        if v not in EVENT_TYPE_BY_NAME:
+            raise ValueError(f"event_type must be one of {', '.join(EVENT_TYPE_BY_NAME)}")
+        return v
 
-EVENT_TYPES = {
-    "goal": EventType.goal,
-    "shot": EventType.shot,
-    "pass": EventType.pass_event,
-    "assist": EventType.assist,
-    "dribble": EventType.dribble,
-}
-PRIMARY_ROLE = {"pass": "passer", "shot": "shooter", "goal": "scorer", "assist": "passer", "dribble": "carrier"}
+
+EVENT_TYPES = EVENT_TYPE_BY_NAME
+# Role of the one player a staff-added event names; the rest use "primary"
+PRIMARY_ROLE = {"pass": "passer", "shot": "shooter", "goal": "scorer", "assist": "passer", "dribble": "carrier",
+                "interception": "won_by", "save": "goalkeeper", "own_goal": "scorer"}
 
 
 class StatsOut(BaseModel):
@@ -78,6 +84,7 @@ class StatsOut(BaseModel):
     totals: dict
     by_player: list[dict]
     by_team: list[dict] | None = None
+    pass_network: list[dict] | None = None
     heatmap: dict | None = None
     labels: dict
 
@@ -153,13 +160,18 @@ def create_event(
     _: FacilityUser = Depends(require_facility_member),
 ) -> EventOut:
     _match(db, facility_id, match_id)
+    provenance = {"source": "staff", "user_id": str(user.id)}
+    if payload.team_id is not None:
+        provenance["team_id"] = str(payload.team_id)
+    if payload.on_target is not None:
+        provenance["on_target"] = payload.on_target
     event = MatchEvent(
         match_id=match_id,
         event_type=EVENT_TYPES[payload.event_type],
         canonical_ts_ms=payload.canonical_ts_ms,
         confirmation=ConfirmationState.confirmed,
         confidence=1.0,
-        provenance={"source": "staff", "user_id": str(user.id)},
+        provenance=provenance,
         is_canonical=True,
     )
     db.add(event)
@@ -168,7 +180,7 @@ def create_event(
         if not db.get(Player, payload.player_id):
             raise HTTPException(status_code=404, detail="Player not found")
         db.add(EventParticipant(event_id=event.id, player_id=payload.player_id,
-                                role=PRIMARY_ROLE[payload.event_type], confidence=1.0))
+                                role=PRIMARY_ROLE.get(payload.event_type, "primary"), confidence=1.0))
     db.add(EventReview(event_id=event.id, reviewer_id=user.id, action="create", notes=payload.notes))
     db.commit()
     return _single_event(db, event)
@@ -226,16 +238,9 @@ def review_event(
     elif payload.action == "edit":
         event.confirmation = ConfirmationState.confirmed
         if payload.event_type:
-            mapping = {
-                "goal": EventType.goal,
-                "shot": EventType.shot,
-                "pass": EventType.pass_event,
-                "assist": EventType.assist,
-                "dribble": EventType.dribble,
-            }
-            if payload.event_type not in mapping:
+            if payload.event_type not in EVENT_TYPE_BY_NAME:
                 raise HTTPException(status_code=400, detail="Invalid event_type")
-            event.event_type = mapping[payload.event_type]
+            event.event_type = EVENT_TYPE_BY_NAME[payload.event_type]
         if payload.canonical_ts_ms is not None:
             event.canonical_ts_ms = payload.canonical_ts_ms
         if payload.player_id is not None:
@@ -399,6 +404,7 @@ def match_stats(
         totals=built["totals"],
         by_player=built["by_player"],
         by_team=built.get("by_team"),
+        pass_network=built.get("pass_network"),
         heatmap=built.get("heatmap"),
         labels=built["labels"],
     )

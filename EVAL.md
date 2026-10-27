@@ -131,6 +131,76 @@ Per-player grids live on `stats.by_player[].heatmap` and `possession_heatmap` (s
 | Multi-camera | synthetic 3-camera check | PASS (sync 0 ms, 15/16 players linked) |
 | Product end to end | live app, 18 steps | PASS (CPU worker: 65 s of video in ~43 min; GPU needed for full matches) |
 
+## Futsal through the live app on the Kaggle GPU (2026-10-27)
+
+`scripts/eval/e2e_product.py --video testing_videos/e2e_tv2_300_390.mp4` (test_video_2 5:00–6:30,
+inside the labelled window, never trained on): 18/18 product checks pass with `VISION_BACKEND=kaggle`.
+Scored with `score_labels.py --offset-ms 300000`, labels restricted to the clip, ±1 s:
+
+| Event | Truth | Pred | TP | P | R | F1 |
+|---|---|---|---|---|---|---|
+| Pass | 15 | 23 | 11 | 0.48 | 0.73 | **0.58** |
+| Shot (old thresholds, shot 0.15) | 3 | 9 | 1 | 0.11 | 0.33 | 0.17 |
+
+Spotter post-processing retuned on the raw output of the held-out 5:00–7:10 window
+(`data/kaggle_out/futsal_product_v2`, 21 passes, 7 shots — small sample, and the same window used
+to pick the checkpoint, so treat as optimistic): 1 s temporal NMS per class + thresholds
+pass 0.45 / shot 0.5 → pass F1 0.53 → **0.60** (pass 0.35 + NMS: 0.59); shots 3 TP of 15 predicted → **2 TP of 3** (P 0.67,
+R 0.29). Fewer, mostly correct shots; staff add missed shots in review.
+
+Kaggle round trip for a 90 s clip: 1572 s, of which the GPU job was 361 s (pip + model downloads
+~4 min, compute ~2 min) — the rest is upload / dataset processing / queue / polling, now timed per
+phase in `kaggle_phases_s` (run stats) to cut next.
+
+## Football through the live app (SoccerTrack v2 M2, 4-min MOT clip, 2026-10-27)
+
+`COURT_FORMAT=11v11` (football spotter + thresholds), Kaggle GPU, 18/18 product checks. Scored
+against the clip's MOT boxes + team labels (`mot/117093_teams.json`):
+
+| | Before fixes | After fixes |
+|---|---|---|
+| Our person boxes matching a GT player (IoU ≥ 0.3) | 76 % | 76 % |
+| Tracks with a crop (kit colour) | 293 / 756 | 712 / 756 (crop floor 28x40 → 12x30 px) |
+| Tracks linked to a player | 14 | 472 (on-court size floor now scales with the video) |
+| Teams found / team split | 1 / — | 2 / **69 %** |
+| Identity purity (box-weighted share of a player that is one person) | — | **38 %**; 18 of 22 GT people get a player of their own |
+
+Events: 25 passes predicted vs ~105–112 labelled in the 4 min (recall ≤ ~0.23 at any clip offset);
+exact F1 not measurable — the clip's offset in the half could not be recovered (our ball: 10 %
+coverage on the 4096 px panorama; ≤ 9 % of its points within 3 m of the labelled ball at any
+offset). The SoccerTrack pass F1 0.80 above was measured with the *labelled* ball steering the
+spotter's crop; with our own ball on the panorama the crop misses the play. Speed: 1324 s GPU for
+4 min of 4096x1080 (tiled ball passes). Note: `e2e_product.py` calibrates with fixed futsal points —
+on another venue that calibration is wrong and the court filter then drops real players.
+
+## Football broadcast through the live app (DFL Bundesliga, 12 min, 2026-10-27)
+
+12 min of 1080p wide tactical feed (Bayern home, `A1606b0e6_0` chunks 21–44 stitched →
+`testing_videos/dfl_1606_0_600_1320.mp4`), `COURT_FORMAT=11v11`, Kaggle GPU.
+
+| | Result |
+|---|---|
+| GPU time | 2067 s for 12 min (0.35× real time, 1920 px, stride 2) |
+| Ball found | **89 %** of frames (vs 10 % on the SoccerTrack panorama) |
+| Person tracks / linked to players | 1774 / 888 → 32 players, 2 teams |
+| Team split vs kit colour (red vs white crops) | 66 % → **83 %** after the off-grass filter |
+| Spectators in the stands tracked as players | 318 / 1525 crops (21 %) before → filtered (`identity._off_grass`) |
+
+**Events not scored — the clip is not continuous.** The DFL labels (`train.csv`, mirrored at HF
+`dbal0503/Bundesliga`, copy in `data/eval/dfl_broadcast/`) are on the full-half clock, but the Kaggle
+460-clip set's 30 s chunks skip time between chunks (players and camera jump at chunk 2→3, 9→10,
+19→20…) and only 76 chunks (38 min) exist for a ~50 min half. No global offset aligns (frames at the
+labelled throw-ins show open play at every candidate offset). `scripts/eval/score_dfl.py` is ready
+for a contiguous labelled video (SoccerNet once `SOCCERNET_PASSWORD` is set).
+
+Still wrong on broadcast: referees / linesmen / bench staff join the two teams (COCO model has no
+referee class; the football detector that has one is not on the Kaggle models dataset yet).
+
+Reliability fix from this run: a worker restart mid-job used to strand the GPU result and leave the
+job `running` forever. The bridge now records each pushed job (`KAGGLE_STATE_DIR`) and a re-run of
+the same video re-attaches to it; on startup the worker re-queues orphans < 12 h old and fails older
+ones.
+
 ## Multi-camera (A–D)
 
 `multicam_synthetic` in `eval_index.json`: B = cropped + brightened copy starting 3.0 s later

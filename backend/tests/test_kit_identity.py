@@ -394,3 +394,48 @@ def test_keeper_clusters_never_take_kit_slots(client, register, monkeypatch):
     assert len(kits["red"] - {None}) == 1 and len(kits["black"] - {None}) == 1
     assert kits["red"] - {None} != kits["black"] - {None}
     assert kits["keeper"] == {None}
+
+
+def test_wide_shot_players_are_not_filtered_as_too_small():
+    from types import SimpleNamespace
+
+    from app.services.identity import MIN_PLAYER_BOX_FRAC, is_on_court_person, min_player_box_frac
+
+    def track(w, h, fw=4096, fh=1080):
+        return SimpleNamespace(features={"bbox_series": [
+            {"x1": 0, "y1": 0, "x2": w, "y2": h, "frame_w": fw, "frame_h": fh}]})
+
+    panorama = [track(21, 54) for _ in range(20)] + [track(6, 12)]  # players + a far-away speck
+    m = min_player_box_frac(panorama)
+    assert m < MIN_PLAYER_BOX_FRAC
+    assert is_on_court_person(panorama[0].features, m) and not is_on_court_person(panorama[-1].features, m)
+    phone = [track(80, 200, 1280, 720) for _ in range(10)]  # futsal: the fixed floor still applies
+    assert min_player_box_frac(phone) == MIN_PLAYER_BOX_FRAC
+
+
+def test_spectators_off_a_grass_pitch_are_filtered(tmp_path):
+    """Wide broadcast shots show the stands: crops framed by seats, not grass, are not players.
+    On a non-green floor (futsal) the filter stays off."""
+    import uuid
+    from types import SimpleNamespace
+
+    import cv2
+    import numpy as np
+
+    from app.services.identity import _off_grass
+
+    def crop(name: str, bg: tuple[int, int, int]) -> str:
+        im = np.full((80, 40, 3), bg, np.uint8)
+        im[10:60, 12:28] = (40, 40, 200)  # the person
+        path = tmp_path / f"{name}.jpg"
+        cv2.imwrite(str(path), im)
+        return str(path)
+
+    grass, seats, floor = (40, 140, 40), (120, 120, 130), (60, 110, 170)
+    players = [SimpleNamespace(id=uuid.uuid4(), features={"thumb_path": crop(f"p{i}", grass)}) for i in range(12)]
+    fans = [SimpleNamespace(id=uuid.uuid4(), features={"thumb_path": crop(f"f{i}", seats)}) for i in range(4)]
+    assert _off_grass(players + fans) == {t.id for t in fans}
+    assert players[0].features["grass_frac"] > 0.9
+
+    futsal = [SimpleNamespace(id=uuid.uuid4(), features={"thumb_path": crop(f"c{i}", floor)}) for i in range(12)]
+    assert _off_grass(futsal + fans) == set()

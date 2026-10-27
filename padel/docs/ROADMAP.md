@@ -18,14 +18,19 @@ Status: ✅ done (measured) · 🟡 in progress · ⬜ not started
 | 7 | Rallies + stats | grouping, zones, distances, pair stats, heatmaps | rally count within 10 % of GT-derived rallies — **+3 % (F) / −8 % (M)** | ✅ |
 | 8 | Product | FastAPI + SQLite + worker; React app: upload → calibrate → report → review | upload → report on a real match video, all pages working — done on the PT100 sample clip through the real API + UI | ✅ |
 
-## P1 — Club-camera robustness
+## Shipped v1.0 (2026-10-27)
+
+Docker image (API + web, analysis on the Kaggle GPU), optional access token, CSV/JSON exports, retrying Kaggle jobs with timeouts and restart recovery, audio + video hit detection, RGB stroke model, tactical stats (STATS.md). Elevated facility / broadcast cameras are the target view (all accuracy numbers in EVAL.md are for that view).
+
+## P1 — Next
 
 - **Racket-hand evidence for strokes** (biggest stroke-type lever, see EVAL §2): racket detector / racket keypoint, or an RGB clip classifier on the hitter crop (X3D-S / VideoMAE-S) trained on PT100 shot windows on Kaggle.
 
 - Venue diversity: add Roboflow padel sets (ball/player) + 2–3 YouTube club-camera matches with hand-checked frames; retrain production detectors.
 - Ball model upgrade if recall < 0.85: 3-frame heatmap model (WASB / TrackNetV3 with inpainting rectification), trained on PT100 at 512×288 crops.
 - Auto calibration without clicks: court-keypoint model (YOLO-pose with 13 landmarks; labels generated from PT100 homographies + Roboflow keypoint set) + line refinement.
-- Audio hit cue (racket impact transient, Decorte et al.) fused with the visual hit score.
+- ✅ Audio hit cue (Decorte et al. CRNN) fused with the visual features: F1 0.94 on 11 unseen tournaments (video-only 0.83) — EVAL §4.
+- ❌ Padel shot-type detector from padelcnn/padel-quret: 0 % coverage on broadcast and club footage → not shipped; needs labelled match footage (label bandeja / víbora / lob in the review UI → train).
 - Bounce detection (floor vs glass) with physics consistency; after-glass tag from measured rebounds.
 
 ## P2 — Padel-native insights

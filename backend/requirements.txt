@@ -13,6 +13,7 @@ boto3==1.35.76
 redis==5.2.1
 httpx==0.28.1
 modal==1.6.2  # GPU detect/track (VISION_BACKEND=modal)
+kaggle==2.2.4  # GPU detect/track on Kaggle (VISION_BACKEND=kaggle)
 email-validator==2.2.0
 
 # Vision deps (torch/torchvision installed separately from CPU wheels; ultralytics --no-deps)

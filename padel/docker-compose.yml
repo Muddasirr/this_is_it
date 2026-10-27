@@ -1,0 +1,16 @@
+# docker compose up -d --build   ->  http://localhost:8010
+services:
+  padel:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      PADEL_BACKEND: kaggle
+      PADEL_API_TOKEN: ${PADEL_API_TOKEN:-}            # set to require an access token
+      KAGGLE_API_KEY_LSECOND: ${KAGGLE_API_KEY_LSECOND} # Kaggle account that runs the GPU jobs
+      PADEL_CORS: ${PADEL_CORS:-http://localhost:8010}
+    volumes:
+      - padel_data:/data
+volumes:
+  padel_data:

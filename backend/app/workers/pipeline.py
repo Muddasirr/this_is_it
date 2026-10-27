@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import tempfile
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.models import (
 from app.models.entities import (
     CameraLabel,
     ConfirmationState,
+    EVENT_TYPE_BY_NAME,
     EventType,
     JobStage,
     JobStatus,
@@ -37,7 +39,7 @@ from app.models.entities import (
 from app.core.config import get_settings
 from app.services import jobs as job_service
 from app.services.clips import render_and_store_clip
-from app.services.avatars import attach_player_avatars
+from app.services.avatars import attach_player_avatars, upload_track_thumbs
 from app.services.identity import propose_identity_links
 from app.services.media import SYNC_MIN_CONFIDENCE, estimate_offset_ms, probe_video, validate_probe
 from app.services.storage import download_to_path, object_key_for_proxy, upload_file
@@ -124,8 +126,9 @@ def _clear_auto_analysis(db: Session, match_id: UUID) -> None:
 
 
 def drop_self_passes(candidates: list, player_of: dict, team_of: dict | None = None) -> list:
-    """Remove passes whose passer and receiver resolve to the same player (a track split), or to
-    players of different teams (the ball changed sides: a turnover / interception, not a pass)."""
+    """Remove passes whose passer and receiver resolve to the same player (a track split); a "pass"
+    to a player of the other team is the ball changing sides — kept as an interception (won_by the
+    receiver, lost_by the passer), not counted as a completed pass."""
     team_of = team_of or {}
     out = []
     for c in candidates:
@@ -136,7 +139,8 @@ def drop_self_passes(candidates: list, player_of: dict, team_of: dict | None = N
                 continue
             ta, tb = team_of.get(a), team_of.get(b)
             if ta is not None and tb is not None and ta != tb:
-                continue
+                c = copy.copy(c)
+                c.event_type, c.evidence = "interception", {**ev, "from_pass": True}
         out.append(c)
     return out
 
@@ -163,6 +167,12 @@ def _participant_roles(
     if event_type == "assist":
         passer = evidence.get("passer") or (track_keys[0] if track_keys else None)
         return [(passer, "passer")] if passer else []
+    if event_type == "interception":
+        winner, loser = evidence.get("receiver"), evidence.get("passer")
+        roles = [(winner, "won_by")] if winner else []
+        if loser and loser != winner:
+            roles.append((loser, "lost_by"))
+        return roles
     if event_type == "dribble":
         carrier = evidence.get("holder") or (track_keys[0] if track_keys else None)
         return [(carrier, "carrier")] if carrier else []
@@ -379,15 +389,16 @@ def process_job(db: Session, job_id: UUID) -> None:
                 db.commit()
             links = propose_identity_links(db, job.match_id, saved_tracks)
             match_row = db.get(Match, job.match_id)
-            avatar_count = 0
+            avatar_count = thumb_count = 0
             if match_row:
                 avatar_count = attach_player_avatars(db, match_row, saved_tracks)
+                thumb_count = upload_track_thumbs(db, match_row, saved_tracks)
             track_by_key = {t.track_key: t for t in saved_tracks}
             _finish_run(
                 db,
                 run,
                 JobStatus.succeeded,
-                {"identity_links": len(links), "avatars": avatar_count},
+                {"identity_links": len(links), "avatars": avatar_count, "track_thumbs": thumb_count},
             )
 
             # 6. Infer events
@@ -410,7 +421,7 @@ def process_job(db: Session, job_id: UUID) -> None:
                 if link.track_id in key_by_track_id
             }
             # A "pass" between two fragments of the same resolved player is a track split, and one
-            # to the other team is a turnover — neither is a completed pass
+            # to the other team is a turnover (stored as an interception) — neither is a completed pass
             linked = {p for p in player_by_track.values() if p is not None}
             team_by_player = {p.id: p.team_id for p in db.query(Player).filter(Player.id.in_(linked)).all()} if linked else {}
             candidates = drop_self_passes(candidates, player_by_track, team_by_player)
@@ -421,13 +432,7 @@ def process_job(db: Session, job_id: UUID) -> None:
                 player_of=player_by_track.get,
             )
 
-            type_map = {
-                "goal": EventType.goal,
-                "shot": EventType.shot,
-                "pass": EventType.pass_event,
-                "assist": EventType.assist,
-                "dribble": EventType.dribble,
-            }
+            type_map = EVENT_TYPE_BY_NAME
             created_events: list[MatchEvent] = []
             for obs_list in groups:
                 primary = max(obs_list, key=lambda x: x.confidence)
@@ -443,6 +448,8 @@ def process_job(db: Session, job_id: UUID) -> None:
                         "version": backend.version,
                         "heuristic": True,
                         "cameras": sorted({o.camera_label for o in obs_list}),
+                        # interceptions made from a "pass" to the other team count against pass accuracy
+                        **({"from_pass": True} if (primary.evidence or {}).get("from_pass") else {}),
                     },
                     is_canonical=True,
                 )

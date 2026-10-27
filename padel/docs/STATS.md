@@ -6,7 +6,7 @@ Every number in a report carries a label: **measured** (from calibrated position
 
 | Event | What it is | How | Validation |
 | --- | --- | --- | --- |
-| **Hit / shot** | racket contact: time, hitter, team, court position | ball trajectory change + wrist proximity → GBM → peaks | F1 0.88 / 0.87 |
+| **Hit / shot** | racket contact: time, hitter, team, court position | **audio (racket-impact sound CRNN) + video** (ball trajectory change, wrist proximity) → GBM → peaks | F1 **0.94** fused on 11 unseen tournaments (video-only 0.83); PT100 video-only 0.88 / 0.87; hitter correct 89.7 % (team 93.6 %) |
 | **Stroke type** | serve · forehand · backhand · smash · other | RGB clip model on the hitter crop (sees the racket) fused with a pose model | 0.79 / 0.78 accuracy |
 | **Volley** tag | contact made inside the net zone (≤ 4 m from the net) | position rule | estimated, not yet validated |
 | **Overhead** tag | contact with the wrist above the head (bandeja / víbora / smash family) | pose rule | estimated, not yet validated |
@@ -27,6 +27,20 @@ Every number in a report carries a label: **measured** (from calibrated position
 | Avg shot ground speed (km/h) | hitter → next hitter distance / flight time | estimated (ball height unknown from one camera) | |
 | Time tracked | how long the player was seen | measured | |
 
+### Tactical (per player, estimated where they depend on detected shots)
+
+| Stat | Definition |
+| --- | --- |
+| Serves, serve side | first shot of each rally; side of the court it was hit from (left / right as the player faces the net) |
+| Returns | second shot of each rally |
+| Shots by zone | net / transition / back position at contact |
+| Shot direction | crosscourt / down the line / centre, from where the receiving opponent had to play it |
+| Shot depth | deep / mid / short, from the receiving opponent's position |
+| Last shot of a rally | how many rallies ended on this player's shot (winner *or* error — confirm in review) |
+| Rallies involved | % of rallies with at least one shot by the player |
+| Net approaches | moves from behind the service line into the net zone, staying ≥ 1 s (measured) |
+| Distance in play, work rate | metres while the ball is in play, and per minute of play (measured) |
+
 ## Per pair
 
 | Stat | Definition | Label |
@@ -37,10 +51,14 @@ Every number in a report carries a label: **measured** (from calibrated position
 | Pair distance (m) | sum of both players | measured |
 | Shots, last shot of rally | team totals | estimated |
 | Rallies won | from confirmed rally winners | confirmed |
+| Formation | % attacking (both at net), defending (both back), split | measured |
+| Net control | % of time with at least one player at the net | measured |
+| Rallies served, time to net after own serve | how fast the serving pair takes the net | estimated |
+| Shot direction mix | crosscourt / down the line / centre | estimated |
 
 ## Per match
 
-Rallies, shots, avg / longest rally (shots), avg rally duration, stroke-type mix, data quality (ball seen %, players tracked %, scene cuts, calibration error, models used).
+Rallies, shots, avg / longest rally (shots), avg rally duration, rally-length distribution (1–3, 4–6, 7–9, 10+), ball-in-play time and %, shots per minute in play, stroke-type and direction mix, data quality (ball seen %, players tracked %, audio used, scene cuts, calibration error, models used). Exports: shots / players / pairs / rallies as CSV, full report as JSON.
 
 ## In the app
 
@@ -54,4 +72,4 @@ Video with player tags + ball circle overlay, live top-down mini-court replay (5
 
 ## Not tracked yet (roadmap)
 
-Point winner / score automatically, bounces (floor vs glass), lobs, bandeja vs víbora vs smash, serve side and return, ball speed in the air, error / winner classification. A public dataset with padel shot labels (padelcnn/padel-quret: bandeja, volleys, lob, off-the-wall …) is being trained in `padel-venues`.
+Point winner / score automatically, bounces (floor vs glass), lobs, bandeja vs víbora vs smash, serve side and return, ball speed in the air, error / winner classification. A detector trained on the public padelcnn shot dataset (bandeja, volleys, lob, off-the-wall …) did not transfer to match footage (0 % coverage) and is not used; bandeja / víbora / lob need labelled match footage.

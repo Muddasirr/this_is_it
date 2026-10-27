@@ -33,10 +33,28 @@ W, H, FPS = 796, 448, 25
 PANORAMA_ASPECT = 2.2
 LABEL_TO_EVENT = {"PASS": "pass", "HIGH PASS": "pass", "CROSS": "pass", "DRIVE": "dribble", "SHOT": "shot",
                   "GOAL": "goal"}
-# Per-class confidence from the held-out sweep (best F1 on M2 + M7); TDEED_THRESHOLDS='{"pass": 0.4}'
-# overrides per deployment (futsal fine-tune: pass 0.4 on the labelled futsal test window)
-THRESHOLDS = {"pass": 0.2, "dribble": 0.3, "shot": 0.3, "goal": 0.3,
-              **json.loads(os.environ.get("TDEED_THRESHOLDS") or "{}")}
+# Per-class confidence. Football (SoccerTrack fine-tune): the held-out sweep, best F1 on M2 + M7.
+# Futsal fine-tune: TDEED_THRESHOLDS (docker-compose; from the labelled futsal test window).
+FOOTBALL_THRESHOLDS = {"pass": 0.2, "dribble": 0.3, "shot": 0.3, "goal": 0.3}
+THRESHOLDS = {**FOOTBALL_THRESHOLDS, **json.loads(os.environ.get("TDEED_THRESHOLDS") or "{}")}
+
+
+def is_football(fmt: str | None = None) -> bool:
+    from app.services.court_format import get_court_format
+
+    return (fmt or get_court_format()) == "11v11"
+
+
+def thresholds(fmt: str | None = None) -> dict[str, float]:
+    """The thresholds of the model this format runs: football → SoccerTrack sweep, futsal → env."""
+    return dict(FOOTBALL_THRESHOLDS) if is_football(fmt) else dict(THRESHOLDS)
+
+
+def weights_path() -> str | None:
+    """Football matches use the SoccerTrack model (TDEED_WEIGHTS_FOOTBALL), futsal the futsal one."""
+    if is_football() and os.environ.get("TDEED_WEIGHTS_FOOTBALL"):
+        return os.environ["TDEED_WEIGHTS_FOOTBALL"]
+    return os.environ.get("TDEED_WEIGHTS")
 # T-DEED SoccerTrack fine-tune config (scripts/modal/tdeed_soccertrack.py) — inference needs only these
 CONFIG = {"clip_len": 100, "feature_arch": "rny008_gsf", "temporal_arch": "ed_sgp_mixer", "n_layers": 2,
           "sgp_ks": 9, "sgp_r": 4, "num_classes": 12, "radi_displacement": 4, "modality": "rgb", "crop_dim": None,
@@ -46,7 +64,7 @@ CONFIG = {"clip_len": 100, "feature_arch": "rny008_gsf", "temporal_arch": "ed_sg
 def available(device: str | None = None) -> bool:
     """Repo + weights present, and a GPU (CPU runs ~7x slower than real time: a 40-min match takes
     hours — the heuristics are used there unless TDEED_ALLOW_CPU=1)."""
-    repo, weights = os.environ.get("TDEED_REPO"), os.environ.get("TDEED_WEIGHTS")
+    repo, weights = os.environ.get("TDEED_REPO"), weights_path()
     if not (repo and weights and Path(repo).is_dir() and Path(weights).is_file()):
         return False
     on_cpu = str(device or "").lower() in {"", "cpu"}
@@ -128,7 +146,7 @@ def _model(device: str):
 
     args = types.SimpleNamespace(**CONFIG)
     model = TDEEDModel(device=device, args=args)
-    ck = torch.load(os.environ["TDEED_WEIGHTS"], map_location="cpu", weights_only=False)
+    ck = torch.load(weights_path(), map_location="cpu", weights_only=False)
     model._model.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
     return model
 

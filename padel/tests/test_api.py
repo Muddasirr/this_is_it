@@ -80,3 +80,33 @@ def test_end_to_end(client, tmp_path, calib):
 
     v = c.get(f"/api/matches/{m['id']}/video", headers={"Range": "bytes=0-99"})
     assert v.status_code == 206 and len(v.content) == 100
+
+
+def test_exports_and_token(client, tmp_path, calib, monkeypatch):
+    c, settings = client
+    src = tmp_path / "clip.mp4"
+    _video(src, n=60)
+    m = c.post("/api/matches", files={"file": ("clip.mp4", src.read_bytes(), "video/mp4")}).json()
+    pts = dict(zip(C.LANDMARKS, calib.to_px(np.array(list(C.LANDMARKS.values()))).tolist()))
+    c.put(f"/api/matches/{m['id']}/calibration", json={"points": pts})
+    det, _ = synthetic_detections(calib, n=60)
+    det.save(settings.MATCH_DIR / m["id"] / "detections.npz")
+    c.post(f"/api/matches/{m['id']}/analyze")
+    for _ in range(100):
+        if c.get(f"/api/matches/{m['id']}").json()["status"] in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    for table in ("shots", "players", "pairs", "rallies"):
+        r = c.get(f"/api/matches/{m['id']}/export/{table}.csv")
+        assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv")
+    players = c.get(f"/api/matches/{m['id']}/export/players.csv").text.splitlines()
+    assert len(players) == 5 and "distance_m" in players[0] and "net_approaches" in players[0]
+    assert c.get(f"/api/matches/{m['id']}/export/nope.csv").status_code == 404
+
+    import padel_analyzer.api.main as main
+
+    monkeypatch.setattr(main, "API_TOKEN", "s3cret")
+    assert c.get("/api/health").status_code == 200
+    assert c.get("/api/matches").status_code == 401
+    assert c.get("/api/matches", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    assert c.get(f"/api/matches/{m['id']}/video", params={"token": "s3cret"}).status_code == 200

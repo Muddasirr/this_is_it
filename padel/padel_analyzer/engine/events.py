@@ -21,6 +21,10 @@ FEATURES = [
     "vy_flip", "d_wrist", "d_wrist_m3", "d_wrist_p3", "d_wrist_2nd", "in_box", "rel_x", "rel_y", "wrist_speed",
     "wrist_above", "acc3_m2", "acc3_p2", "hitter_side",
 ]
+VISUAL_FEATURES = list(FEATURES)
+# racket-impact sound (engine/audio.py): max prob within ±1 / ±3 frames, seconds to the nearest audio peak
+AUDIO_FEATURES = ["aud_p1", "aud_p3", "aud_dt"]
+FEATURES = VISUAL_FEATURES + AUDIO_FEATURES
 MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 
 
@@ -53,8 +57,8 @@ def _wrists(tracks: PlayerTracks) -> np.ndarray:
     return w
 
 
-def features(ball: BallTrack, tracks: PlayerTracks) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (X (n, len(FEATURES)), nearest_slot (n,))."""
+def features(ball: BallTrack, tracks: PlayerTracks, audio: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (X (n, len(FEATURES)), nearest_slot (n,)). audio: (n, 3) from audio.video_features, or None."""
     n = len(ball.xy)
     xy = ball.xy
     obs = ball.observed.astype(float)
@@ -118,6 +122,8 @@ def features(ball: BallTrack, tracks: PlayerTracks) -> tuple[np.ndarray, np.ndar
     sh_y = np.nanmin(tracks.kpt[rows, nearest][:, [5, 6], 1], axis=1)
     X[:, col["wrist_above"]] = (np.nanmin(np.where(np.isnan(wn[:, :, 1]), np.inf, wn[:, :, 1]), axis=1) < sh_y)
     X[:, col["hitter_side"]] = (nearest >= 2).astype(float)
+    if audio is not None:
+        X[:, len(VISUAL_FEATURES):] = audio[:n]
     return X, nearest
 
 
@@ -156,10 +162,12 @@ class HitModel:
     def score(self, X: np.ndarray) -> np.ndarray:
         if self.booster is None:
             return heuristic_score(X)
-        return self.booster.predict(X)
+        # models trained before the audio columns existed see only the visual block
+        return self.booster.predict(X[:, :self.booster.num_feature()])
 
-    def detect(self, ball: BallTrack, tracks: PlayerTracks, nms: int = 12) -> tuple[list[Hit], np.ndarray]:
-        X, nearest = features(ball, tracks)
+    def detect(self, ball: BallTrack, tracks: PlayerTracks, nms: int = 12,
+               audio: np.ndarray | None = None) -> tuple[list[Hit], np.ndarray]:
+        X, nearest = features(ball, tracks, audio)
         s = self.score(X)
         return pick_peaks(s, nearest, self.threshold, nms), s
 

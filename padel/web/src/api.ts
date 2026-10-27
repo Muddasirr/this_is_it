@@ -2,8 +2,35 @@ import type { CourtModel, Match, Pt, Report } from './types'
 
 const BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? ''
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(BASE + path, init)
+// Optional server token (PADEL_API_TOKEN): asked once on a 401, kept in this browser.
+const TOKEN_KEY = 'padel-token'
+function token(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+function withToken(url: string): string {
+  const t = token()
+  return t ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(t)}` : url
+}
+
+async function req<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (token()) headers.set('Authorization', `Bearer ${token()}`)
+  const r = await fetch(BASE + path, { ...init, headers })
+  if (r.status === 401 && !retried) {
+    const t = window.prompt('Access token for this PadelLens server')
+    if (t) {
+      try {
+        localStorage.setItem(TOKEN_KEY, t)
+      } catch {
+        /* storage blocked: token lasts for this request only */
+      }
+      return req<T>(path, init, true)
+    }
+  }
   if (!r.ok) {
     let msg = `${r.status} ${r.statusText}`
     try {
@@ -41,8 +68,10 @@ export const api = {
   review: (id: string, body: Record<string, Record<string, unknown>>) =>
     req<Match>(`/api/matches/${id}/review`, json('PATCH', body)),
   frameUrl: (id: string, t: number, overlay = false, bust = '') =>
-    `${BASE}/api/matches/${id}/frame?t=${t.toFixed(2)}${overlay ? '&overlay=true' : ''}${bust ? `&v=${bust}` : ''}`,
-  videoUrl: (id: string) => `${BASE}/api/matches/${id}/video`,
+    withToken(`${BASE}/api/matches/${id}/frame?t=${t.toFixed(2)}${overlay ? '&overlay=true' : ''}${bust ? `&v=${bust}` : ''}`),
+  videoUrl: (id: string) => withToken(`${BASE}/api/matches/${id}/video`),
+  exportUrl: (id: string, table: string) => withToken(`${BASE}/api/matches/${id}/export/${table}.csv`),
+  reportUrl: (id: string) => withToken(`${BASE}/api/matches/${id}/report`),
 
   upload(file: File, title: string, onProgress: (p: number) => void): Promise<Match> {
     return new Promise((resolve, reject) => {
@@ -51,6 +80,7 @@ export const api = {
       fd.append('file', file)
       fd.append('title', title)
       xhr.open('POST', `${BASE}/api/matches`)
+      if (token()) xhr.setRequestHeader('Authorization', `Bearer ${token()}`)
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total)
       xhr.onload = () =>
         xhr.status < 300 ? resolve(JSON.parse(xhr.responseText)) : reject(new Error(xhr.responseText || xhr.statusText))

@@ -22,6 +22,8 @@ COLOR_SIM_THRESHOLD = 0.72
 # Facility CCTV players are typically ~0.2%–8% of the frame.
 CLOSEUP_BOX_FRAC = 0.18
 MIN_PLAYER_BOX_FRAC = 0.0008
+GRASS_PITCH_MEDIAN = 0.4  # median crop this green ⇒ grass pitch, the off-grass filter applies
+OFF_GRASS_MAX = 0.15  # crop surroundings under this green share ⇒ not on the pitch
 
 
 def median_box_frac(features: dict | None) -> float:
@@ -40,9 +42,19 @@ def median_box_frac(features: dict | None) -> float:
     return fracs[len(fracs) // 2]
 
 
-def is_on_court_person(features: dict | None) -> bool:
+def is_on_court_person(features: dict | None, min_frac: float = MIN_PLAYER_BOX_FRAC) -> bool:
     frac = median_box_frac(features)
-    return MIN_PLAYER_BOX_FRAC <= frac <= CLOSEUP_BOX_FRAC
+    return min_frac <= frac <= CLOSEUP_BOX_FRAC
+
+
+def min_player_box_frac(tracks: list) -> float:
+    """MIN_PLAYER_BOX_FRAC, lowered for wide shots: a quarter of this video's typical person box.
+    A 4096x1080 football panorama player (~21x54 px) is 0.03 % of the frame — under the fixed 0.08 %,
+    which kept 17 of 756 SoccerTrack tracks."""
+    fracs = sorted(median_box_frac(t.features) for t in tracks)
+    if not fracs:
+        return MIN_PLAYER_BOX_FRAC
+    return min(MIN_PLAYER_BOX_FRAC, 0.25 * fracs[len(fracs) // 2])
 
 
 def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack]) -> list[TrackIdentityLink]:
@@ -55,11 +67,12 @@ def propose_identity_links(db: Session, match_id: UUID, tracks: list[PlayerTrack
     # Drop broadcast close-ups / sideline staff so they cannot top the leaderboard;
     # on court-calibrated cameras, also anyone whose feet stay off the court.
     court_ok = _court_filter(db, match_id)
-    on_court = [t for t in person_all if is_on_court_person(t.features) and court_ok(t)]
+    min_frac = min_player_box_frac(person_all)
+    on_court = [t for t in person_all if is_on_court_person(t.features, min_frac) and court_ok(t)]
     closeups = [t for t in person_all if t not in on_court]
     person_tracks = on_court if on_court else person_all  # fall back if filter wiped everyone
     skipped_closeups = closeups if on_court else []
-    bystanders = _bystanders(person_tracks)
+    bystanders = _off_grass(person_tracks) | _bystanders(person_tracks)
     if bystanders:
         person_tracks = [t for t in person_tracks if t.id not in bystanders]
         skipped_closeups = skipped_closeups + [t for t in person_all if t.id in bystanders]
@@ -172,6 +185,42 @@ def _bystanders(tracks: list[PlayerTrack]) -> set:
         logger.warning("Role filter would drop %d/%d tracks — not applied", len(drop), len(tracks))
         return set()
     return drop
+
+
+def grass_fraction(thumb_path: str | None) -> float | None:
+    """Share of grass-green pixels around a crop's feet and sides (None if no thumb).
+    A player stands on the pitch; a spectator in the stands is framed by seats."""
+    if not thumb_path:
+        return None
+    import cv2
+    import numpy as np
+
+    im = cv2.imread(str(thumb_path))
+    if im is None or im.size == 0:
+        return None
+    h, w = im.shape[:2]
+    green = cv2.inRange(cv2.cvtColor(im, cv2.COLOR_BGR2HSV), (35, 40, 40), (95, 255, 255)) > 0
+    side = max(1, w // 6)
+    band = np.concatenate([green[int(h * 0.75):].ravel(), green[:, :side].ravel(), green[:, -side:].ravel()])
+    return float(band.mean())
+
+
+def _off_grass(tracks: list[PlayerTrack]) -> set:
+    """Track ids standing off a grass pitch (spectators in the stands of a wide broadcast shot).
+    Only on grass: when the median crop is mostly green; futsal floors leave this off.
+    DFL broadcast: 318/1525 crops under 0.15, all stands; the next band holds bench staff."""
+    fracs = {}
+    for t in tracks:
+        g = grass_fraction((t.features or {}).get("thumb_path"))
+        if g is not None:
+            fracs[t.id] = g
+            t.features = {**(t.features or {}), "grass_frac": round(g, 3)}
+    if len(fracs) < 10:
+        return set()
+    ordered = sorted(fracs.values())
+    if ordered[len(ordered) // 2] < GRASS_PITCH_MEDIAN:
+        return set()
+    return {tid for tid, g in fracs.items() if g < OFF_GRASS_MAX}
 
 
 def _court_filter(db: Session, match_id: UUID):

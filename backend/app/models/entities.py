@@ -99,6 +99,23 @@ class EventType(str, enum.Enum):
     pass_event = "pass"
     assist = "assist"
     dribble = "dribble"
+    # Ball won from the other team (auto: a "pass" whose receiver is on the other team) —
+    # participants: won_by (interception) and lost_by (ball lost / turnover)
+    interception = "interception"
+    # Futsal match events — staff-tagged in review (no model detects them yet)
+    save = "save"  # goalkeeper stops a shot (makes that shot "on target")
+    foul = "foul"  # counts toward the team's accumulated fouls (6th+ per half → 10 m kick)
+    yellow_card = "yellow_card"
+    red_card = "red_card"
+    own_goal = "own_goal"  # scored by the player's own team's opponent
+    corner = "corner"
+    kick_in = "kick_in"
+    free_kick = "free_kick"
+    penalty = "penalty"  # 6 m penalty or 10 m second penalty
+
+
+# API / model name → enum ("pass" is pass_event)
+EVENT_TYPE_BY_NAME = {("pass" if e is EventType.pass_event else e.value): e for e in EventType}
 
 
 class ConfirmationState(str, enum.Enum):

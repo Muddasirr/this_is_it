@@ -17,6 +17,9 @@ _PG_PATCHES = [
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(512)",
     # Enum values must be added outside a transaction (AUTOCOMMIT below)
     "ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'dribble'",
+    *(f"ALTER TYPE eventtype ADD VALUE IF NOT EXISTS '{v}'" for v in (
+        "interception", "save", "foul", "yellow_card", "red_card", "own_goal", "corner", "kick_in",
+        "free_kick", "penalty")),
     "ALTER TYPE cameralabel ADD VALUE IF NOT EXISTS 'D'",
     # Per-camera sync: legacy rows were "B relative to A"
     "ALTER TABLE camera_syncs ADD COLUMN IF NOT EXISTS camera_label cameralabel NOT NULL DEFAULT 'B'",

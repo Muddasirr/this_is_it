@@ -52,6 +52,13 @@ export default function ReportPage({ id }: { id: string }) {
           </div>
         </div>
         <div className="spacer" />
+        <div className="row small" style={{ gap: 6 }}>
+          <span className="muted">Export</span>
+          {['shots', 'players', 'pairs', 'rallies'].map((t) => (
+            <a key={t} className="btn" href={api.exportUrl(id, t)} download>{t}.csv</a>
+          ))}
+          <a className="btn" href={api.reportUrl(id)} download={`padel_${id}_report.json`}>json</a>
+        </div>
         <button onClick={() => go('/')}>All matches</button>
       </div>
 
@@ -60,6 +67,8 @@ export default function ReportPage({ id }: { id: string }) {
         <Tile label="Shots" value={m.hits} />
         <Tile label="Avg rally" value={m.avg_rally_shots ?? '–'} sub={m.avg_rally_s ? `shots · ${m.avg_rally_s} s` : 'shots'} />
         <Tile label="Longest rally" value={m.max_rally_shots ?? '–'} sub="shots" />
+        <Tile label="Ball in play" value={m.time_in_play_pct != null ? `${m.time_in_play_pct}%` : '–'}
+          sub={m.time_in_play_s != null ? `${fmtTime(m.time_in_play_s)} · ${m.shots_per_min_in_play ?? '–'} shots/min` : undefined} />
         {rep.teams.map((t) => (
           <Tile key={t.id} label={t.name} value={`${Math.round(Number(t.stats.distance_m ?? 0))} m`}
             sub={`${t.stats.shots} shots · ${t.stats.both_at_net_pct ?? 0}% both at net`} color={teamColor(t.id)} />
@@ -114,8 +123,9 @@ export default function ReportPage({ id }: { id: string }) {
                     ['Shots', t.stats.shots],
                     ['Hit the last shot of a rally', t.stats.last_shot_in_rallies],
                     ['Rallies won (confirmed)', t.stats.rallies_won ?? 0],
+                    ...pairExtra(t.stats),
                   ].map(([k, v]) => (
-                    <tr key={String(k)}><td className="secondary">{k}</td><td className="num" style={{ textAlign: 'right' }}>{v}</td></tr>
+                    <tr key={String(k)}><td className="secondary">{k as React.ReactNode}</td><td className="num" style={{ textAlign: "right" }}>{v as React.ReactNode}</td></tr>
                   ))}
                 </tbody>
               </table>
@@ -279,21 +289,74 @@ function PlayerCard({ p, onRename }: { p: Player; onRename: (name: string) => vo
           <h3 style={{ marginBottom: 6 }}>Strokes</h3>
           <Bars data={s.by_type} />
           {s.avg_shot_speed_kmh && <div className="small muted" style={{ marginTop: 6 }}>Avg shot ground speed {s.avg_shot_speed_kmh} km/h (est.)</div>}
+          {s.direction && (
+            <>
+              <h3 style={{ margin: '12px 0 6px' }}>Shot direction <span className="small muted">(est.)</span></h3>
+              <Bars data={s.direction} />
+            </>
+          )}
+          {s.padel_types && Object.keys(s.padel_types).length > 0 && (
+            <>
+              <h3 style={{ margin: '12px 0 6px' }}>Padel shots</h3>
+              <Bars data={s.padel_types} />
+            </>
+          )}
         </div>
         <div>
           <h3 style={{ marginBottom: 6 }}>Own-half heatmap</h3>
           <Heatmap grid={p.heatmap} size={170} />
         </div>
       </div>
+      {s.serves != null && (
+        <table className="small">
+          <tbody>
+            {[
+              ['Serves (left / right side)', `${s.serves} (${s.serve_side?.left ?? 0} / ${s.serve_side?.right ?? 0})`],
+              ['Returns', s.returns],
+              ['Shots from net / transition / back', `${s.shots_by_zone?.net ?? 0} / ${s.shots_by_zone?.transition ?? 0} / ${s.shots_by_zone?.back ?? 0}`],
+              ['Shot depth deep / mid / short', `${s.depth?.deep ?? 0} / ${s.depth?.mid ?? 0} / ${s.depth?.short ?? 0}`],
+              ['Last shot of a rally', s.last_shot_of_rally],
+              ['Rallies involved', `${s.rally_participation_pct ?? 0}%`],
+              ['Net approaches', s.net_approaches],
+              ['Distance while ball in play', `${s.distance_in_play_m ?? 0} m`],
+              ['Work rate (in play)', s.work_rate_m_per_min != null ? `${s.work_rate_m_per_min} m/min` : '–'],
+            ].map(([k, v]) => (
+              <tr key={String(k)}><td className="secondary">{k}</td><td className="num" style={{ textAlign: 'right' }}>{v}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
+}
+
+function pairExtra(st: Record<string, unknown>): [string, string | number][] {
+  const f = st.formation_pct as Record<string, number> | undefined
+  const d = st.direction as Record<string, number> | undefined
+  const rows: [string, string | number][] = []
+  if (f) {
+    rows.push(['Attacking (both at net)', `${f.attack_both_net} %`])
+    rows.push(['Defending (both back)', `${f.defence_both_back} %`])
+    rows.push(['Split (one up, one back)', `${f.split_one_up_one_back} %`])
+  }
+  if (st.net_control_pct != null) rows.push(['Net control (≥ 1 player at net)', `${st.net_control_pct} %`])
+  if (st.rallies_served != null) rows.push(['Rallies served', st.rallies_served as number])
+  if (st.avg_time_to_net_after_serve_s != null) rows.push(['Time to net after own serve', `${st.avg_time_to_net_after_serve_s} s`])
+  if (d) rows.push(['Crosscourt / down the line / centre', `${d.crosscourt} / ${d['down the line']} / ${d.centre}`])
+  return rows
 }
 
 function Rallies({ rep, names, seek, review }: {
   rep: Report; names: string[]; seek: (t: number) => void; review: (b: Record<string, Record<string, unknown>>) => void
 }) {
   return (
-    <div className="card" style={{ overflowX: 'auto' }}>
+    <div className="card stack" style={{ overflowX: 'auto' }}>
+      {rep.match.rally_length_distribution && (
+        <div style={{ maxWidth: 420 }}>
+          <h3 style={{ marginBottom: 6 }}>Rally length (shots)</h3>
+          <Bars data={rep.match.rally_length_distribution} />
+        </div>
+      )}
       <table>
         <thead><tr><th>#</th><th>Start</th><th>Shots</th><th>Length</th><th>Opened with</th><th>Last shot</th><th>Winner</th></tr></thead>
         <tbody>
@@ -341,7 +404,7 @@ function Shots({ rep, names, seek, review, now }: {
       </div>
       <div style={{ overflowX: 'auto' }}>
         <table>
-          <thead><tr><th>Time</th><th>Rally</th><th>Player</th><th>Stroke</th><th>Tags</th><th>Speed</th><th /></tr></thead>
+          <thead><tr><th>Time</th><th>Rally</th><th>Player</th><th>Stroke</th><th>Padel shot</th><th>Tags</th><th>Speed</th><th /></tr></thead>
           <tbody>
             {list.map((s) => (
               <tr key={s.id} className={`clickable ${Math.abs(s.t - now) < 0.4 ? 'active' : ''}`} onClick={() => seek(s.t - 1)}>
@@ -354,6 +417,7 @@ function Shots({ rep, names, seek, review, now }: {
                   </select>{' '}
                   <span className="small muted">{s.label === 'confirmed' ? '✓ confirmed' : `${Math.round(s.type_conf * 100)}%`}</span>
                 </td>
+                <td>{s.padel_type ? <>{s.padel_type} <span className="small muted">{Math.round((s.padel_type_conf ?? 0) * 100)}%</span></> : <span className="muted">–</span>}</td>
                 <td>{s.volley && <span className="tag">volley</span>}{s.overhead && <span className="tag">overhead</span>}</td>
                 <td className="num">{s.speed_kmh ? `${s.speed_kmh} km/h` : '–'}</td>
                 <td onClick={(e) => e.stopPropagation()}>

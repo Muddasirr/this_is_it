@@ -18,6 +18,7 @@ from .events import HitModel
 from .shots import CLASSES, ShotModel
 
 REPLAY_HZ = 5
+MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 VERSION = "padel-0.1"
 
 
@@ -48,6 +49,22 @@ def sample_hists(video: str | Path, det: Detections, every_s: float = 0.5,
     return out
 
 
+def audio_features(video: str | Path | None, det: Detections) -> tuple[np.ndarray | None, int | None]:
+    """Racket-impact sound features per analysed frame (None without a model, a video or an audio track)."""
+    from . import audio as A
+
+    if video is None or not A.AudioHitModel.available():
+        return None, None
+    y = A.load_audio(video)
+    if y is None or len(y) < A.SR:
+        return None, None
+    model = A.AudioHitModel()
+    times, prob = model.probs(y)
+    # det.fps is already the sampled rate: analysed frame i is at i / det.fps seconds (step must be 1 here)
+    return (A.video_features(times, prob, det.n, det.fps, 1, model.threshold),
+            int(len(A.peaks(times, prob, model.threshold))))
+
+
 def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = None,
             hit_model: HitModel | None = None, shot_model: ShotModel | None = None,
             progress: Callable[[str, float], None] | None = None) -> dict:
@@ -64,20 +81,41 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
     bt = B.track(det.ball)  # precise: what the report shows
     bt_ev = B.track_for_events(det.ball)  # recall-oriented: what hit / stroke features see
     prog("hits", 0)
-    hits, hit_score = (hit_model or HitModel()).detect(bt_ev, slot_tracks)
+    aud, n_audio_hits = audio_features(video, det)
+    if hit_model is None:
+        # audio + video model (modality dropout) when there is sound; the dedicated video-only model otherwise
+        video_only = MODEL_DIR / "hit_lgbm_video.txt"
+        hit_model = HitModel(video_only) if aud is None and video_only.exists() else HitModel()
+    hits, hit_score = hit_model.detect(bt_ev, slot_tracks, audio=aud)
+    # broadcast replays / close-ups: a hit can only be measured while the main court view is on screen
+    # (≥ 3 players tracked around it); fixed facility cameras are never affected
+    seen = (~np.isnan(slot_tracks.raw_m[:, :, 0])).sum(1) >= 3
+    k = max(1, int(round(fps)))
+    court_view = np.convolve(seen.astype(float), np.ones(2 * k + 1) / (2 * k + 1), "same") >= 0.6
+    hits = [h for h in hits if court_view[min(h.frame, det.n - 1)]]
     strokes = (shot_model or ShotModel()).predict(hits, bt_ev, slot_tracks, fps, video, det.step)
     prog("rallies", 0)
     rallies = R.group(hits, fps, det.n, slot_tracks.segments, [s.kind == "serve" for s in strokes])
+    person_of = [int(slot_tracks.person[h.frame, h.slot]) for h in hits]
+    team_of = [0 if p < 2 else 1 for p in person_of]
+    # touches between points are not shots: drop them, then regroup what is left
+    live = sorted(i for r in rallies if not R.dead_ball(r, team_of) for i in r.hits)
+    if len(live) < len(hits):
+        hits, strokes = [hits[i] for i in live], [strokes[i] for i in live]
+        person_of, team_of = [person_of[i] for i in live], [team_of[i] for i in live]
+        rallies = R.group(hits, fps, det.n, slot_tracks.segments, [s.kind == "serve" for s in strokes])
     rally_of = [0] * len(hits)
     for r in rallies:
         for i in r.hits:
             rally_of[i] = r.id
 
-    person_of = [int(slot_tracks.person[h.frame, h.slot]) for h in hits]
-    team_of = [0 if p < 2 else 1 for p in person_of]
     hit_pos = [tracks.pos_m[h.frame, p] for h, p in zip(hits, person_of)]
     speeds = ST.shot_ground_speed(hit_pos, [h.frame for h in hits], rally_of, fps)
 
+    from . import shot_types as SH
+
+    padel_types = SH.classify(video, hits, slot_tracks, det.step) if (video is not None and hits and SH.available()) \
+        else [(None, 0.0)] * len(hits)
     shots = []
     for i, (h, s) in enumerate(zip(hits, strokes)):
         pos = hit_pos[i]
@@ -88,6 +126,7 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
             "hit_score": round(h.score, 3), "speed_kmh": speeds[i],
             "pos_m": None if np.isnan(pos).any() else [round(float(pos[0]), 2), round(float(pos[1]), 2)],
             "ball_px": None if np.isnan(bt.xy[h.frame]).any() else [round(float(v), 1) for v in bt.xy[h.frame]],
+            "padel_type": padel_types[i][0], "padel_type_conf": padel_types[i][1],
             "label": "estimated",
         })
 
@@ -99,6 +138,8 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
         st["by_type"] = {c: sum(1 for s in mine if s["type"] == c) for c in CLASSES}
         st["volleys"] = sum(1 for s in mine if s["volley"])
         st["overheads"] = sum(1 for s in mine if s["overhead"])
+        pt = [s["padel_type"] for s in mine if s.get("padel_type")]
+        st["padel_types"] = {k: pt.count(k) for k in sorted(set(pt))}
         sp = [s["speed_kmh"] for s in mine if s["speed_kmh"]]
         st["avg_shot_speed_kmh"] = round(float(np.mean(sp)), 1) if sp else None
         players.append({"id": p, "name": f"Player {p + 1}", "team": 0 if p < 2 else 1, "stats": st,
@@ -138,6 +179,8 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
         "players_tracked_pct": round(float((~np.isnan(tracks.pos_m[:, :, 0])).mean() * 100), 1),
         "segments": len(slot_tracks.segments),
         "identity_linked": hists is not None,
+        "audio_used": aud is not None,
+        "audio_hits": n_audio_hits,
         "calibration_reproj_m": calib.reproj_m,
         "analysis_s": round(time.time() - t0, 1),
     }
@@ -150,6 +193,16 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
         "ball_px": [None if np.isnan(bt.xy[f, 0]) else [round(float(bt.xy[f, 0])), round(float(bt.xy[f, 1]))]
                     for f in range(0, det.n, step)],
     }
+    from . import advanced as ADV
+
+    ADV.shot_context(shots, rally_out)
+    extra, in_play = ADV.match_extra(rally_out, shots, det.n / fps, fps, det.n)
+    match.update(extra)
+    for pl in players:
+        pl["stats"].update(ADV.player_extra(pl["id"], shots, rally_out, tracks.pos_m[:, pl["id"]], fps, in_play))
+    for tm in teams:
+        a, b = tm["players"]
+        tm["stats"].update(ADV.pair_extra(tracks.pos_m[:, a], tracks.pos_m[:, b], shots, rally_out, tm["id"], fps))
     return {"match": match, "players": players, "teams": teams, "rallies": rally_out, "shots": shots,
             "quality": quality, "replay": replay, "calibration": calib.to_dict()}
 

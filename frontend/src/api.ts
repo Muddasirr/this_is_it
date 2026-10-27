@@ -101,6 +101,7 @@ export type Track = {
   end_ms: number;
   confidence: number | null;
   class_name: string | null;
+  thumb_url?: string | null;
   identity: {
     link_id: string;
     player_id: string | null;
@@ -143,6 +144,15 @@ export type MatchStats = {
     minutes?: number;
     avg_speed?: number;
     conversion_pct?: number | null;
+    shot_on_target?: number;
+    pass_accuracy_pct?: number | null;
+    interception?: number;
+    ball_lost?: number;
+    save?: number;
+    foul?: number;
+    yellow_card?: number;
+    red_card?: number;
+    own_goal?: number;
     heatmap?: number[][];
     possession_heatmap?: number[][];
     attribution: string;
@@ -156,7 +166,24 @@ export type MatchStats = {
     dribble: number;
     possession_pct: number;
     players: number;
+    score?: number;
+    shot_on_target?: number;
+    pass_accuracy_pct?: number | null;
+    conversion_pct?: number | null;
+    interception?: number;
+    ball_lost?: number;
+    save?: number;
+    foul?: number;
+    fouls_by_half?: number[];
+    yellow_card?: number;
+    red_card?: number;
+    corner?: number;
+    kick_in?: number;
+    free_kick?: number;
+    penalty?: number;
+    own_goal_for?: number;
   }[];
+  pass_network?: { from: string; to: string; passes: number }[];
   heatmap?: {
     width: number;
     height: number;
@@ -278,12 +305,18 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ player_id, state: player_id ? "confirmed" : "unknown" }),
     }),
+  // Merge a player (all its tracks) into another, or mark crops as not a player (player_id null)
+  setTrackIdentities: (facilityId: string, matchId: string, trackIds: string[], player_id: string | null) =>
+    request<{ updated: number }>(`/api/v1/facilities/${facilityId}/matches/${matchId}/tracks/identity`, {
+      method: "PUT",
+      body: JSON.stringify({ track_ids: trackIds, player_id }),
+    }),
   listEvents: (facilityId: string, matchId: string) =>
     request<MatchEvent[]>(`/api/v1/facilities/${facilityId}/matches/${matchId}/events`),
   createEvent: (
     facilityId: string,
     matchId: string,
-    body: { event_type: string; canonical_ts_ms: number; player_id?: string; notes?: string },
+    body: { event_type: string; canonical_ts_ms: number; player_id?: string; team_id?: string; on_target?: boolean; notes?: string },
   ) =>
     request<MatchEvent>(`/api/v1/facilities/${facilityId}/matches/${matchId}/events`, {
       method: "POST",
@@ -359,30 +392,9 @@ export const api = {
       facility_name: string;
       status: string;
       totals: Record<string, number>;
-      by_player: {
-        display_name: string;
-        player_id?: string;
-        shirt_number?: number | null;
-        avatar_url?: string | null;
-        goal: number;
-        shot: number;
-        pass: number;
-        assist?: number;
-        dribble?: number;
-        pass_received?: number;
-        possession_pct: number;
-        touches: number;
-        distance: number;
-        distance_m?: number | null;
-        avg_speed_kmh?: number | null;
-        top_speed_kmh?: number | null;
-        minutes?: number;
-        avg_speed?: number;
-        conversion_pct?: number | null;
-        attribution: string;
-        heatmap?: number[][];
-        possession_heatmap?: number[][];
-      }[];
+      by_player: MatchStats["by_player"];
+      by_team?: MatchStats["by_team"];
+      pass_network?: MatchStats["pass_network"];
       heatmap: {
         width: number;
         height: number;

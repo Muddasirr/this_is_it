@@ -14,5 +14,9 @@ MAX_FRAMES = int(os.environ.get("PADEL_MAX_FRAMES", "0"))  # 0 = whole video
 BACKEND = os.environ.get("PADEL_BACKEND", "kaggle")
 CORS = os.environ.get("PADEL_CORS", "http://localhost:5175,http://127.0.0.1:5175").split(",")
 WEB_DIST = ROOT / "web" / "dist"
+# optional shared secret: when set, every /api request needs "Authorization: Bearer <token>" (or ?token= for
+# <video>/<img> URLs, which cannot send headers); /api/health stays open for load balancers
+API_TOKEN = os.environ.get("PADEL_API_TOKEN", "")
+KAGGLE_JOB_TIMEOUT_S = int(os.environ.get("PADEL_KAGGLE_TIMEOUT_S", str(9 * 3600)))  # Kaggle kernels stop at 12 h
 
 MATCH_DIR.mkdir(parents=True, exist_ok=True)

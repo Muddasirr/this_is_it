@@ -48,11 +48,12 @@ video ──► ingest (probe fps/size, thumbnail, proxy frames for the UI)
       ──► hits      per-frame features (ball velocity change, ball–wrist distance / player height,
                     wrist speed, ball side) → gradient-boosted classifier → peak picking (NMS 10 frames)
                     → hitter = closest wrist; heuristic fallback when no model file
-      ──► strokes   hitter pose window ±8 frames (normalised keypoints) + ball-vs-head height + side
-                    + court zone + rally index → classifier {serve, forehand, backhand, smash, other}
+      ──► strokes   RGB clip model on the hitter crop (R(2+1)D-18, sees the racket) fused 0.7/0.3 with a
+                    pose/context GBM → {serve, forehand, backhand, smash, other}
                     + tags: volley, overhead, after-glass (estimated)
       ──► rallies   hits grouped (gap ≤ 3.5 s), serve opens a rally; last hitter; duration; length
-      ──► stats     per player / pair / match (below) + heatmaps + 5 Hz replay track
+      ──► stats     per player / pair / match + tactical (engine/advanced.py: serves, returns, zones,
+                    direction, depth, net approaches, formation, work rate) + heatmaps + 5 Hz replay track
       ──► report.json  (+ review overrides stored separately, merged at read time)
 ```
 

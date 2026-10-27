@@ -752,16 +752,45 @@ function parseClock(text: string): number | null {
   return (Number(m[1]) * 60 + Number(m[2])) * 1000 + (m[3] ? Number(m[3]) * 100 : 0);
 }
 
+// Every event staff can tag; fouls, cards, saves and set pieces are staff-only (no model yet)
+const STAFF_EVENT_TYPES: [string, string][] = [
+  ["goal", "Goal"],
+  ["shot", "Shot"],
+  ["save", "Keeper save"],
+  ["pass", "Pass"],
+  ["assist", "Assist"],
+  ["dribble", "Dribble"],
+  ["interception", "Interception / ball won"],
+  ["foul", "Foul"],
+  ["yellow_card", "Yellow card"],
+  ["red_card", "Red card"],
+  ["own_goal", "Own goal"],
+  ["corner", "Corner"],
+  ["kick_in", "Kick-in"],
+  ["free_kick", "Free kick"],
+  ["penalty", "Penalty (6 m / 10 m)"],
+];
+
 function AddEventForm({
   players,
   onAdd,
   onExport,
+  teams = [],
 }: {
   players: Player[];
-  onAdd: (body: { event_type: string; canonical_ts_ms: number; player_id?: string }) => Promise<void>;
+  onAdd: (body: {
+    event_type: string;
+    canonical_ts_ms: number;
+    player_id?: string;
+    team_id?: string;
+    on_target?: boolean;
+  }) => Promise<void>;
   onExport: () => Promise<void>;
+  teams?: { id: string; name: string }[];
 }) {
   const [type, setType] = useState("goal");
+  const [teamId, setTeamId] = useState("");
+  const [onTarget, setOnTarget] = useState(false);
   const [clock, setClock] = useState("");
   const [playerId, setPlayerId] = useState("");
   const ts = parseClock(clock);
@@ -771,14 +800,20 @@ function AddEventForm({
       onSubmit={async (e) => {
         e.preventDefault();
         if (ts === null) return;
-        await onAdd({ event_type: type, canonical_ts_ms: ts, player_id: playerId || undefined });
+        await onAdd({
+          event_type: type,
+          canonical_ts_ms: ts,
+          player_id: playerId || undefined,
+          team_id: teamId || undefined,
+          on_target: type === "shot" && onTarget ? true : undefined,
+        });
         setClock("");
       }}
     >
       <select value={type} onChange={(e) => setType(e.target.value)}>
-        {["goal", "shot", "pass", "assist", "dribble"].map((t) => (
+        {STAFF_EVENT_TYPES.map(([t, label]) => (
           <option key={t} value={t}>
-            {t}
+            {label}
           </option>
         ))}
       </select>
@@ -791,13 +826,146 @@ function AddEventForm({
           </option>
         ))}
       </select>
+      {teams.length > 0 && !playerId && (
+        <select value={teamId} onChange={(e) => setTeamId(e.target.value)} title="For team events (corner, kick-in, foul by an unknown player)">
+          <option value="">team (optional)</option>
+          {teams.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+        </select>
+      )}
+      {type === "shot" && (
+        <label className="inline-check">
+          <input type="checkbox" checked={onTarget} onChange={(e) => setOnTarget(e.target.checked)} /> on target
+        </label>
+      )}
       <button className="primary" type="submit" disabled={ts === null}>
-        {type === "goal" ? "Add goal" : "Add missed event"}
+        {type === "goal" ? "Add goal" : "Add event"}
       </button>
       <button type="button" onClick={onExport} title="Confirmed events as JSON ground truth">
         Export ground truth
       </button>
     </form>
+  );
+}
+
+const pctOr = (v: number | null | undefined) => (v == null ? "–" : `${v.toFixed(0)}%`);
+
+// Rows of the team comparison: [label, value, hint]
+const TEAM_STAT_ROWS: [string, (t: NonNullable<MatchStats["by_team"]>[number]) => string | number, string][] = [
+  ["Score", (t) => t.score ?? t.goal, "Goals + opponent own goals"],
+  ["Possession", (t) => pctOr(t.possession_pct), "Share of ball-control time (estimated)"],
+  ["Shots", (t) => t.shot, "Estimated + staff-tagged"],
+  ["Shots on target", (t) => t.shot_on_target ?? 0, "Followed by a goal or save, or marked by staff"],
+  ["Conversion", (t) => pctOr(t.conversion_pct), "Goals ÷ shots"],
+  ["Passes completed", (t) => t.pass, "Estimated"],
+  ["Pass accuracy", (t) => pctOr(t.pass_accuracy_pct), "Completed ÷ (completed + intercepted)"],
+  ["Assists", (t) => t.assist, ""],
+  ["Dribbles", (t) => t.dribble, "Estimated"],
+  ["Interceptions", (t) => t.interception ?? 0, "Ball won from the other team"],
+  ["Balls lost", (t) => t.ball_lost ?? 0, "Ball given to the other team"],
+  ["Keeper saves", (t) => t.save ?? 0, "Staff-tagged"],
+  ["Fouls (1st / 2nd half)", (t) => `${t.foul ?? 0} (${(t.fouls_by_half ?? [0, 0]).join(" / ")})`, "Accumulated fouls: from the 6th in a half, a 10 m kick"],
+  ["Yellow / red cards", (t) => `${t.yellow_card ?? 0} / ${t.red_card ?? 0}`, "Staff-tagged"],
+  ["Corners", (t) => t.corner ?? 0, "Staff-tagged"],
+  ["Kick-ins", (t) => t.kick_in ?? 0, "Staff-tagged"],
+  ["Free kicks", (t) => t.free_kick ?? 0, "Staff-tagged"],
+  ["Penalties", (t) => t.penalty ?? 0, "Staff-tagged"],
+  ["Players", (t) => t.players, "Players with tracks"],
+];
+
+// Staff identity board: every person track as a crop, grouped by the player it is linked to.
+// Move a crop, merge a whole player into another, or mark crops as not a player (referee, coach, crowd).
+function IdentityBoard({
+  tracks,
+  players,
+  onMove,
+}: {
+  tracks: Track[];
+  players: Player[];
+  onMove: (trackIds: string[], playerId: string | null, note: string) => Promise<void>;
+}) {
+  const [showAll, setShowAll] = useState<Record<string, boolean>>({});
+  const people = tracks.filter((t) => t.class_name !== "sports_ball");
+  const groups = new Map<string, Track[]>();
+  for (const t of people) {
+    const key = t.identity?.player_id || "";
+    groups.set(key, [...(groups.get(key) ?? []), t]);
+  }
+  const name = (id: string) => players.find((p) => p.id === id)?.display_name || id.slice(0, 8);
+  const order = [...groups.keys()].sort((a, b) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b))));
+  const dur = (t: Track) => t.end_ms - t.start_ms;
+  const target = (current: string, onPick: (v: string | null) => void, label: string) => (
+    <select
+      value=""
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v) onPick(v === "__none" ? null : v);
+      }}
+    >
+      <option value="">{label}</option>
+      {current !== "" && <option value="__none">Not a player (ref / coach / crowd)</option>}
+      {players
+        .filter((p) => p.id !== current)
+        .map((p) => (
+          <option key={p.id} value={p.id}>
+            #{p.default_shirt_number ?? "—"} {p.display_name}
+          </option>
+        ))}
+    </select>
+  );
+  if (!people.length)
+    return (
+      <section className="panel">
+        <h2>Player identity board</h2>
+        <p className="bc-empty">No tracks yet — process a match first.</p>
+      </section>
+    );
+  return (
+    <section className="panel">
+      <h2>Player identity board</h2>
+      <p className="lede">
+        Each crop is one tracked fragment. If a player&apos;s row shows someone else, move that crop; if two rows
+        are the same person, merge them. Per-player stats follow these links.
+      </p>
+      {order.map((pid) => {
+        const list = [...(groups.get(pid) ?? [])].sort((a, b) => dur(b) - dur(a));
+        const shown = showAll[pid] ? list : list.slice(0, 18);
+        const secs = Math.round(list.reduce((n, t) => n + dur(t), 0) / 1000);
+        return (
+          <div key={pid || "none"} className="id-group">
+            <div className="id-group-head">
+              <strong>{pid ? name(pid) : "Not linked to a player"}</strong>
+              <span className="muted">
+                {list.length} crops · {secs} s on camera
+              </span>
+              {pid &&
+                target(pid, (to) => onMove(list.map((t) => t.id), to,
+                  to ? `Merged ${name(pid)} into ${name(to)}` : `${name(pid)} marked as not a player`),
+                  "Merge whole player into…")}
+            </div>
+            <div className="id-grid">
+              {shown.map((t) => (
+                <figure key={t.id} className="id-tile" title={`${t.track_key} · cam ${t.camera_label} · ${(dur(t) / 1000).toFixed(1)} s`}>
+                  {t.thumb_url ? <img src={t.thumb_url} alt="" loading="lazy" /> : <div className="id-noimg">{t.track_key}</div>}
+                  <figcaption>
+                    {formatMatchClock(t.start_ms)} · {(dur(t) / 1000).toFixed(0)}s
+                    {target(pid, (to) => onMove([t.id], to, to ? `Moved crop to ${name(to)}` : "Crop marked as not a player"), "Move…")}
+                  </figcaption>
+                </figure>
+              ))}
+            </div>
+            {list.length > shown.length && (
+              <button type="button" onClick={() => setShowAll({ ...showAll, [pid]: true })}>
+                Show all {list.length}
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 
@@ -809,37 +977,37 @@ function TeamStatsPanel({
   names: Record<string, string>;
 }) {
   if (!teams.length) return null;
+  const label = (t: (typeof teams)[number], i: number) =>
+    (t.team_id && names[t.team_id]) || (t.team_id ? `Team ${i + 1}` : "Unassigned");
   return (
     <section className="panel">
       <h2>Team stats</h2>
-      <table className="bc-table">
-        <thead>
-          <tr>
-            <th>Team</th>
-            <th className="num" title="Share of ball-control time (estimated)">Possession</th>
-            <th className="num">Goals</th>
-            <th className="num" title="Estimated">Shots</th>
-            <th className="num" title="Estimated">Passes</th>
-            <th className="num" title="Estimated">Dribbles</th>
-            <th className="num">Assists</th>
-            <th className="num">Players</th>
-          </tr>
-        </thead>
-        <tbody>
-          {teams.map((t, i) => (
-            <tr key={t.team_id ?? i}>
-              <td>{(t.team_id && names[t.team_id]) || (t.team_id ? `Team ${i + 1}` : "Unassigned")}</td>
-              <td className="num">{(t.possession_pct ?? 0).toFixed(0)}%</td>
-              <td className="num">{t.goal}</td>
-              <td className="num">{t.shot}</td>
-              <td className="num">{t.pass}</td>
-              <td className="num">{t.dribble}</td>
-              <td className="num">{t.assist}</td>
-              <td className="num">{t.players}</td>
+      <div className="table-scroll">
+        <table className="bc-table">
+          <thead>
+            <tr>
+              <th>Stat</th>
+              {teams.map((t, i) => (
+                <th key={t.team_id ?? i} className="num">
+                  {label(t, i)}
+                </th>
+              ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {TEAM_STAT_ROWS.map(([name, value, hint]) => (
+              <tr key={name}>
+                <td title={hint}>{name}</td>
+                {teams.map((t, i) => (
+                  <td key={t.team_id ?? i} className="num">
+                    {value(t)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
@@ -1127,6 +1295,29 @@ function MatchPage() {
         <>
           <RunStatsPanel stats={runStats} />
           <TeamStatsPanel teams={stats?.by_team ?? []} names={teamNames} />
+          {(stats?.pass_network ?? []).length > 0 && (
+            <section className="panel">
+              <h2>Passing combinations</h2>
+              <table className="bc-table">
+                <thead>
+                  <tr>
+                    <th>From</th>
+                    <th>To</th>
+                    <th className="num">Passes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(stats?.pass_network ?? []).slice(0, 10).map((e) => (
+                    <tr key={`${e.from}-${e.to}`}>
+                      <td>{playerName(e.from)}</td>
+                      <td>{playerName(e.to)}</td>
+                      <td className="num">{e.passes}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
           <div className="bc-layout">
             <section className="bc-board">
               <div className="bc-board-head">
@@ -1154,6 +1345,13 @@ function MatchPage() {
                         <th className="num" title="Dribbles">D</th>
                         <th className="num" title="Passes">P</th>
                         <th className="num" title="Passes received">Rec</th>
+                <th className="num" title="Pass accuracy: completed ÷ (completed + intercepted)">P%</th>
+                <th className="num" title="Shots on target">SoT</th>
+                <th className="num" title="Interceptions (ball won)">Int</th>
+                <th className="num" title="Balls lost to the other team">Lost</th>
+                <th className="num" title="Keeper saves">Sv</th>
+                <th className="num" title="Fouls committed">F</th>
+                <th className="num" title="Yellow / red cards">Cards</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1204,6 +1402,15 @@ function MatchPage() {
                             <td className="num">{row.dribble ?? 0}</td>
                             <td className="num">{row.pass}</td>
                             <td className="num">{row.pass_received ?? 0}</td>
+                  <td className="num">{pctOr(row.pass_accuracy_pct)}</td>
+                  <td className="num">{row.shot_on_target ?? 0}</td>
+                  <td className="num">{row.interception ?? 0}</td>
+                  <td className="num">{row.ball_lost ?? 0}</td>
+                  <td className="num">{row.save ?? 0}</td>
+                  <td className="num">{row.foul ?? 0}</td>
+                  <td className="num">
+                    {(row.yellow_card ?? 0) + (row.red_card ?? 0) > 0 ? `${row.yellow_card ?? 0}Y ${row.red_card ?? 0}R` : "–"}
+                  </td>
                           </tr>
                         );
                       })}
@@ -1229,6 +1436,7 @@ function MatchPage() {
               </div>
               <AddEventForm
                 players={players}
+                teams={Object.entries(teamNames).map(([id, name]) => ({ id, name }))}
                 onAdd={async (body) => {
                   await api.createEvent(facilityId, matchId, body);
                   setMessage(`Added ${body.event_type} at ${formatMatchClock(body.canonical_ts_ms)}`);
@@ -1600,41 +1808,16 @@ function MatchPage() {
               ))}
             </ul>
           </section>
-          <section className="panel">
-            <h2>Tracks & identity</h2>
-            <p className="lede">Reassign a camera track to another player when auto-ID is wrong.</p>
-            <ul className="list compact">
-              {tracks
-                .filter((t) => t.class_name !== "sports_ball")
-                .slice(0, 40)
-                .map((t) => (
-                  <li key={t.id} className="inline" style={{ justifyContent: "space-between" }}>
-                    <span>
-                      {t.track_key} · cam {t.camera_label} · {t.identity?.state || "none"} ·{" "}
-                      {playerName(t.identity?.player_id || null)}
-                    </span>
-                    <select
-                      defaultValue={t.identity?.player_id || ""}
-                      onChange={async (e) => {
-                        const val = e.target.value || null;
-                        await api.setTrackIdentity(facilityId, matchId, t.id, val);
-                        setMessage("Identity updated");
-                        setTracks(await api.listTracks(facilityId, matchId));
-                        setStats(await api.getStats(facilityId, matchId));
-                      }}
-                    >
-                      <option value="">Unknown</option>
-                      {players.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          #{p.default_shirt_number ?? "—"} {p.display_name}
-                        </option>
-                      ))}
-                    </select>
-            </li>
-                ))}
-          </ul>
-            {!tracks.length && <p className="bc-empty">No tracks yet — process a match first.</p>}
-          </section>
+          <IdentityBoard
+            tracks={tracks}
+            players={players}
+            onMove={async (trackIds, playerId, note) => {
+              await api.setTrackIdentities(facilityId, matchId, trackIds, playerId);
+              setMessage(note);
+              setTracks(await api.listTracks(facilityId, matchId));
+              setStats(await api.getStats(facilityId, matchId));
+            }}
+          />
         </>
       )}
 
@@ -1793,6 +1976,7 @@ function PublicReportPage() {
       </section>
 
       <div className="bc-layout">
+        <TeamStatsPanel teams={data.by_team ?? []} names={{}} />
         <section className="bc-board">
           <div className="bc-board-head">
                 <h2>Squad board</h2>
@@ -1817,6 +2001,13 @@ function PublicReportPage() {
                 <th className="num" title="Dribbles">D</th>
                 <th className="num" title="Passes">P</th>
                 <th className="num" title="Passes received">Rec</th>
+                <th className="num" title="Pass accuracy: completed ÷ (completed + intercepted)">P%</th>
+                <th className="num" title="Shots on target">SoT</th>
+                <th className="num" title="Interceptions (ball won)">Int</th>
+                <th className="num" title="Balls lost to the other team">Lost</th>
+                <th className="num" title="Keeper saves">Sv</th>
+                <th className="num" title="Fouls committed">F</th>
+                <th className="num" title="Yellow / red cards">Cards</th>
               </tr>
             </thead>
             <tbody>
@@ -1855,6 +2046,15 @@ function PublicReportPage() {
                   <td className="num">{row.dribble ?? 0}</td>
                   <td className="num">{row.pass}</td>
                   <td className="num">{row.pass_received ?? 0}</td>
+                  <td className="num">{pctOr(row.pass_accuracy_pct)}</td>
+                  <td className="num">{row.shot_on_target ?? 0}</td>
+                  <td className="num">{row.interception ?? 0}</td>
+                  <td className="num">{row.ball_lost ?? 0}</td>
+                  <td className="num">{row.save ?? 0}</td>
+                  <td className="num">{row.foul ?? 0}</td>
+                  <td className="num">
+                    {(row.yellow_card ?? 0) + (row.red_card ?? 0) > 0 ? `${row.yellow_card ?? 0}Y ${row.red_card ?? 0}R` : "–"}
+                  </td>
                 </tr>
               ))}
             </tbody>

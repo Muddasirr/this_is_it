@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     default_retention_days: int = 30
 
     # Vision / Phase 0
-    vision_backend: str = "yolo"  # yolo | stub | modal (GPU on Modal, app.services.modal_backend)
+    vision_backend: str = "yolo"  # yolo | stub | kaggle (free GPU, kaggle_backend) | modal (modal_backend)
     # General COCO detector: Kaggle corpus run (5 futsal videos) found 4–80× more players
     # per frame than the football fine-tune (yolov5x_football.pt), which misses futsal players.
     yolo_model: str = "yolov8m.pt"
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     vision_reid_model: str = "osnet_x0_25"
     vision_reid_every: int = 3  # embed every N processed frames (cost control)
     vision_thumb_dir: str = ""  # player crops; "" = <tmp>/courtlens_thumbs
-    court_format: str = "5v5"  # 5v5 | 6v6 | 7v7
+    court_format: str = "5v5"  # 5v5 | 6v6 | 7v7 (futsal) | 11v11 (football)
     allow_single_camera: bool = True  # pilot: Camera A only; production courts add B–D
     # Pipeline knobs (batch runs on Kaggle skip review-only work)
     min_video_duration_s: int = 60  # 30 for DFL 30 s eval clips

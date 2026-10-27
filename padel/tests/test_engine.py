@@ -88,6 +88,13 @@ def test_rally_grouping_splits_on_gap_and_cut():
     assert [x.hits for x in r] == [[0, 1, 2], [3, 4], [5]]
 
 
+def test_dead_ball_touches_are_not_rallies():
+    r = R.Rally(0, 0, 10, hits=[0, 1, 2])
+    assert R.dead_ball(r, [0, 0, 0])  # one pair knocking the ball back to the server
+    assert not R.dead_ball(r, [0, 1, 0])  # an exchange is a point
+    assert not R.dead_ball(R.Rally(0, 0, 10, hits=[0, 1, 2, 3]), [1, 1, 1, 1])  # long one-team runs: keep
+
+
 def test_analyze_report_shape(calib):
     det, _ = synthetic_detections(calib, n=300)
     rep = pipeline.analyze(det, calib)

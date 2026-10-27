@@ -370,6 +370,7 @@ def run_stats(
         "model", "device", "tracker", "imgsz", "frames_processed", "frame_stride", "processing_fps", "realtime_factor",
         "video_seconds_probed", "person_tracks", "referee_tracks", "person_boxes", "ball_detections",
         "ball_coverage_pct", "reid_tracks", "jersey_ocr_tracks", "thumbs_written", "fallback_model",
+        "backend", "kaggle_round_trip_s", "kaggle_phases_s", "kaggle_error",
     )
     cameras = []
     for v in detect.get("vision_stats") or []:

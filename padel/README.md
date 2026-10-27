@@ -6,7 +6,22 @@ Independent of the futsal product in the parent repo: separate package, database
 
 Docs: [docs/RESEARCH.md](docs/RESEARCH.md) (methods, datasets, prior art) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (pipeline, stats, API) · [docs/ROADMAP.md](docs/ROADMAP.md) (features and gates) · [docs/EVAL.md](docs/EVAL.md) (measured results).
 
-## Run it
+## Deploy (production)
+
+```bash
+cd padel
+export KAGGLE_API_KEY_LSECOND=...      # Kaggle account that runs the GPU analysis jobs
+export PADEL_API_TOKEN=$(openssl rand -hex 16)   # optional: require an access token
+docker compose up -d --build           # -> http://<host>:8010  (health: /api/health)
+```
+
+The container serves the web app + API and stores the database and uploaded matches in the `padel_data` volume. Every analysis runs on the Kaggle GPU (`padel-infer` kernel, models mounted from the training kernels): upload → `padel-jobs` dataset → GPU → `report.json`. A 25-minute match takes roughly 40–60 min end to end, mostly upload + GPU time. Jobs interrupted by a restart are marked failed and can be re-run from the UI; Kaggle calls retry with backoff and GPU jobs stop after `PADEL_KAGGLE_TIMEOUT_S` (default 9 h; Kaggle's own limit is 12 h).
+
+Put it behind HTTPS (any reverse proxy) when exposed; set `PADEL_CORS` to the public origin.
+
+Exports per match: `/api/matches/{id}/export/{shots|players|pairs|rallies}.csv` and the full report JSON (buttons on the report page).
+
+## Run it (development)
 
 ```bash
 cd padel
@@ -30,10 +45,14 @@ Environment variables:
 | `PADEL_POSE_STRIDE` | 2 | run player pose every n frames |
 | `PADEL_MAX_FRAMES` | 0 | cap frames per analysis (0 = all) |
 | `PADEL_DATA_DIR` | `data/app` | DB and uploaded matches |
+| `PADEL_API_TOKEN` | – | when set, every `/api` call needs `Authorization: Bearer <token>` (the web app asks once) |
+| `PADEL_KAGGLE_TIMEOUT_S` | 32400 | stop waiting for a Kaggle GPU job after this many seconds |
+| `PADEL_CORS` | localhost:5175 | allowed browser origins |
 
-Models live in `models/` (gitignored):
-- `ball.pt` and `pose.pt` are the detectors trained on Kaggle.
-- `hit_lgbm.txt` and `shot_lgbm.txt` are the hit and stroke classifiers.
+Models (trained on Kaggle; `models/` is only needed for `PADEL_BACKEND=local`):
+- `ball.pt` (ball_v2: PT100 + Roboflow venues), `pose.pt` (players + keypoints)
+- `audio_hit.pt` (racket-impact sound CRNN) + `hit_lgbm.txt` (audio + video hit model, modality dropout)
+- `stroke_rgb.pt` (clip model on the hitter crop) + `shot_lgbm.txt` (pose / context stroke model)
 
 Without trained detectors the app falls back to stock YOLO11 (COCO sports-ball + yolo11m-pose); without the classifiers it uses rule-based scores.
 

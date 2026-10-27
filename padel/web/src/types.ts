@@ -49,6 +49,18 @@ export interface PlayerStats {
   volleys: number
   overheads: number
   avg_shot_speed_kmh: number | null
+  padel_types?: Record<string, number>
+  serves?: number
+  serve_side?: Record<string, number>
+  returns?: number
+  shots_by_zone?: Record<string, number>
+  direction?: Record<string, number>
+  depth?: Record<string, number>
+  last_shot_of_rally?: number
+  rally_participation_pct?: number
+  net_approaches?: number
+  distance_in_play_m?: number
+  work_rate_m_per_min?: number | null
 }
 
 export interface Player {
@@ -63,7 +75,7 @@ export interface Team {
   id: number
   name: string
   players: number[]
-  stats: Record<string, number | null>
+  stats: Record<string, number | null | Record<string, number>>
 }
 
 export interface Shot {
@@ -83,6 +95,8 @@ export interface Shot {
   ball_px: Pt | null
   label: 'estimated' | 'confirmed'
   deleted?: boolean
+  padel_type?: string | null
+  padel_type_conf?: number
 }
 
 export interface Rally {
@@ -111,6 +125,11 @@ export interface Report {
     hits: number
     type_mix: Record<string, number>
     rallies_confirmed?: number
+    time_in_play_s?: number
+    time_in_play_pct?: number
+    shots_per_min_in_play?: number | null
+    rally_length_distribution?: Record<string, number>
+    direction_mix?: Record<string, number>
   }
   players: Player[]
   teams: Team[]

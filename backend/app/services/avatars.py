@@ -95,6 +95,41 @@ def attach_player_avatars(db: Session, match: Match, tracks: list[PlayerTrack]) 
     return updated
 
 
+def upload_track_thumbs(db: Session, match: Match, tracks: list[PlayerTrack]) -> int:
+    """One crop per person track → storage (features["thumb_key"]), for the staff identity board.
+
+    The crops are written on the worker's disk; the API (and staff) can only see what is uploaded.
+    """
+    uploaded = 0
+    for track in tracks:
+        feats = dict(track.features or {})
+        path_str = feats.get("thumb_path")
+        if feats.get("class", "person") != "person" or not path_str or not Path(path_str).is_file():
+            continue
+        key = f"thumbs/{match.id}/{track.id}.jpg"
+        try:
+            upload_file(Path(path_str), key, content_type="image/jpeg")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Track thumb upload failed for %s: %s", track.id, exc)
+            continue
+        feats["thumb_key"] = key
+        track.features = feats  # reassign: JSONB changes are not tracked in place
+        uploaded += 1
+    if uploaded:
+        db.commit()
+    return uploaded
+
+
+def thumb_url_for(track: PlayerTrack) -> str | None:
+    key = (track.features or {}).get("thumb_key")
+    if not key:
+        return None
+    try:
+        return presign_download(key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def avatar_url_for(player: Player | None) -> str | None:
     if not player or not player.avatar_key:
         return None

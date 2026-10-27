@@ -251,7 +251,7 @@ class YoloTrackBackend(VisionBackend):
                             bw = max(1.0, xyxy[2] - xyxy[0])
                             bh = max(1.0, xyxy[3] - xyxy[1])
                             thumb_score = bw * bh * conf
-                            if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= 28 and bh >= 40:
+                            if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= THUMB_MIN_W and bh >= THUMB_MIN_H:
                                 x1 = max(0, int(xyxy[0]))
                                 y1 = max(0, int(xyxy[1]))
                                 x2 = min(frame.shape[1], int(xyxy[2]))
@@ -293,7 +293,7 @@ class YoloTrackBackend(VisionBackend):
                         bw = max(1.0, xyxy[2] - xyxy[0])
                         bh = max(1.0, xyxy[3] - xyxy[1])
                         thumb_score = bw * bh * conf
-                        if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= 28 and bh >= 40:
+                        if thumb_score > best_thumbs.get(tid, (0.0, ""))[0] and bw >= THUMB_MIN_W and bh >= THUMB_MIN_H:
                             x1 = max(0, int(xyxy[0]))
                             y1 = max(0, int(xyxy[1]))
                             x2 = min(frame.shape[1], int(xyxy[2]))
@@ -674,7 +674,23 @@ def _crop_semantics(best_thumbs: dict, person_tracks: dict, device: str) -> dict
     imgs = [cv2.imread(str(best_thumbs[tid][1])) for tid in tids]
     from app.services.role_filter import crop_semantics
 
-    return {tid: sem for tid, sem in zip(tids, crop_semantics(imgs, device)) if sem}
+    out = {}
+    for tid, img, sem in zip(tids, imgs, crop_semantics(imgs, device)):
+        if not sem:
+            continue
+        if img is None or img.shape[0] < ROLE_MIN_H:
+            sem = {k: v for k, v in sem.items() if k != "role_score"}
+        out[tid] = sem
+    return out
+
+
+# Smallest box worth a crop (kit colour, avatar). 28 x 40 suited futsal; football panorama players
+# are ~16-28 px wide (SoccerTrack GT 21x54, 16x44), and at 28 px 61 % of their tracks got no crop,
+# hence no kit — identity linked 14 of 756 tracks.
+THUMB_MIN_W, THUMB_MIN_H = 12, 30
+# Below this crop height the zero-shot player-vs-bystander score is noise (mean 0.01 on the
+# panorama): keep the colour profile, drop the role score so the filter never acts on it.
+ROLE_MIN_H = 60
 
 
 STATIC_SAMPLES = 30

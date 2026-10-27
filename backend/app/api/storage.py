@@ -1,3 +1,5 @@
+import mimetypes
+
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 
@@ -36,4 +38,6 @@ def local_download(
     path = local_path(key)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+    # Clips are mp4; avatars and identity-board crops are jpg
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=path.name)

@@ -57,7 +57,8 @@ KERNELS = {
         "code_file": "padel_infer.py",
         "enable_gpu": True,
         "kernel_sources": [f"{USER}/padel-gpu-train", f"{USER}/padel-gpu-pose", f"{USER}/padel-stroke-rgb",
-                           f"{USER}/padel-eval", f"{USER}/padel-venues"],  # padel-eval sorts first: its *_lgbm win
+                           f"{USER}/padel-eval", f"{USER}/padel-venues", f"{USER}/padel-fusion",
+                           f"{USER}/padel-audio"],
         "dataset_sources": [f"{USER}/padel-code", f"{USER}/padel-jobs"],
     },
     "eval": {
@@ -75,20 +76,56 @@ KERNELS = {
         "kernel_sources": [f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-train", f"{USER}/padel-gpu-pose"],
         "dataset_sources": [f"{USER}/padel-code"],
     },
+    "decorte": {
+        "slug": "padel-decorte-prep",
+        "code_file": "padel_decorte_prep.py",
+        "enable_gpu": False,
+        "kernel_sources": [],
+    },
+    "audio": {
+        "slug": "padel-audio",
+        "code_file": "padel_audio.py",
+        "enable_gpu": True,
+        "kernel_sources": [f"{USER}/padel-decorte-prep", f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-pose",
+                           f"{USER}/padel-venues"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
+    "fusion": {
+        "slug": "padel-fusion",
+        "code_file": "padel_fusion.py",
+        "enable_gpu": True,
+        "kernel_sources": [f"{USER}/padel-audio", f"{USER}/padel-decorte-prep", f"{USER}/padel-pt100-prep",
+                           f"{USER}/padel-gpu-pose", f"{USER}/padel-venues"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
+    "hitter": {
+        "slug": "padel-hitter",
+        "code_file": "padel_hitter.py",
+        "enable_gpu": False,
+        "kernel_sources": [f"{USER}/padel-audio", f"{USER}/padel-decorte-prep", f"{USER}/padel-pt100-prep"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
+    "rallytest": {
+        "slug": "padel-rallytest",
+        "code_file": "padel_rallytest.py",
+        "enable_gpu": False,
+        "kernel_sources": [f"{USER}/padel-audio", f"{USER}/padel-decorte-prep", f"{USER}/padel-pt100-prep"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
 }
 CODE_DATASET = "padel-code"
 JOBS_DATASET = "padel-jobs"
 
 
 def padel_env() -> dict[str, str]:
-    token = None
-    for line in REPO_ENV.read_text().splitlines():
+    token = next((os.environ[k] for k in KEY_NAMES if os.environ.get(k)), None)
+    for line in (REPO_ENV.read_text().splitlines() if REPO_ENV.exists() and not token else []):
         k, _, v = line.partition("=")
         if k.strip() in KEY_NAMES and v.strip():
             token = v.strip()
     if not token:
         sys.exit(f"no {KEY_NAMES[0]} in {REPO_ENV}")
-    cfg = ROOT / ".kaggle_cfg"
+    cfg = Path(os.environ.get("PADEL_KAGGLE_CFG", ROOT / ".kaggle_cfg"))
     cfg.mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update(KAGGLE_API_TOKEN=token, KAGGLE_CONFIG_DIR=str(cfg))
@@ -132,6 +169,8 @@ def push_code() -> int:
         shutil.copytree(pkg / d, out / d, ignore=ignore)
     (out / "kaggle" / "gpu").mkdir(parents=True)
     shutil.copy(ROOT / "gpu" / "padel_gpu.py", out / "kaggle" / "gpu" / "padel_gpu.py")
+    (out / "kaggle" / "audio").mkdir(parents=True)
+    shutil.copy(ROOT / "audio" / "padel_audio.py", out / "kaggle" / "audio" / "padel_audio.py")
     links = ROOT / "venues" / "roboflow_links.json"
     if links.exists():
         (out / "kaggle" / "venues").mkdir(parents=True)
@@ -160,6 +199,13 @@ def dataset_ready(name: str) -> bool:
     r = subprocess.run(["kaggle", "datasets", "status", f"{USER}/{name}"], env=padel_env(), capture_output=True,
                        text=True)
     return "ready" in r.stdout
+
+
+def dataset_has_file(name: str, filename: str) -> bool:
+    """True once the dataset's *current* version lists filename ("ready" can still describe the old version)."""
+    r = subprocess.run(["kaggle", "datasets", "files", f"{USER}/{name}", "--page-size", "200"], env=padel_env(),
+                       capture_output=True, text=True)
+    return filename in r.stdout
 
 
 def kernel_status(name: str) -> str:
@@ -206,7 +252,7 @@ def main() -> None:
     if cmd == "status":
         sys.exit(kaggle("kernels", "status", f"{USER}/{KERNELS[rest[0]]['slug']}"))
     if cmd == "output":
-        download_output(rest[0], rest[1])
+        download_output(rest[0], rest[1], rest[2] if len(rest) > 2 else None)
         return
     if cmd == "dataset":
         sys.exit(push_folder_dataset(rest[0], Path(rest[1])))

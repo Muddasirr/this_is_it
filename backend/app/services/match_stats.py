@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.models import EventParticipant, Match, MatchEvent, Player, PlayerTrack, TrackIdentityLink
 from app.models.entities import ConfirmationState, EventType
 from app.services.court_calib import mapper, track_motion
+from app.services.court_format import half_ms
 from app.services.possession import TrackIndex
 
 HEAT_W = 32
@@ -124,12 +125,16 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             },
         )
 
+    futsal_events: list[dict[str, Any]] = []  # input to futsal_event_stats
     for e in events:
         et = _event_type_value(e.event_type)
         if et in totals and e.confirmation != ConfirmationState.rejected:
             totals[et] += 1
         totals[e.confirmation.value] = totals.get(e.confirmation.value, 0) + 1
         parts = db.query(EventParticipant).filter(EventParticipant.event_id == e.id).all()
+        if e.confirmation != ConfirmationState.rejected:
+            futsal_events.append({"type": et, "ts_ms": e.canonical_ts_ms, "provenance": e.provenance or {},
+                                  "participants": [(str(p.player_id), p.role) for p in parts if p.player_id]})
         for p in parts:
             if not p.player_id or e.confirmation == ConfirmationState.rejected:
                 continue
@@ -260,10 +265,16 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             }
         )
 
+    team_of = {r["player_id"]: r["team_id"] for r in player_rows}
+    player_extra, team_extra = futsal_event_stats(futsal_events, team_of)
+    for r in player_rows:
+        r.update(player_extra.get(r["player_id"], _empty_player_extra()))
+        r["pass_accuracy_pct"] = _pct(r["pass"], r["pass"] + r["pass_failed"])
     player_rows.sort(
         key=lambda x: (-x["possession_pct"], -(x["pass"] + x["shot"] * 3 + x["goal"] * 10))
     )
-    by_team = _aggregate_teams(player_rows)
+    by_team = _aggregate_teams(player_rows, team_extra)
+    totals.update({k: sum(t.get(k, 0) for t in team_extra.values()) for k in TEAM_EVENT_KEYS})
 
     return {
         "totals": {
@@ -274,6 +285,7 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
         },
         "by_player": player_rows,
         "by_team": by_team,
+        "pass_network": pass_network(futsal_events),
         "heatmap": {
             "width": HEAT_W,
             "height": HEAT_H,
@@ -301,6 +313,15 @@ def build_match_stats(db: Session, match_id: UUID) -> dict[str, Any]:
             "assist": "Pass immediately preceding a goal in the possession chain (estimated)",
             "pass_received": "Completed passes where this player was the receiver",
             "conversion_pct": "Goals per shot × 100 (None if no shots)",
+            "shot_on_target": "Shots followed by a goal or a keeper save within 4 s, or marked on target by staff; every goal counts as one",
+            "pass_accuracy_pct": "Completed passes ÷ (completed + passes intercepted by the other team) × 100",
+            "interception": "Ball won from the other team (a pass of theirs received, or staff-tagged)",
+            "ball_lost": "Ball given to the other team (pass intercepted, or staff-tagged)",
+            "save": "Goalkeeper saves (staff-tagged)",
+            "foul": "Fouls committed (staff-tagged); team accumulated fouls per half — from the 6th, a 10 m kick",
+            "yellow_card": "Yellow cards (staff-tagged)",
+            "red_card": "Red cards (staff-tagged)",
+            "score": "Goals + opponent own goals",
         },
     }
 
@@ -317,30 +338,127 @@ def _conversion_pct(goals: int, shots: int) -> float | None:
     return round(100.0 * float(goals) / float(shots), 1)
 
 
-def _aggregate_teams(player_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+PLAYER_EVENT_KEYS = ("shot_on_target", "interception", "ball_lost", "pass_failed", "save", "foul",
+                     "yellow_card", "red_card", "own_goal")
+TEAM_EVENT_KEYS = ("corner", "kick_in", "free_kick", "penalty", "own_goal_for", "foul")
+ON_TARGET_WINDOW_MS = 4000
+
+
+def _empty_player_extra() -> dict[str, int]:
+    return {k: 0 for k in PLAYER_EVENT_KEYS}
+
+
+def _pct(part: float, whole: float) -> float | None:
+    return round(100.0 * part / whole, 1) if whole > 0 else None
+
+
+def futsal_event_stats(
+    events: list[dict[str, Any]], team_of: dict[str, str | None]
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
+    """Per-player and per-team futsal counts from non-rejected canonical events.
+
+    events: [{type, ts_ms, provenance, participants: [(player_id, role)]}]. A team-level event
+    (corner, kick-in …) counts for the team of its player, else provenance["team_id"].
+    """
+    players: dict[str, dict[str, int]] = defaultdict(_empty_player_extra)
+    teams: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {**{k: 0 for k in TEAM_EVENT_KEYS}, "fouls_by_half": [0, 0]})
+    finishers = sorted(e["ts_ms"] for e in events if e["type"] in ("goal", "save"))
+    shot_ts = sorted(e["ts_ms"] for e in events if e["type"] == "shot")
+
+    def team_for(e: dict[str, Any]) -> str | None:
+        for pid, _role in e["participants"]:
+            if team_of.get(pid):
+                return team_of[pid]
+        return (e.get("provenance") or {}).get("team_id")
+
+    for e in events:
+        et, prov, ts = e["type"], e.get("provenance") or {}, e["ts_ms"]
+        roles = {role: pid for pid, role in e["participants"]}
+        first = e["participants"][0][0] if e["participants"] else None
+        if et == "shot":
+            shooter = roles.get("shooter") or roles.get("primary") or first
+            on_target = prov.get("on_target")
+            if on_target is None:
+                on_target = any(0 <= f - ts <= ON_TARGET_WINDOW_MS for f in finishers)
+            if shooter and on_target:
+                players[shooter]["shot_on_target"] += 1
+        elif et == "goal":
+            scorer = roles.get("scorer") or roles.get("primary") or first
+            # A goal with no shot event just before it is its own shot on target
+            if scorer and not any(0 <= ts - s_ <= ON_TARGET_WINDOW_MS for s_ in shot_ts):
+                players[scorer]["shot_on_target"] += 1
+        elif et == "interception":
+            if roles.get("won_by") or roles.get("primary"):
+                players[roles.get("won_by") or roles["primary"]]["interception"] += 1
+            if roles.get("lost_by"):
+                players[roles["lost_by"]]["ball_lost"] += 1
+                if prov.get("from_pass"):
+                    players[roles["lost_by"]]["pass_failed"] += 1
+        elif et in ("save", "foul", "yellow_card", "red_card", "own_goal") and first:
+            players[roles.get("goalkeeper") or roles.get("scorer") or first][et] += 1
+        team = team_for(e)
+        if team is None:
+            continue
+        if et in ("corner", "kick_in", "free_kick", "penalty"):
+            teams[team][et] += 1
+        elif et == "foul":
+            teams[team]["foul"] += 1
+            teams[team]["fouls_by_half"][min(1, ts // half_ms())] += 1
+        elif et == "own_goal":
+            teams[team]["own_goal_against"] = teams[team].get("own_goal_against", 0) + 1
+    # An own goal counts for the other team (two-team matches)
+    named = [t for t in set(team_of.values()) | set(teams) if t]
+    for t, row in list(teams.items()):
+        against = row.pop("own_goal_against", 0)
+        others = [o for o in named if o != t]
+        if against and len(others) == 1:
+            teams[others[0]]["own_goal_for"] += against
+    return dict(players), dict(teams)
+
+
+def pass_network(events: list[dict[str, Any]], top: int = 15) -> list[dict[str, Any]]:
+    """Most frequent completed passer → receiver pairs: [{from, to, passes}]."""
+    pairs: dict[tuple[str, str], int] = defaultdict(int)
+    for e in events:
+        if e["type"] != "pass":
+            continue
+        roles = {role: pid for pid, role in e["participants"]}
+        if roles.get("passer") and roles.get("receiver") and roles["passer"] != roles["receiver"]:
+            pairs[(roles["passer"], roles["receiver"])] += 1
+    ranked = sorted(pairs.items(), key=lambda kv: -kv[1])[:top]
+    return [{"from": a, "to": b, "passes": n} for (a, b), n in ranked]
+
+
+def _aggregate_teams(player_rows: list[dict[str, Any]],
+                     team_extra: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    team_extra = team_extra or {}
+    summed = ("goal", "shot", "pass", "assist", "dribble", "pass_received", "touches", *PLAYER_EVENT_KEYS)
     teams: dict[str, dict[str, Any]] = {}
     for r in player_rows:
         tid = r.get("team_id") or "unknown"
         t = teams.setdefault(
             tid,
-            {
-                "team_id": None if tid == "unknown" else tid,
-                "goal": 0,
-                "shot": 0,
-                "pass": 0,
-                "assist": 0,
-                "dribble": 0,
-                "pass_received": 0,
-                "touches": 0,
-                "possession_pct": 0.0,
-                "players": 0,
-            },
+            {"team_id": None if tid == "unknown" else tid, **{k: 0 for k in summed},
+             "possession_pct": 0.0, "players": 0},
         )
-        for k in ("goal", "shot", "pass", "assist", "dribble", "pass_received", "touches"):
+        for k in summed:
             t[k] += int(r.get(k) or 0)
         t["possession_pct"] = round(t["possession_pct"] + float(r.get("possession_pct") or 0), 1)
         t["players"] += 1
-    return sorted(teams.values(), key=lambda x: (-x["goal"], -x["possession_pct"]))
+    for tid, extra in team_extra.items():  # team-level events of a team with no tracked players
+        teams.setdefault(tid, {"team_id": tid, **{k: 0 for k in summed}, "possession_pct": 0.0, "players": 0})
+    for tid, t in teams.items():
+        extra = team_extra.get(tid, {})
+        for k in ("corner", "kick_in", "free_kick", "penalty", "own_goal_for"):
+            t[k] = int(extra.get(k, 0))
+        # Fouls: player-tagged fouls are in t["foul"]; add team-only ones (no player named)
+        t["fouls_by_half"] = extra.get("fouls_by_half", [0, 0])
+        t["foul"] = max(t["foul"], int(extra.get("foul", 0)))
+        t["score"] = t["goal"] + t["own_goal_for"]
+        t["pass_accuracy_pct"] = _pct(t["pass"], t["pass"] + t["pass_failed"])
+        t["conversion_pct"] = _conversion_pct(t["goal"], t["shot"])
+    return sorted(teams.values(), key=lambda x: (-x["score"], -x["possession_pct"]))
 
 
 def _event_type_value(et: EventType) -> str:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from .events import Hit
 
 MAX_GAP_S = 4.0  # cross-checked on PT100: rally count within 10 % on both finals (docs/EVAL.md §3)
+DEAD_BALL_MAX_SHOTS = 3
 
 
 @dataclass
@@ -40,6 +41,13 @@ def group(hits: list[Hit], fps: float, n_frames: int, segments: list[tuple[int, 
         r.start = max(a, r.start - pad_pre)
         r.end = min(b - 1, r.end + pad_post)
     return rallies
+
+
+def dead_ball(rally: Rally, team_of: list[int], max_shots: int = DEAD_BALL_MAX_SHOTS) -> bool:
+    """Between points players knock the ball back to the server: a few touches by one pair, no exchange.
+    A real point (even an ace or a double fault) is rarely that, and counting these inflated rallies by ~40 %
+    on an unseen broadcast match (docs/EVAL.md §7); the labelled PT100 final loses none."""
+    return len(rally.hits) <= max_shots and len({team_of[i] for i in rally.hits}) == 1
 
 
 def _segment_lookup(segments: list[tuple[int, int]]):

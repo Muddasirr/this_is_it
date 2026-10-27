@@ -1,0 +1,10 @@
+.venv
+data
+models
+web/node_modules
+web/dist
+kaggle/.kaggle_cfg
+kaggle/.code_bundle
+**/__pycache__
+*.mp4
+*.pt

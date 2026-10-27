@@ -74,6 +74,7 @@ def shared_match_report(share_token: str, db: Session = Depends(get_db)) -> dict
         "totals": stats["totals"],
         "by_player": players,
         "by_team": stats.get("by_team") or [],
+        "pass_network": stats.get("pass_network") or [],
         "heatmap": {
             "width": stats["heatmap"]["width"],
             "height": stats["heatmap"]["height"],

@@ -51,7 +51,7 @@ services:
       YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
       VISION_TARGET_FPS: "10"
-      COURT_FORMAT: "5v5"
+      COURT_FORMAT: ${COURT_FORMAT:-5v5}  # 11v11 = football
       ALLOW_SINGLE_CAMERA: "true"
     ports:
       - "8001:8000"
@@ -81,20 +81,22 @@ services:
       LOCAL_STORAGE_PATH: /data/videos
       API_PUBLIC_URL: http://localhost:8001
       JWT_SECRET: dev-change-me
-      # yolo = local (CPU here). modal = detect/track on a Modal GPU (falls back to local yolo);
-      # Modal paused 2026-10-25 (credits) — set VISION_BACKEND=modal to use it again.
-      VISION_BACKEND: ${VISION_BACKEND:-yolo}
-      # Learned event spotter: T-DEED fine-tuned on hand-labelled futsal (EVAL.md: pass F1 0.44 → 0.55,
-      # shots 0/7 → 3/7 on unseen footage). GPU only; on this CPU worker the heuristics run instead.
+      # kaggle = detect/track + futsal event spotter on a free Kaggle T4 (30 GPU-h/week), falls
+      # back to local yolo on any failure. yolo = local CPU only. modal = paused 2026-10-25 (credits).
+      VISION_BACKEND: ${VISION_BACKEND:-kaggle}
+      # Learned event spotter: T-DEED fine-tuned on hand-labelled futsal, runs on the Kaggle GPU (the
+      # CPU fallback uses the heuristics). Thresholds + 1 s NMS from the held-out 5:00–7:10 window:
+      # pass F1 0.60; shots precision 0.67, recall 2/7 (EVAL.md).
       TDEED_REPO: /app/data/third_party/tdeed
       TDEED_WEIGHTS: /app/models/tdeed_futsal.pt
-      TDEED_THRESHOLDS: '{"pass": 0.4, "shot": 0.15, "dribble": 0.3}'
+      TDEED_WEIGHTS_FOOTBALL: /app/models/tdeed_soccertrack.pt  # COURT_FORMAT=11v11
+      TDEED_THRESHOLDS: '{"pass": 0.35, "shot": 0.5, "dribble": 0.3}'
       YOLO_MODEL: yolov8m.pt
       VISION_DEVICE: cpu
       VISION_TARGET_FPS: "10"
       VISION_MAX_FRAMES: "0"
       VISION_JERSEY_OCR: "1"
-      COURT_FORMAT: "5v5"
+      COURT_FORMAT: ${COURT_FORMAT:-5v5}  # 11v11 = football
       ALLOW_SINGLE_CAMERA: "true"
     volumes:
       - ./backend:/app
@@ -104,6 +106,7 @@ services:
       - ./yolov8n.pt:/app/yolov8n.pt:ro
       - ./yolov8n_futsal.pt:/app/yolov8n_futsal.pt:ro
       - ${HOME}/.modal.toml:/root/.modal.toml:ro  # Modal CLI token (modal token new)
+      - ${HOME}/.kaggle:/root/.kaggle:ro  # Kaggle API credentials (VISION_BACKEND=kaggle)
     depends_on:
       db:
         condition: service_healthy

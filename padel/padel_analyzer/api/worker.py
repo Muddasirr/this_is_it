@@ -12,7 +12,7 @@ from ..engine import court as C
 from ..engine import pipeline
 from ..engine.detect import Detector
 from . import db
-from .settings import BACKEND, DATA_DIR, DEVICE, MATCH_DIR, MAX_FRAMES, POSE_STRIDE
+from .settings import BACKEND, DATA_DIR, DEVICE, KAGGLE_JOB_TIMEOUT_S, MATCH_DIR, MAX_FRAMES, POSE_STRIDE
 
 log = logging.getLogger("padel.worker")
 _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="padel-job")
@@ -40,6 +40,31 @@ def _update(match_id: str, **fields) -> None:
             for k, v in fields.items():
                 setattr(m, k, v)
             s.commit()
+
+
+def recover_interrupted() -> None:
+    """Jobs cannot survive a server restart (the worker is in-process): mark them failed, re-run from the UI."""
+    with db.Session() as s:
+        for m in s.query(db.Match).filter(db.Match.status.in_(("queued", "processing"))).all():
+            m.status, m.stage = "failed", None
+            m.error = "Interrupted by a server restart — press Re-run."
+        s.commit()
+
+
+def _retry(fn, what: str, tries: int = 4, wait_s: float = 20.0):
+    import time
+
+    for i in range(tries):
+        try:
+            rc = fn()
+            if rc in (0, None, True):
+                return rc
+            err = f"exit code {rc}"
+        except Exception as exc:  # noqa: BLE001 - network hiccups to Kaggle are common
+            err = str(exc)
+        log.warning("%s failed (%s), attempt %d/%d", what, err, i + 1, tries)
+        time.sleep(wait_s * (i + 1))
+    raise RuntimeError(f"{what} failed after {tries} attempts: {err}")
 
 
 def submit(match_id: str) -> None:
@@ -86,14 +111,19 @@ def _run_on_kaggle(match_id: str, video: Path, calib: C.Calibration, folder: Pat
     import sys
     import time
 
+    import importlib
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "kaggle"))
     import kaggle_cli as K
+
+    K = importlib.reload(K)  # kernel sources / model locations change between jobs; never use a stale copy
 
     job_dir = DATA_DIR / "kaggle_job"
     if job_dir.exists():
         shutil.rmtree(job_dir)
     job_dir.mkdir(parents=True)
-    vname = f"{match_id}{video.suffix or '.mp4'}"
+    # unique per run: the "is the new dataset version live" check below keys on this name
+    vname = f"{match_id}_{int(time.time())}{video.suffix or '.mp4'}"
     try:
         os.link(video, job_dir / vname)  # no copy
     except OSError:
@@ -101,27 +131,48 @@ def _run_on_kaggle(match_id: str, video: Path, calib: C.Calibration, folder: Pat
     (job_dir / "job.json").write_text(json.dumps([{"match_id": match_id, "video": vname,
                                                    "calibration": calib.to_dict(), "max_frames": MAX_FRAMES}]))
     progress("upload", 0.0)
-    if K.push_jobs(job_dir) != 0:
-        raise RuntimeError("Kaggle dataset upload failed")
-    for _ in range(240):  # dataset processing
-        if K.dataset_ready(K.JOBS_DATASET):
-            break
+    _retry(lambda: K.push_jobs(job_dir), "Kaggle dataset upload")
+    # wait until the new dataset version (with this match's video) is live: starting the GPU job earlier
+    # mounts the previous version and silently analyses the previous match
+    for _ in range(240):
+        try:
+            if K.dataset_ready(K.JOBS_DATASET) and K.dataset_has_file(K.JOBS_DATASET, vname):
+                break
+        except Exception:  # noqa: BLE001
+            pass
         time.sleep(15)
+    else:
+        raise RuntimeError("Kaggle never published the uploaded video (dataset version not ready after 60 min)")
     progress("queued_gpu", 0.0)
-    if K.kaggle("kernels", "push", "-p", str(K.write_metadata("infer"))) != 0:
-        raise RuntimeError("Kaggle kernel push failed")
+    _retry(lambda: K.kaggle("kernels", "push", "-p", str(K.write_metadata("infer"))), "Kaggle kernel push")
     t0 = time.time()
     time.sleep(30)
+    import cv2
+
+    cap = cv2.VideoCapture(str(video))
+    expected_s = max(600.0, 1.6 * (cap.get(cv2.CAP_PROP_FRAME_COUNT) / (cap.get(cv2.CAP_PROP_FPS) or 30.0)))
+    cap.release()
+    st = "unknown"
+    started = False  # right after a push Kaggle may still report the *previous* run as complete
     while True:
-        st = K.kernel_status("infer")
-        if st in ("complete", "error", "cancel"):
+        try:
+            st = K.kernel_status("infer")
+        except Exception:  # noqa: BLE001 - keep polling through network hiccups
+            st = "unknown"
+        if st in ("queued", "running"):
+            started = True
+        if st in ("complete", "error", "cancel") and (started or time.time() - t0 > 1800):
             break
-        # rough progress: a 30 fps match takes ~ duration x 1.5 on a T4
-        progress("gpu", min(0.95, (time.time() - t0) / 3600))
+        if time.time() - t0 > KAGGLE_JOB_TIMEOUT_S:
+            raise RuntimeError(f"Kaggle GPU job exceeded {KAGGLE_JOB_TIMEOUT_S / 3600:.1f} h")
+        # GPU time is ~1.5x the match duration on a T4 (detection + audio + stroke clips)
+        progress("gpu", min(0.97, (time.time() - t0) / expected_s))
         time.sleep(30)
     progress("download", 0.0)
     out = folder / "kaggle_out"
-    K.download_output("infer", str(out), pattern=match_id)
+    if out.exists():
+        shutil.rmtree(out)  # a stale report from an earlier run must never be picked up
+    _retry(lambda: K.download_output("infer", str(out), pattern=match_id), "Kaggle output download")
     rep = next(out.rglob("report.json"), None)
     if rep is None:
         err = next(out.rglob("error.txt"), None)

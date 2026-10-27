@@ -12,6 +12,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_user, require_facility_member
 from app.models import FacilityUser, Match, Player, PlayerTrack, TrackIdentityLink, User
 from app.models.entities import IdentityState, MatchStatus
+from app.services.avatars import thumb_url_for
 from app.services.identity import set_track_identity
 
 router = APIRouter()
@@ -26,6 +27,7 @@ class TrackOut(BaseModel):
     confidence: float | None
     class_name: str | None
     identity: dict | None
+    thumb_url: str | None = None  # a crop of this track (staff identity board)
 
     model_config = {"from_attributes": True}
 
@@ -33,6 +35,14 @@ class TrackOut(BaseModel):
 class IdentityUpdate(BaseModel):
     player_id: UUID | None = None
     state: IdentityState = IdentityState.confirmed
+
+
+class BulkIdentityUpdate(BaseModel):
+    """Move several tracks at once: merge a player into another (all its tracks), or mark crops
+    as "not a player" (player_id null — referee, coach, crowd)."""
+
+    track_ids: list[UUID]
+    player_id: UUID | None = None
 
 
 def _match(db: Session, facility_id: UUID, match_id: UUID) -> Match:
@@ -78,6 +88,7 @@ def list_tracks(
                 confidence=t.confidence,
                 class_name=(t.features or {}).get("class"),
                 identity=identity,
+                thumb_url=thumb_url_for(t),
             )
         )
     return out
@@ -109,3 +120,25 @@ def update_identity(
         "state": link.state.value,
         "source": link.source,
     }
+
+
+@router.put("/{match_id}/tracks/identity", response_model=dict)
+def update_identities(
+    facility_id: UUID,
+    match_id: UUID,
+    payload: BulkIdentityUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    _: FacilityUser = Depends(require_facility_member),
+) -> dict:
+    _match(db, facility_id, match_id)
+    if payload.player_id:
+        player = db.get(Player, payload.player_id)
+        if not player or player.facility_id != facility_id:
+            raise HTTPException(status_code=400, detail="Player not in facility")
+    tracks = db.query(PlayerTrack).filter(PlayerTrack.id.in_(payload.track_ids), PlayerTrack.match_id == match_id).all()
+    if len(tracks) != len(set(payload.track_ids)):
+        raise HTTPException(status_code=404, detail="Track not found in this match")
+    for t in tracks:
+        set_track_identity(db, t.id, payload.player_id, user.id)
+    return {"updated": len(tracks), "player_id": str(payload.player_id) if payload.player_id else None}

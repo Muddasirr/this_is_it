@@ -4,26 +4,41 @@
 """
 from __future__ import annotations
 
+import csv
+import hmac
+import io
 import json
 import re
 import shutil
 from pathlib import Path
 
 import cv2
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..engine import court as C
 from ..engine.shots import CLASSES
 from . import db, worker
-from .settings import CORS, MATCH_DIR, WEB_DIST
+from .settings import API_TOKEN, CORS, MATCH_DIR, WEB_DIST
 
-app = FastAPI(title="PadelLens", version="0.1")
+app = FastAPI(title="PadelLens", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=CORS, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    path = request.url.path
+    if API_TOKEN and path.startswith("/api/") and path != "/api/health":
+        auth = request.headers.get("authorization", "")
+        given = auth[7:] if auth.lower().startswith("bearer ") else request.query_params.get("token", "")
+        if not hmac.compare_digest(given.encode(), API_TOKEN.encode()):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 db.init()
+worker.recover_interrupted()
 
 
 def _match(s, match_id: str) -> db.Match:
@@ -191,6 +206,57 @@ def analyze(match_id: str) -> dict:
             raise HTTPException(409, "already running")
     worker.submit(match_id)
     return get_match(match_id)
+
+
+def _report(match_id: str) -> dict:
+    with db.Session() as s:
+        review = _match(s, match_id).review or {}
+    path = MATCH_DIR / match_id / "report.json"
+    if not path.exists():
+        raise HTTPException(404, "no report yet")
+    return merge_review(json.loads(path.read_text()), review)
+
+
+def _flat(d: dict, prefix: str = "") -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(_flat(v, f"{prefix}{k}."))
+        elif isinstance(v, list):
+            out[prefix + k] = json.dumps(v)
+        else:
+            out[prefix + k] = v
+    return out
+
+
+@app.get("/api/matches/{match_id}/export/{table}.csv")
+def export_csv(match_id: str, table: str) -> Response:
+    """Spreadsheet exports: shots, players, pairs, rallies."""
+    rep = _report(match_id)
+    names = [p["name"] for p in rep["players"]]
+    if table == "shots":
+        rows = [{"time_s": s["t"], "rally": s["rally"] + 1, "player": names[s["player"]],
+                 "team": rep["teams"][s["team"]]["name"], **{k: v for k, v in _flat(s).items()
+                 if k not in ("t", "rally", "player", "team", "frame", "type_probs", "ball_px")}}
+                for s in rep["shots"] if not s.get("deleted")]
+    elif table == "players":
+        rows = [{"player": p["name"], "team": rep["teams"][p["team"]]["name"], **_flat(p["stats"])} for p in rep["players"]]
+    elif table == "pairs":
+        rows = [{"team": t["name"], "players": " & ".join(names[i] for i in t["players"]), **_flat(t["stats"])}
+                for t in rep["teams"]]
+    elif table == "rallies":
+        rows = [{**{k: v for k, v in r.items() if k != "shots"},
+                 "last_player": names[r["last_player"]] if r.get("last_player") is not None else None}
+                for r in rep["rallies"]]
+    else:
+        raise HTTPException(404, "unknown table (shots, players, pairs, rallies)")
+    buf = io.StringIO()
+    cols = list(dict.fromkeys(k for r in rows for k in r))
+    w = csv.DictWriter(buf, fieldnames=cols)
+    w.writeheader()
+    w.writerows(rows)
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="padel_{match_id}_{table}.csv"'})
 
 
 @app.get("/api/matches/{match_id}/report")

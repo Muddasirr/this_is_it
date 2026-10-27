@@ -640,8 +640,21 @@ def _dedupe(candidates: list[EventCandidate]) -> list[EventCandidate]:
 
 
 # How far around a spotted event to look for the player in possession
+SPOT_NMS_MS = 1000
 SPOT_HOLDER_BEFORE_MS = 1500
 SPOT_RECEIVER_AFTER_MS = 4000
+
+
+def _spot_nms(spotted: list[dict[str, Any]], window_ms: int | None = None) -> list[dict[str, Any]]:
+    """Temporal non-maximum suppression per event type: the spotter fires 2–3 times on one action
+    (e.g. shots at 25.0 s and 25.6 s); keep the most confident within ±window_ms.
+    Futsal held-out 5:00–7:10: pass F1 0.53 → 0.60, shot precision 0.13 → 0.67 (with thresholds)."""
+    window_ms = SPOT_NMS_MS if window_ms is None else window_ms
+    kept: list[dict[str, Any]] = []
+    for e in sorted(spotted, key=lambda e: -float(e["confidence"])):
+        if all(k["event_type"] != e["event_type"] or abs(int(k["ts_ms"]) - int(e["ts_ms"])) > window_ms for k in kept):
+            kept.append(e)
+    return kept
 
 
 def events_from_spotting(
@@ -664,10 +677,12 @@ def events_from_spotting(
                 best, idx = h, i
         return best, idx
 
-    from app.services.action_spotting import THRESHOLDS
+    from app.services.action_spotting import thresholds
+
+    THRESHOLDS = thresholds()
 
     out: list[EventCandidate] = []
-    for e in sorted(spotted, key=lambda e: e["ts_ms"]):
+    for e in sorted(_spot_nms(spotted), key=lambda e: e["ts_ms"]):
         ts, kind = int(e["ts_ms"]), e["event_type"]
         if float(e["confidence"]) < THRESHOLDS.get(kind, 0.3):
             continue
