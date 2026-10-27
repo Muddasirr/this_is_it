@@ -194,8 +194,12 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
                     for f in range(0, det.n, step)],
     }
     from . import advanced as ADV
+    from . import points as PTS
 
-    ADV.shot_context(shots, rally_out)
+    ADV.shot_context(shots, rally_out, tracks.pos_m)
+    if PTS.PointModel.available() and rally_out:
+        X = point_features(rally_out, shots, bt, tracks.pos_m, calib, fps, det.n, slot_tracks.segments)
+        PTS.assign_winners(rally_out, shots, X, PTS.PointModel())
     extra, in_play = ADV.match_extra(rally_out, shots, det.n / fps, fps, det.n)
     match.update(extra)
     for pl in players:
@@ -203,8 +207,24 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
     for tm in teams:
         a, b = tm["players"]
         tm["stats"].update(ADV.pair_extra(tracks.pos_m[:, a], tracks.pos_m[:, b], shots, rally_out, tm["id"], fps))
-    return {"match": match, "players": players, "teams": teams, "rallies": rally_out, "shots": shots,
-            "quality": quality, "replay": replay, "calibration": calib.to_dict()}
+    rep = {"match": match, "players": players, "teams": teams, "rallies": rally_out, "shots": shots,
+           "quality": quality, "replay": replay, "calibration": calib.to_dict()}
+    ADV.outcome_stats(rep)
+    return rep
+
+
+def point_features(rally_out: list[dict], shots: list[dict], bt, pos_m: np.ndarray, calib: C.Calibration,
+                   fps: float, n: int, segments: list[tuple[int, int]]) -> np.ndarray:
+    from . import points as PTS
+
+    seg_end = [b for _, b in segments]
+    rows = []
+    for k, r in enumerate(rally_out):
+        f = shots[r["shots"][-1]]["frame"] if r["shots"] else 0
+        end = next((b for b in seg_end if b > f), n)
+        nxt = shots[rally_out[k + 1]["shots"][0]]["frame"] if k + 1 < len(rally_out) and rally_out[k + 1]["shots"] else None
+        rows.append(PTS.rally_features(r, shots, bt.xy, pos_m, calib, fps, end, nxt))
+    return np.array(rows).reshape(len(rows), len(PTS.FEATURES))
 
 
 def run(video: str | Path, calib: C.Calibration, detector: Detector | Callable[[], Detector] | None = None,

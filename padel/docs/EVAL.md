@@ -168,3 +168,30 @@ Kernel `padel-rallytest` (CPU). Each of the 99 Decorte clips (11 WPT 2023 tourna
 - Splitting long rallies is a small error (+2 % from the gap rule itself, +6 % with detected hits): one true 4.3 s gap, one false scene cut, the rest from missed hits leaving > 4 s gaps.
 - The dead-ball rule removes 4 of the 6 spurious rallies and wrongly deletes one real 4-hit point (VIGO_16: its detected hits were all credited to one team).
 - What this test cannot measure: touches *between* points (the clips are cut to the point), which is the main surplus on full broadcasts (§7). That still needs labelled point boundaries on a full match.
+
+
+## 9. Point labels from broadcast scoreboards: point winner, pair identity, rally count (2026-10-28)
+
+No public padel dataset labels who won each point, so labels come from the on-screen score. `padel-scoreboard` reads the score bug of both PadelTracker100 finals with EasyOCR (serve dot by colour); a change of exactly one point gives the winner and the server: **75 points (women's final) + 90 (men's)**, spot-checked by eye against the crops (golden point at 40-40, WPT 2022). The Kuwait 2025 clip (§7) was read by eye: 24 points, advantage scoring (`data/eval/kuwait_points.json`).
+
+**Rally count against real points (Kuwait):** 25 points in the clip (24 complete + 1 in play at the end). With the dead-ball rule: **27 rallies, 23 of 24 points matched by exactly one rally, none missed** (before the rule: 35 rallies, 19 of 24).
+
+**Point winner** (`padel-points`, model `engine/points.py`: P(the last hitter's pair won) from the last shot, the ball after it and the opponents' reaction; LightGBM, trained on two matches, tested on the third):
+
+| Test match | Points | Accuracy | Always guessing the more common outcome |
+| --- | --- | --- | --- |
+| PT100 women's final | 57 | **75 %** | 58 % |
+| PT100 men's final | 70 | **71 %** | 59 % |
+| Kuwait 2025 (unseen tournament) | 24 | **62 %** | 58 % |
+| all | 151 | **72 %** | 58 % |
+
+The last hitter's pair won only 42 % of points in all three matches (errors end more points than winners). Strongest cues: where the ball was last seen after the final shot (own vs opponent half), whether it was a smash, the hitter's distance from the net. The model fills in an *estimated* winner per rally (with its confidence) and the point totals / winners / errors; **games, breaks and the set score are only built from winners confirmed in review**, because a game score replayed from 72 %-correct points is usually wrong. Unit-tested score replay (advantage or golden point, tiebreak at 6-6, serve order); fed the true Kuwait winners it reproduces the scoreboard's games and servers.
+
+**Pair identity across changes of ends** (which pair plays the far end, per segment, against the scoreboard serve dot + where the serve was hit):
+
+| | Women's final | Men's final |
+| --- | --- | --- |
+| current linking (shirt colours, segment by segment) | **52 / 52** | **43 / 61** (70 %) |
+| tried: joint orientation over all segments | 32 / 52 | 37 / 61 |
+
+The joint version was worse and was not kept. In the men's final and Kuwait the two pairs' shirts are similar enough that identity is lost after some changes of ends → per-player and per-pair totals over a whole match can mix the pairs there; **side-relative stats (per rally, per shot) are unaffected**. Next fix: use the padel rule that ends change only after odd games, once the game structure is known.

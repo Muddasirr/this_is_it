@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from ..engine import advanced as ADV
 from ..engine import court as C
 from ..engine.shots import CLASSES
 from . import db, worker
@@ -318,6 +319,7 @@ def merge_review(rep: dict, review: dict) -> dict:
         i = int(k)
         if i < len(rep["rallies"]) and "winner_team" in v:
             rep["rallies"][i]["winner_team"] = v["winner_team"]
+            rep["rallies"][i]["winner_source"] = "confirmed"
     live = [s for s in rep["shots"] if not s.get("deleted")]
     for p in rep["players"]:
         mine = [s for s in live if s["player"] == p["id"]]
@@ -328,7 +330,8 @@ def merge_review(rep: dict, review: dict) -> dict:
         t["stats"]["rallies_won"] = sum(1 for r in rep["rallies"] if r.get("winner_team") == t["id"])
     rep["match"]["hits"] = len(live)
     rep["match"]["type_mix"] = {c: sum(1 for s in live if s["type"] == c) for c in CLASSES}
-    rep["match"]["rallies_confirmed"] = sum(1 for r in rep["rallies"] if r.get("winner_team") is not None)
+    rep["match"]["rallies_confirmed"] = sum(1 for r in rep["rallies"] if r.get("winner_source") == "confirmed")
+    ADV.outcome_stats(rep)
     return rep
 
 

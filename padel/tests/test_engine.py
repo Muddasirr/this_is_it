@@ -105,3 +105,24 @@ def test_analyze_report_shape(calib):
         assert abs(sum(p["stats"]["zone_pct"].values()) - 100) < 0.5
     assert rep["quality"]["players_tracked_pct"] > 95
     assert len(rep["replay"]["players"]) == 50
+
+
+def test_outcome_stats_replays_padel_scoring():
+    from padel_analyzer.engine import advanced as ADV
+
+    # game 1: team 0 serves, wins 4-0; game 2: team 1 serves, 3-3 then 0 wins two (advantage) -> break
+    winners = [0, 0, 0, 0] + [1, 0, 1, 0, 1, 0, 0, 0]
+    servers = [0] * 4 + [1] * 8
+    shots, rallies = [], []
+    for i, (w, s) in enumerate(zip(winners, servers)):
+        shots += [{"player": 2 * s, "team": s}, {"player": 2 * (1 - s), "team": 1 - s}]
+        rallies.append({"id": i, "shots": [2 * i, 2 * i + 1], "winner_team": w, "winner_source": "confirmed"})
+    rep = {"shots": shots, "rallies": rallies, "match": {},
+           "players": [{"id": p, "team": 0 if p < 2 else 1, "stats": {}} for p in range(4)],
+           "teams": [{"id": t, "stats": {}} for t in (0, 1)]}
+    ADV.outcome_stats(rep)
+    assert rep["match"]["score"]["sets"] == [[2, 0]]
+    assert [g["server_team"] for g in rep["match"]["games"]] == [0, 1]
+    assert rep["teams"][0]["stats"]["breaks"] == 1 and rep["teams"][0]["stats"]["service_games_held"] == 1
+    assert rep["teams"][0]["stats"]["points_won"] == 9
+    assert rep["teams"][0]["stats"]["serve_points_won_pct"] == 100.0

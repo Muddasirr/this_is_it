@@ -74,6 +74,9 @@ def main() -> None:
         "stroke_rgb.pt": "/kaggle/input/**/stroke_rgb.pt",
         # shot_types.pt (padelcnn detector) is NOT loaded: zero detections on PT100 broadcast or club footage (EVAL §5)
         "audio_hit.pt": "/kaggle/input/**/padel-audio/out/models/audio_hit.pt",
+        # point winner (scoreboard-labelled PT100 finals + Kuwait 2025; EVAL §9)
+        "point_lgbm.txt": "/kaggle/input/**/padel-points/out/models/point_lgbm.txt",
+        "point_lgbm.json": "/kaggle/input/**/padel-points/out/models/point_lgbm.json",
     }
     for name, pat in wanted.items():
         src = next((p for p in map(first, pat if isinstance(pat, list) else [pat]) if p), None)

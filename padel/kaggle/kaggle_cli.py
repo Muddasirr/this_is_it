@@ -58,7 +58,7 @@ KERNELS = {
         "enable_gpu": True,
         "kernel_sources": [f"{USER}/padel-gpu-train", f"{USER}/padel-gpu-pose", f"{USER}/padel-stroke-rgb",
                            f"{USER}/padel-eval", f"{USER}/padel-venues", f"{USER}/padel-fusion",
-                           f"{USER}/padel-audio"],
+                           f"{USER}/padel-audio", f"{USER}/padel-points"],
         "dataset_sources": [f"{USER}/padel-code", f"{USER}/padel-jobs"],
     },
     "eval": {
@@ -111,6 +111,29 @@ KERNELS = {
         "enable_gpu": False,
         "kernel_sources": [f"{USER}/padel-audio", f"{USER}/padel-decorte-prep", f"{USER}/padel-pt100-prep"],
         "dataset_sources": [f"{USER}/padel-code"],
+    },
+    "scoreboard": {
+        "slug": "padel-scoreboard",
+        "code_file": "padel_scoreboard.py",
+        "enable_gpu": True,
+        "kernel_sources": [f"{USER}/padel-pt100-prep"],
+    },
+    "points": {
+        "slug": "padel-points",
+        "code_file": "padel_points.py",
+        "enable_gpu": True,
+        "kernel_sources": [f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-train", f"{USER}/padel-gpu-pose",
+                           f"{USER}/padel-stroke-rgb", f"{USER}/padel-eval", f"{USER}/padel-fusion",
+                           f"{USER}/padel-scoreboard"],
+        "dataset_sources": [f"{USER}/padel-code", f"{USER}/padel-kuwait-small"],
+    },
+    "tests": {
+        "slug": "padel-tests",
+        "code_file": "padel_tests.py",
+        "enable_gpu": False,
+        "kernel_sources": [],
+        "dataset_sources": [f"{USER}/padel-code"],
+        "dir": "testsk",
     },
 }
 CODE_DATASET = "padel-code"

@@ -9,6 +9,7 @@ model's boxes to the labelled ones (IoU ≥ 0.5). Per model:
   referee_as_ref  labelled referees found *as referee* (kept out of the teams)
   referee_leak    labelled referees found as a player/person box (they would join a team)
   ball_recall     labelled balls found
+  player_as_ref   labelled players/keepers detected as referee (would be dropped from the teams)
 """
 
 from __future__ import annotations
@@ -122,6 +123,7 @@ def main() -> None:
                         s[f"{key}_total"] += 1
                         if role in ("player", "goalkeeper"):
                             s["player_found"] += int(hit in PERSON)
+                            s["player_as_ref"] += int(hit == "referee")
                         elif role == "referee":
                             s["referee_as_ref"] += int(hit == "referee")
                             s["referee_leak"] += int(hit in PERSON)
@@ -139,6 +141,7 @@ def main() -> None:
             "referee_as_ref": round(s["referee_as_ref"] / max(1, s["referee_total"]), 3),
             "referee_leak": round(s["referee_leak"] / max(1, s["referee_total"]), 3),
             "ball_recall": round(s["ball_found"] / max(1, s["ball_total"]), 3),
+            "player_as_ref": round(s["player_as_ref"] / max(1, players), 3),
             "counts": dict(s),
         }
     print(json.dumps(report, indent=1))

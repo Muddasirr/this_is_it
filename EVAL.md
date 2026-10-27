@@ -193,8 +193,23 @@ on another venue that calibration is wrong and the court filter then drops real 
 labelled throw-ins show open play at every candidate offset). `scripts/eval/score_dfl.py` is ready
 for a contiguous labelled video (SoccerNet once `SOCCERNET_PASSWORD` is set).
 
-Still wrong on broadcast: referees / linesmen / bench staff join the two teams (COCO model has no
-referee class; the football detector that has one is not on the Kaggle models dataset yet).
+Referees joining the teams (COCO has no referee class) — detector A/B on SoccerNet GSR broadcast
+(public, per-box roles; 6 sequences × 8 frames, `scripts/eval/bench_gsr_roles.py`):
+
+| | yolov8m COCO @1280 | football fine-tune @1280 | football fine-tune @640 |
+|---|---|---|---|
+| Players/keepers found | **92.7 %** | 58.9 % | 90.1 % |
+| Referees detected as referee | 0 % | 35 % | **47.5 %** |
+| Referees found as a player (join a team) | 80 % | 29 % | 35 % |
+| Ball | 41.7 % | 8.3 % | 10.4 % |
+
+→ `COURT_FORMAT=11v11` on broadcast-size frames (≤ 1920 px wide) now detects people with the
+football fine-tune at 640 (`YOLO_MODEL_FOOTBALL`, on the Kaggle models dataset) and keeps the COCO
+model for the full-size ball pass. A track's class is now a vote over all its frames (referee when ≥ 20 % and ≥ 2
+frames say so; the detector calls a player a referee in only 0.1 % of boxes) instead of its first
+frame — replayed on GSR's labelled tracks (3 sequences, every 10th frame): referee tracks kept out
+of the teams 3/8 → **6/8**, players wrongly removed 0/63 → 0/63. Wider panoramas (SoccerTrack) keep COCO at 1920. Not yet re-run
+end to end on a full broadcast match (needs a contiguous one — SoccerNet).
 
 Reliability fix from this run: a worker restart mid-job used to strand the GPU result and leave the
 job `running` forever. The bridge now records each pushed job (`KAGGLE_STATE_DIR`) and a re-run of

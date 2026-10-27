@@ -61,6 +61,13 @@ export interface PlayerStats {
   net_approaches?: number
   distance_in_play_m?: number
   work_rate_m_per_min?: number | null
+  lobs?: number
+  off_wall?: number
+  overhead_kind?: Record<string, number>
+  winners?: number
+  errors?: number
+  points_served?: number
+  serve_points_won?: number
 }
 
 export interface Player {
@@ -97,6 +104,9 @@ export interface Shot {
   deleted?: boolean
   padel_type?: string | null
   padel_type_conf?: number
+  lob?: boolean
+  off_wall?: boolean
+  overhead_kind?: string
 }
 
 export interface Rally {
@@ -110,6 +120,8 @@ export interface Rally {
   last_player: number | null
   last_team: number | null
   winner_team: number | null
+  winner_source?: 'estimated' | 'confirmed'
+  winner_conf?: number
 }
 
 export interface Report {
@@ -125,6 +137,11 @@ export interface Report {
     hits: number
     type_mix: Record<string, number>
     rallies_confirmed?: number
+    points_decided?: number
+    outcome_label?: 'estimated' | 'confirmed' | null
+    score?: { sets: number[][]; current_game: string | null }
+    games?: { points: number[]; game_winner: number; server_team: number; breaks: boolean; tiebreak: boolean }[]
+    games_won?: number[]
     time_in_play_s?: number
     time_in_play_pct?: number
     shots_per_min_in_play?: number | null

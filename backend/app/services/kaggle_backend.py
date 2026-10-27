@@ -41,7 +41,7 @@ MAX_WAIT_S = 6 * 3600
 STATE_DIR = Path(os.environ.get("KAGGLE_STATE_DIR", "/data/videos/.kaggle_jobs"))
 # Settings forwarded to the GPU run so it behaves like a local run (plus the spotter config)
 FORWARD_ENV = ("YOLO_MODEL", "VISION_TARGET_FPS", "VISION_FRAME_STRIDE", "VISION_CONF", "VISION_IMGSZ",
-               "VISION_IMGSZ_MAX", "VISION_MAX_FRAMES", "VISION_TRACKER", "VISION_GMC", "VISION_REID",
+               "VISION_IMGSZ_MAX", "VISION_MAX_FRAMES", "VISION_IMGSZ_FOOTBALL", "VISION_FOOTBALL_MAX_W", "VISION_TRACKER", "VISION_GMC", "VISION_REID",
                "VISION_TEAM_EMBED", "VISION_ROLE_FILTER", "VISION_JERSEY_OCR", "COURT_FORMAT", "TDEED_THRESHOLDS")
 TDEED_COMMIT = "d953b4de8a2ad941c565e1683c5b07255cbe644e"
 
@@ -66,7 +66,10 @@ if not (work / "tdeed").exists():
                     f"git -C {work}/tdeed checkout -q {job['tdeed_commit']}", shell=True)
 weights = next(iter(Path("/kaggle/input").rglob("tdeed_futsal.pt")), None)
 football = next(iter(Path("/kaggle/input").rglob("tdeed_soccertrack.pt")), None)  # used when COURT_FORMAT=11v11
+detector = next(iter(Path("/kaggle/input").rglob("yolov5x_football.pt")), None)  # 11v11 people + referees
 os.environ.update(job["env"])
+if detector is not None:
+    os.environ.update(YOLO_MODEL_FOOTBALL=str(detector))
 os.environ.update(VISION_DEVICE="0", VISION_BACKEND="yolo", VISION_THUMB_DIR=str(work / "thumbs"), FFMPEG="ffmpeg")
 if weights is not None and (work / "tdeed").exists():
     os.environ.update(TDEED_REPO=str(work / "tdeed"), TDEED_WEIGHTS=str(weights))

@@ -63,6 +63,11 @@ export default function ReportPage({ id }: { id: string }) {
       </div>
 
       <div className="grid4">
+        {m.score && m.points_decided ? (
+          <Tile label={`Score${m.outcome_label === 'confirmed' ? '' : ' (est.)'}`}
+            value={m.score.sets.map((g: number[]) => g.join('-')).join('  ')}
+            sub={`${m.score.current_game ? `game ${m.score.current_game} · ` : ''}${m.points_decided} points`} />
+        ) : null}
         <Tile label="Rallies" value={m.rallies} sub={m.rallies_confirmed ? `${m.rallies_confirmed} with winner set` : undefined} />
         <Tile label="Shots" value={m.hits} />
         <Tile label="Avg rally" value={m.avg_rally_shots ?? '–'} sub={m.avg_rally_s ? `shots · ${m.avg_rally_s} s` : 'shots'} />
@@ -122,7 +127,10 @@ export default function ReportPage({ id }: { id: string }) {
                     ['Distance (pair)', `${t.stats.distance_m ?? '–'} m`],
                     ['Shots', t.stats.shots],
                     ['Hit the last shot of a rally', t.stats.last_shot_in_rallies],
-                    ['Rallies won (confirmed)', t.stats.rallies_won ?? 0],
+                    ['Points won (est. unless confirmed)', t.stats.points_won != null ? `${t.stats.points_won} (${t.stats.points_won_pct ?? '–'} %)` : '–'],
+                    ['Games won · held · breaks', `${t.stats.games_won ?? 0} · ${t.stats.service_games_held ?? 0} · ${t.stats.breaks ?? 0}`],
+                    ['Serve / return points won', `${t.stats.serve_points_won_pct ?? '–'} % / ${t.stats.return_points_won_pct ?? '–'} %`],
+                    ['Winners / errors', `${t.stats.winners ?? 0} / ${t.stats.errors ?? 0}`],
                     ...pairExtra(t.stats),
                   ].map(([k, v]) => (
                     <tr key={String(k)}><td className="secondary">{k as React.ReactNode}</td><td className="num" style={{ textAlign: "right" }}>{v as React.ReactNode}</td></tr>
@@ -315,6 +323,11 @@ function PlayerCard({ p, onRename }: { p: Player; onRename: (name: string) => vo
               ['Returns', s.returns],
               ['Shots from net / transition / back', `${s.shots_by_zone?.net ?? 0} / ${s.shots_by_zone?.transition ?? 0} / ${s.shots_by_zone?.back ?? 0}`],
               ['Shot depth deep / mid / short', `${s.depth?.deep ?? 0} / ${s.depth?.mid ?? 0} / ${s.depth?.short ?? 0}`],
+              ['Winners / errors', `${s.winners ?? 0} / ${s.errors ?? 0}`],
+              ['Serve points won', s.points_served ? `${s.serve_points_won ?? 0} of ${s.points_served}` : '–'],
+              ['Smashes / bandejas & víboras', `${s.overhead_kind?.smash ?? 0} / ${s.overhead_kind?.['bandeja/víbora'] ?? 0}`],
+              ['Lobs', s.lobs ?? 0],
+              ['Off the back glass', s.off_wall ?? 0],
               ['Last shot of a rally', s.last_shot_of_rally],
               ['Rallies involved', `${s.rally_participation_pct ?? 0}%`],
               ['Net approaches', s.net_approaches],
@@ -373,6 +386,7 @@ function Rallies({ rep, names, seek, review }: {
                   <option value="">–</option>
                   {rep.teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>
+                {r.winner_source === 'estimated' && <span className="small muted"> est. {Math.round((r.winner_conf ?? 0) * 100)}%</span>}
               </td>
             </tr>
           ))}

@@ -22,8 +22,12 @@ def _side_of_court(x: float, far: bool) -> str:
     return "left" if left else "right"
 
 
-def shot_context(shots: list[dict], rallies: list[dict]) -> None:
-    """Annotate shots in place: serve side, return, direction, depth, zone (each estimated)."""
+BACK_GLASS_M = 9.0  # contact this far from the net (≤ 1 m from the back glass): ball played off the wall
+
+
+def shot_context(shots: list[dict], rallies: list[dict], player_pos: np.ndarray | None = None) -> None:
+    """Annotate shots in place: serve side, return, direction, depth, zone, lob, off the wall, overhead kind
+    (each estimated). player_pos: (n_frames, 4, 2) player floor positions, needed for the lob tag."""
     for r in rallies:
         idx = [i for i in r["shots"] if not shots[i].get("deleted")]
         for j, i in enumerate(idx):
@@ -47,6 +51,18 @@ def shot_context(shots: list[dict], rallies: list[dict]) -> None:
                     # opposite ends of the court: the same x-half is down the line, the other is crosscourt
                     s["direction"] = "down the line" if same_x_half else "crosscourt"
                 s["depth"] = "deep" if C.zone(q[1]) == 2 else ("mid" if C.zone(q[1]) == 1 else "short")
+            if pos:
+                s["off_wall"] = abs(pos[1] - C.NET_Y) >= BACK_GLASS_M and j > 0
+            if s.get("overhead") or s["type"] == "smash":
+                # at the net it is a put-away (remate); from further back the controlled overheads (bandeja / víbora)
+                s["overhead_kind"] = "smash" if s.get("zone") == "net" else "bandeja/víbora"
+            # lob: both opponents at the net when it is hit and the reply comes from behind the service line
+            if player_pos is not None and nxt and nxt["team"] != s["team"] and nxt.get("pos_m") and j > 0:
+                opp = [2, 3] if s["team"] == 0 else [0, 1]
+                f = min(s["frame"], len(player_pos) - 1)
+                oy = player_pos[f, opp, 1]
+                if not np.isnan(oy).any() and (C.zone(oy) == 0).all() and C.zone(nxt["pos_m"][1]) == 2:
+                    s["lob"] = True
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -88,6 +104,9 @@ def player_extra(p: int, shots: list[dict], rallies: list[dict], pos: np.ndarray
         "shots_by_zone": {z: count("zone", z) for z in ("net", "transition", "back")},
         "direction": {k: count("direction", k) for k in ("crosscourt", "down the line", "centre")},
         "depth": {k: count("depth", k) for k in ("deep", "mid", "short")},
+        "lobs": count("lob", True),
+        "off_wall": count("off_wall", True),
+        "overhead_kind": {k: count("overhead_kind", k) for k in ("smash", "bandeja/víbora")},
         "last_shot_of_rally": sum(1 for r in rallies if r["shots"] and shots[r["shots"][-1]]["player"] == p),
         "rally_participation_pct": round(100 * rallies_hit / max(1, len(rallies)), 1),
         "net_approaches": net_approaches(y, fps),
@@ -143,3 +162,95 @@ def match_extra(rallies: list[dict], shots: list[dict], duration_s: float, fps: 
                                       for a, b in RALLY_BUCKETS},
         "direction_mix": {k: sum(1 for s in live if s.get("direction") == k) for k in ("crosscourt", "down the line", "centre")},
     }, in_play
+
+
+def _game_score(a: int, b: int, golden_point: bool) -> str:
+    names = ["0", "15", "30", "40"]
+    if a >= 3 and b >= 3 and not golden_point:
+        return "40-40" if a == b else ("AD-40" if a > b else "40-AD")
+    return f"{names[min(a, 3)]}-{names[min(b, 3)]}"
+
+
+def outcome_stats(rep: dict, golden_point: bool = False) -> None:
+    """Point-outcome stats from rally winners (model estimate or confirmed in review), in place.
+
+    Winner / error: the last shot of a point won by the hitter's pair is a winner (or forced an error),
+    of a lost point an error. Games follow the server: one pair serves a whole game, so a change of serving
+    pair closes the game; the score is replayed with padel scoring (advantage, or golden point).
+    """
+    shots, rallies = rep["shots"], rep["rallies"]
+    live = lambda r: [i for i in r["shots"] if not shots[i].get("deleted")]  # noqa: E731
+    decided = [r for r in rallies if r.get("winner_team") is not None and live(r)]
+    for p in rep["players"]:
+        pid = p["id"]
+        last = [r for r in decided if shots[live(r)[-1]]["player"] == pid]
+        served = [r for r in decided if shots[live(r)[0]]["player"] == pid]
+        p["stats"]["winners"] = sum(1 for r in last if r["winner_team"] == p["team"])
+        p["stats"]["errors"] = sum(1 for r in last if r["winner_team"] != p["team"])
+        p["stats"]["points_served"] = len(served)
+        p["stats"]["serve_points_won"] = sum(1 for r in served if r["winner_team"] == p["team"])
+    for t in rep["teams"]:
+        tid = t["id"]
+        won = sum(1 for r in decided if r["winner_team"] == tid)
+        t["stats"].update({
+            "points_won": won,
+            "points_won_pct": round(100 * won / len(decided), 1) if decided else None,
+            "winners": sum(p["stats"]["winners"] for p in rep["players"] if p["team"] == tid),
+            "errors": sum(p["stats"]["errors"] for p in rep["players"] if p["team"] == tid),
+        })
+    # replay padel scoring over the decided points (assumes the recording starts at 0-0). Only confirmed
+    # winners: the model is right on ~72 % of points (EVAL §9), too few for a reliable game score.
+    decided = [r for r in decided if r.get("winner_source", "confirmed") == "confirmed"]
+    log, sets, won_games = [], [], [0, 0]
+    pts: list = []
+    gs = [0, 0]  # games in the current set
+    for r in decided:
+        pts.append(r)
+        a = sum(1 for x in pts if x["winner_team"] == 0)
+        b = len(pts) - a
+        tiebreak = gs == [6, 6]
+        need = 7 if tiebreak else 4
+        if max(a, b) >= need and (abs(a - b) >= 2 or (golden_point and not tiebreak)):
+            gw = 0 if a > b else 1
+            log.append({"points": [a, b], "game_winner": gw, "tiebreak": tiebreak, "rallies": [x["id"] for x in pts],
+                        "first_hits": [shots[live(x)[0]]["team"] for x in pts]})
+            won_games[gw] += 1
+            gs[gw] += 1
+            pts = []
+            if (max(gs) >= 6 and abs(gs[0] - gs[1]) >= 2) or max(gs) == 7:
+                sets.append(gs)
+                gs = [0, 0]
+    # the serve alternates every game: pick the order that agrees with the most first hits of the whole match
+    # (a single detected first hit can be the return; the alternation makes the vote match-wide)
+    games = log + ([{"first_hits": [shots[live(x)[0]]["team"] for x in pts], "rallies": [x["id"] for x in pts]}]
+                   if pts else [])
+    agree = [sum(f == (s0 + k) % 2 for k, g in enumerate(games) for f in g["first_hits"]) for s0 in (0, 1)]
+    s0 = int(agree[1] > agree[0])
+    by_id = {r["id"]: r for r in decided}
+    for k, g in enumerate(games):
+        for rid in g.pop("rallies"):
+            by_id[rid]["server_team"] = (s0 + k) % 2
+        del g["first_hits"]
+        if "game_winner" in g:
+            g["server_team"] = (s0 + k) % 2
+            g["breaks"] = g["game_winner"] != g["server_team"]
+    for t in rep["teams"]:
+        tid = t["id"]
+        srv = [r for r in decided if r["server_team"] == tid]
+        ret = [r for r in decided if r["server_team"] != tid]
+        t["stats"]["serve_points_won_pct"] = round(100 * sum(r["winner_team"] == tid for r in srv) / len(srv), 1) if srv else None
+        t["stats"]["return_points_won_pct"] = round(100 * sum(r["winner_team"] == tid for r in ret) / len(ret), 1) if ret else None
+    in_game = None
+    if pts:
+        a = sum(1 for x in pts if x["winner_team"] == 0)
+        in_game = _game_score(a, len(pts) - a, golden_point)
+    for t in rep["teams"]:
+        t["stats"]["games_won"] = won_games[t["id"]]
+        t["stats"]["service_games_held"] = sum(1 for g in log if g["server_team"] == t["id"] and g["game_winner"] == t["id"])
+        t["stats"]["breaks"] = sum(1 for g in log if g["breaks"] and g["game_winner"] == t["id"])
+    rep["match"]["score"] = {"sets": sets + ([gs] if gs != [0, 0] or not sets else []), "current_game": in_game}
+    rep["match"]["points_decided"] = len(decided)
+    rep["match"]["games"] = log
+    rep["match"]["games_won"] = won_games
+    sources = {r.get("winner_source", "confirmed") for r in decided}
+    rep["match"]["outcome_label"] = "confirmed" if sources == {"confirmed"} else "estimated" if decided else None

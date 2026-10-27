@@ -75,6 +75,13 @@ class Settings(BaseSettings):
     # General COCO detector: Kaggle corpus run (5 futsal videos) found 4–80× more players
     # per frame than the football fine-tune (yolov5x_football.pt), which misses futsal players.
     yolo_model: str = "yolov8m.pt"
+    # COURT_FORMAT=11v11 on broadcast-size frames (≤ VISION_FOOTBALL_MAX_W wide): this football
+    # fine-tune (player/goalkeeper/referee/ball) at 640 px for people — SoccerNet GSR, 48 frames:
+    # players 92.7 % → 90.1 %, referees joining a team 80 % → 35 % (scripts/eval/bench_gsr_roles.py).
+    # The ball pass keeps YOLO_MODEL at full size. Wider panoramas keep YOLO_MODEL (it needs 1920 px).
+    yolo_model_football: str = "yolov5x_football.pt"
+    vision_imgsz_football: int = 640
+    vision_football_max_w: int = 1920
     vision_device: str = "cpu"  # cpu | 0 | cuda
     vision_frame_stride: int = 5  # process every Nth frame (when vision_target_fps = 0)
     vision_target_fps: float = 10.0  # processed frames per video second; stride = fps / target

@@ -70,6 +70,28 @@ class YoloTrackBackend(VisionBackend):
         # Fall back to Ultralytics built-in name
         return f"{name}.yaml"
 
+    def _football_profile(self, video_path: str) -> int:
+        """Football on broadcast-size frames: people from the football fine-tune (it has a referee
+        class) at its own input size; the ball pass keeps the general model. Returns that input
+        size, or 0 when the profile does not apply (futsal, panoramas, weights missing)."""
+        from app.services.action_spotting import is_football
+
+        settings = get_settings()
+        if not is_football() or self._model is not None:
+            return 0
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        cap.release()
+        weights = resolve_yolo_weights(settings.yolo_model_football)
+        if not width or width > settings.vision_football_max_w or not Path(weights).is_file():
+            return 0
+        if not self.ball_model_path:
+            self.ball_model_path = self.model_name  # the general model still finds the ball best
+        self.model_name = weights
+        return settings.vision_imgsz_football
+
     def _load(self):
         if self._model is not None:
             return self._model
@@ -119,6 +141,7 @@ class YoloTrackBackend(VisionBackend):
         import cv2
         import numpy as np
 
+        football_imgsz = self._football_profile(video_path)
         model = self._load()
         reset_tracker(model)
         class_map: dict[int, str] = self._class_map or {
@@ -136,9 +159,10 @@ class YoloTrackBackend(VisionBackend):
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        imgsz = self.imgsz or auto_imgsz(
+        full_imgsz = auto_imgsz(
             int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0), self.imgsz_max
         )
+        imgsz = football_imgsz or self.imgsz or full_imgsz
         if self.target_fps > 0:
             # Same temporal density on 25 and 60 fps sources (fast players need ~10 Hz to keep IDs)
             self.frame_stride = max(1, int(round(fps / self.target_fps)))
@@ -329,7 +353,7 @@ class YoloTrackBackend(VisionBackend):
                 # (tiled, native resolution) also every 2nd frame — the primary may only
                 # see a spare ball there. On frames that fit, a second pass at the same
                 # resolution adds nothing but a lower threshold, so skip it (CPU cost).
-                ball_imgsz = max(imgsz, 960)
+                ball_imgsz = max(full_imgsz if football_imgsz else imgsz, 960)
                 tiled = len(ball_tiles(frame.shape[1], frame.shape[0], ball_imgsz)) > 1
                 if (not ball_seen_this_frame or (tiled and frames_processed % 2 == 0)) and frames_processed % ball_every == 0:
                     ball_conf = min(self.conf, 0.12)
@@ -402,7 +426,7 @@ class YoloTrackBackend(VisionBackend):
         for tid, obs in person_tracks.items():
             if not obs:
                 continue
-            class_name = obs[0].get("class_name", "person")
+            class_name = track_class(obs)
             if class_name == "sports_ball":
                 prefix, key_id = "b", tid - 100000
             elif class_name == "referee":
@@ -557,6 +581,20 @@ def _cuda(device: str) -> str:
     return torch_device(device)
 
 
+REFEREE_TRACK_SHARE = 0.2  # of a track's frames called referee ⇒ the track is a referee
+
+
+def track_class(obs: list[dict]) -> str:
+    """A track's class from all its frames, not just the first. The football detector misses
+    refs often (47.5 % of referee boxes called referee on SoccerNet GSR) but almost never calls a
+    player one (0.1 %), so a minority of referee frames is enough."""
+    first = obs[0].get("class_name", "person")
+    if first == "sports_ball":
+        return first
+    refs = sum(1 for o in obs if o.get("class_name") == "referee")
+    return "referee" if refs >= 2 and refs >= REFEREE_TRACK_SHARE * len(obs) else "person"
+
+
 def _build_class_map(model) -> dict[int, str]:
     """Map detector class ids → person | sports_ball | referee.
 
@@ -670,7 +708,7 @@ def _crop_semantics(best_thumbs: dict, person_tracks: dict, device: str) -> dict
 
     if not getattr(get_settings(), "vision_role_filter", True):
         return {}
-    tids = [tid for tid in best_thumbs if person_tracks.get(tid) and person_tracks[tid][0].get("class_name", "person") == "person"]
+    tids = [tid for tid in best_thumbs if person_tracks.get(tid) and track_class(person_tracks[tid]) == "person"]
     imgs = [cv2.imread(str(best_thumbs[tid][1])) for tid in tids]
     from app.services.role_filter import crop_semantics
 
