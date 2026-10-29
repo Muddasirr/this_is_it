@@ -11,6 +11,7 @@ Every number in a report carries a label: **measured** (from calibrated position
 | **Volley** tag | contact made inside the net zone (≤ 4 m from the net) | position rule | estimated, not yet validated |
 | **Overhead** tag | contact with the wrist above the head (bandeja / víbora / smash family) | pose rule | estimated, not yet validated |
 | **Rally** | sequence of hits; start, end, length, duration, who opened it, who hit last | hits grouped by gap (4 s) + scene cuts | count within +3 % / −8 % |
+| **Pair identity** | which pair is which across camera cuts and changes of ends | DINOv2 appearance + joint linker over all segments | 113 / 113 segments on both PT100 finals (EVAL §11) |
 | **Rally winner** | team that won the point | model: P(last hitter's pair won) from the last shot, the ball after it and the opponents' reaction; or set in review | **72 %** of points on matches not trained on (guessing 58 %), labels from broadcast scoreboards |
 | **Dead ball** | between-point touches (≤ 3 hits, one pair, no exchange) are not rallies | rule | Kuwait 2025: 27 rallies for 25 points, none missed |
 
@@ -25,10 +26,11 @@ Every number in a report carries a label: **measured** (from calibrated position
 | Own-half heatmap | 0.5 m occupancy grid, folded so every player is seen from behind | measured | |
 | Shots, by stroke type | counts of the hits above | estimated | |
 | Volleys, overheads | counts of the tags above | estimated | |
-| Avg shot ground speed (km/h) | hitter → next hitter distance / flight time | estimated (ball height unknown from one camera) | |
 | Time tracked | how long the player was seen | measured | |
 | Winners / errors | last shot of a point the pair won / lost | estimated (point winner model) or confirmed | |
 | Serve points won | points won by the pair when this player served | estimated or confirmed | |
+| Ball speed to bounce (km/h) | average ball speed from the racket to its first bounce, per shot; per player avg / max / median by stroke | estimated | serves land in the service box 119/122; detected vs labelled ball: median 0.3 km/h apart; no radar truth (EVAL §10) |
+| Winners / errors by stroke | the above split by the stroke type of the last shot | estimated or confirmed | |
 | Smashes vs bandejas / víboras | overhead at the net = smash (remate), from further back = bandeja / víbora | estimated (position rule) | not validated: no labelled bandeja / víbora footage exists |
 | Lobs | hit while both opponents are at the net and answered from behind the service line | estimated | not validated |
 | Off the back glass | contact ≤ 1 m from the back glass | estimated (position rule) | not validated |
@@ -59,6 +61,8 @@ Every number in a report carries a label: **measured** (from calibrated position
 | Points won (%), winners, errors | from rally winners | estimated or confirmed |
 | Serve / return points won (%) | by the serving pair of each game | estimated or confirmed |
 | Games won, service games held, breaks | padel scoring replayed over the points | **confirmed winners only** |
+| Break points won / saved, golden points won | from the replayed score (receiver at game point; 40-40 under golden-point rules) | **confirmed winners only** |
+| Points finished at the net (won / lost) | points ended by this pair's shot from the net zone | estimated or confirmed |
 | Formation | % attacking (both at net), defending (both back), split | measured |
 | Net control | % of time with at least one player at the net | measured |
 | Rallies served, time to net after own serve | how fast the serving pair takes the net | estimated |
@@ -80,4 +84,4 @@ Video with player tags + ball circle overlay, live top-down mini-court replay (5
 
 ## Not tracked yet (roadmap)
 
-Automatic game score (needs > 90 % point-winner accuracy; today 72 % → confirm winners in review), bounces (floor vs glass), bandeja vs víbora (only told apart from smashes by position), forced vs unforced errors, ball speed in the air. A detector trained on the public padelcnn shot dataset (bandeja, volleys, lob, off-the-wall …) did not transfer to match footage (0 % coverage) and is not used; bandeja / víbora / lob need labelled match footage.
+Automatic game score (needs > 90 % point-winner accuracy; today 72 % → confirm winners in review), bounces (floor vs glass), bandeja vs víbora (only told apart from smashes by position), forced vs unforced errors, launch (racket) speed — one camera cannot see depth along its viewing direction; we report the average speed to the bounce instead. A detector trained on the public padelcnn shot dataset (bandeja, volleys, lob, off-the-wall …) did not transfer to match footage (0 % coverage) and is not used; bandeja / víbora / lob need labelled match footage.

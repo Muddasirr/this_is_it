@@ -22,6 +22,69 @@ MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 VERSION = "padel-0.1"
 
 
+def sample_embeddings(video: str | Path, det: Detections, every_s: float = 0.5,
+                      progress: Callable[[float], None] | None = None) -> dict[tuple[int, int], np.ndarray] | None:
+    """DINOv2-S appearance embeddings of confident player crops every `every_s` (for pair / player identity
+    across changes of ends; EVAL §11). None if the model cannot be loaded (then shirt histograms are used)."""
+    try:
+        import torch
+
+        model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", verbose=False)
+    except Exception:  # noqa: BLE001 - no internet / hub cache: fall back to shirt colours
+        return None
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(dev).eval()
+    if dev == "cuda":
+        model = model.half()
+    mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+    cap = cv2.VideoCapture(str(video))
+    step = max(1, int(round(det.fps * every_s)))
+    keys: list[tuple[int, int]] = []
+    crops: list[np.ndarray] = []
+    out: dict[tuple[int, int], np.ndarray] = {}
+
+    def flush() -> None:
+        if not crops:
+            return
+        x = torch.from_numpy(np.stack(crops)).to(dev).permute(0, 3, 1, 2).float() / 255
+        x = (x - mean) / std
+        with torch.no_grad():
+            e = model(x.half() if dev == "cuda" else x).float()
+        e = torch.nn.functional.normalize(e, dim=1).cpu().numpy()
+        out.update(zip(keys, e))
+        keys.clear()
+        crops.clear()
+
+    for fv in range(det.n * det.step):
+        if not cap.grab():
+            break
+        if fv % det.step:
+            continue
+        f = fv // det.step
+        if f % step or not det.pose_done[f]:
+            continue
+        ok, frame = cap.retrieve()
+        if not ok:
+            continue
+        for j in np.where(det.pose_box[f, :, 4] >= P.MIN_CONF)[0]:
+            x1, y1, x2, y2 = det.pose_box[f, j, :4]
+            w, h = x2 - x1, y2 - y1
+            x1, x2 = int(max(0, x1 - 0.1 * w)), int(min(frame.shape[1], x2 + 0.1 * w))
+            y1, y2 = int(max(0, y1 - 0.05 * h)), int(min(frame.shape[0], y2 + 0.05 * h))
+            if x2 - x1 < 8 or y2 - y1 < 16:
+                continue
+            keys.append((f, int(j)))
+            crops.append(np.ascontiguousarray(cv2.resize(frame[y1:y2, x1:x2], (112, 224))[:, :, ::-1]))
+            if len(crops) == 256:
+                flush()
+        if progress and f % (step * 50) == 0:
+            progress(f / det.n)
+    flush()
+    cap.release()
+    return out or None
+
+
 def sample_hists(video: str | Path, det: Detections, every_s: float = 0.5,
                  progress: Callable[[float], None] | None = None) -> dict[tuple[int, int], np.ndarray]:
     """Torso colour histograms of confident detections every `every_s` (for team/person linking)."""
@@ -73,7 +136,10 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
     t0 = time.time()
     hists = None
     if video is not None:
-        hists = sample_hists(video, det, progress=lambda p: prog("identity", p))
+        hists = sample_embeddings(video, det, progress=lambda p: prog("identity", p))
+        id_features = "dinov2" if hists else "shirt_colour"
+        if hists is None:
+            hists = sample_hists(video, det, progress=lambda p: prog("identity", p))
     prog("players", 0)
     slot_tracks = P.track(det, calib, hists)
     tracks = slot_tracks.person_view()
@@ -110,12 +176,19 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
             rally_of[i] = r.id
 
     hit_pos = [tracks.pos_m[h.frame, p] for h, p in zip(hits, person_of)]
-    speeds = ST.shot_ground_speed(hit_pos, [h.frame for h in hits], rally_of, fps)
 
     from . import shot_types as SH
 
     padel_types = SH.classify(video, hits, slot_tracks, det.step) if (video is not None and hits and SH.available()) \
         else [(None, 0.0)] * len(hits)
+    from . import ballspeed as BSP
+
+    cam = BSP.camera_from_calibration(calib)
+    speeds = []
+    for i, h in enumerate(hits):
+        end = min(hits[i + 1].frame - 1 if i + 1 < len(hits) else det.n, h.frame + int(2.5 * fps))
+        r = BSP.shot_speed(cam, calib, bt.xy, bt.observed, h.frame, end, hit_pos[i], fps) if cam is not None else None
+        speeds.append(r)
     shots = []
     for i, (h, s) in enumerate(zip(hits, strokes)):
         pos = hit_pos[i]
@@ -123,7 +196,9 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
             "id": i, "frame": h.frame, "t": round(h.frame / fps, 3), "rally": rally_of[i],
             "player": person_of[i], "team": team_of[i], "type": s.kind, "type_conf": round(s.conf, 3),
             "type_probs": s.probs, "overhead": s.overhead, "volley": s.volley,
-            "hit_score": round(h.score, 3), "speed_kmh": speeds[i],
+            "hit_score": round(h.score, 3),
+            "speed_kmh": speeds[i]["speed_kmh"] if speeds[i] else None,  # average, racket -> first bounce
+            "bounce_m": speeds[i]["bounce_m"] if speeds[i] else None,
             "pos_m": None if np.isnan(pos).any() else [round(float(pos[0]), 2), round(float(pos[1]), 2)],
             "ball_px": None if np.isnan(bt.xy[h.frame]).any() else [round(float(v), 1) for v in bt.xy[h.frame]],
             "padel_type": padel_types[i][0], "padel_type_conf": padel_types[i][1],
@@ -138,10 +213,16 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
         st["by_type"] = {c: sum(1 for s in mine if s["type"] == c) for c in CLASSES}
         st["volleys"] = sum(1 for s in mine if s["volley"])
         st["overheads"] = sum(1 for s in mine if s["overhead"])
+        sp = {}
+        for s in mine:
+            if s["speed_kmh"]:
+                sp.setdefault(s["type"], []).append(s["speed_kmh"])
+        allsp = [v for vs in sp.values() for v in vs]
+        st["ball_speed_kmh"] = {"avg": round(float(np.mean(allsp)), 1) if allsp else None,
+                                "max": round(float(max(allsp)), 1) if allsp else None, "shots_measured": len(allsp),
+                                "by_type": {k: round(float(np.median(v)), 1) for k, v in sp.items()}}
         pt = [s["padel_type"] for s in mine if s.get("padel_type")]
         st["padel_types"] = {k: pt.count(k) for k in sorted(set(pt))}
-        sp = [s["speed_kmh"] for s in mine if s["speed_kmh"]]
-        st["avg_shot_speed_kmh"] = round(float(np.mean(sp)), 1) if sp else None
         players.append({"id": p, "name": f"Player {p + 1}", "team": 0 if p < 2 else 1, "stats": st,
                         "heatmap": ST.folded_heatmap(tracks.pos_m[:, p])})
 
@@ -179,6 +260,7 @@ def analyze(det: Detections, calib: C.Calibration, video: str | Path | None = No
         "players_tracked_pct": round(float((~np.isnan(tracks.pos_m[:, :, 0])).mean() * 100), 1),
         "segments": len(slot_tracks.segments),
         "identity_linked": hists is not None,
+        "identity_features": id_features if hists is not None else None,
         "audio_used": aud is not None,
         "audio_hits": n_audio_hits,
         "calibration_reproj_m": calib.reproj_m,

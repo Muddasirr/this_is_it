@@ -187,6 +187,9 @@ def outcome_stats(rep: dict, golden_point: bool = False) -> None:
         served = [r for r in decided if shots[live(r)[0]]["player"] == pid]
         p["stats"]["winners"] = sum(1 for r in last if r["winner_team"] == p["team"])
         p["stats"]["errors"] = sum(1 for r in last if r["winner_team"] != p["team"])
+        for key, won in (("winners_by_type", True), ("errors_by_type", False)):
+            ts = [shots[live(r)[-1]].get("type", "other") for r in last if (r["winner_team"] == p["team"]) == won]
+            p["stats"][key] = {k: ts.count(k) for k in sorted(set(ts))}
         p["stats"]["points_served"] = len(served)
         p["stats"]["serve_points_won"] = sum(1 for r in served if r["winner_team"] == p["team"])
     for t in rep["teams"]:
@@ -198,6 +201,10 @@ def outcome_stats(rep: dict, golden_point: bool = False) -> None:
             "winners": sum(p["stats"]["winners"] for p in rep["players"] if p["team"] == tid),
             "errors": sum(p["stats"]["errors"] for p in rep["players"] if p["team"] == tid),
         })
+        # points this pair finished with a shot from the net zone: won / lost
+        net = [r for r in decided if shots[live(r)[-1]]["team"] == tid and shots[live(r)[-1]].get("zone") == "net"]
+        t["stats"]["net_finishes"] = {"won": sum(r["winner_team"] == tid for r in net),
+                                      "lost": sum(r["winner_team"] != tid for r in net)}
     # replay padel scoring over the decided points (assumes the recording starts at 0-0). Only confirmed
     # winners: the model is right on ~72 % of points (EVAL §9), too few for a reliable game score.
     decided = [r for r in decided if r.get("winner_source", "confirmed") == "confirmed"]
@@ -227,6 +234,26 @@ def outcome_stats(rep: dict, golden_point: bool = False) -> None:
     agree = [sum(f == (s0 + k) % 2 for k, g in enumerate(games) for f in g["first_hits"]) for s0 in (0, 1)]
     s0 = int(agree[1] > agree[0])
     by_id = {r["id"]: r for r in decided}
+    # break points (the receiving pair can win the game on this point) and golden points (40-40, golden scoring)
+    bp = {0: [0, 0], 1: [0, 0]}  # receiving team -> [break points, converted]
+    golden = {0: [0, 0], 1: [0, 0]}  # team -> [golden points played, won]
+    for k, g in enumerate(games):
+        if g.get("tiebreak"):
+            continue
+        srv = (s0 + k) % 2
+        rcv = 1 - srv
+        cnt = [0, 0]
+        for rid in g["rallies"]:
+            w = by_id[rid]["winner_team"]
+            rp, sp = cnt[rcv], cnt[srv]
+            if rp >= 3 and (rp > sp or (golden_point and rp == sp == 3)):
+                bp[rcv][0] += 1
+                bp[rcv][1] += w == rcv
+            if golden_point and cnt == [3, 3]:
+                for tm in (0, 1):
+                    golden[tm][0] += 1
+                    golden[tm][1] += w == tm
+            cnt[w] += 1
     for k, g in enumerate(games):
         for rid in g.pop("rallies"):
             by_id[rid]["server_team"] = (s0 + k) % 2
@@ -248,6 +275,10 @@ def outcome_stats(rep: dict, golden_point: bool = False) -> None:
         t["stats"]["games_won"] = won_games[t["id"]]
         t["stats"]["service_games_held"] = sum(1 for g in log if g["server_team"] == t["id"] and g["game_winner"] == t["id"])
         t["stats"]["breaks"] = sum(1 for g in log if g["breaks"] and g["game_winner"] == t["id"])
+        t["stats"]["break_points"] = {"won": bp[t["id"]][1], "of": bp[t["id"]][0]}
+        t["stats"]["break_points_saved"] = {"saved": bp[1 - t["id"]][0] - bp[1 - t["id"]][1], "of": bp[1 - t["id"]][0]}
+        if golden_point:
+            t["stats"]["golden_points"] = {"won": golden[t["id"]][1], "of": golden[t["id"]][0]}
     rep["match"]["score"] = {"sets": sets + ([gs] if gs != [0, 0] or not sets else []), "current_game": in_game}
     rep["match"]["points_decided"] = len(decided)
     rep["match"]["games"] = log

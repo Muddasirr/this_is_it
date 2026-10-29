@@ -83,21 +83,3 @@ def pair_stats(pa: np.ndarray, pb: np.ndarray) -> dict:
         "avg_lateral_spacing_m": round(float(np.abs(a[:, 0] - b[:, 0]).mean()), 2),
         "avg_depth_offset_m": round(float(np.abs(a[:, 1] - b[:, 1]).mean()), 2),
     }
-
-
-def shot_ground_speed(hit_pos: list[np.ndarray], frames: list[int], rally_of: list[int], fps: float) -> list[float | None]:
-    """Ball ground speed estimate per shot: hitter position -> next hitter position over flight time."""
-    out: list[float | None] = []
-    for i in range(len(frames)):
-        j = i + 1
-        if j >= len(frames) or rally_of[j] != rally_of[i]:
-            out.append(None)
-            continue
-        dt = (frames[j] - frames[i]) / fps
-        a, b = hit_pos[i], hit_pos[j]
-        if dt <= 0.15 or np.isnan(a).any() or np.isnan(b).any():
-            out.append(None)
-            continue
-        v = float(np.linalg.norm(b - a) / dt * 3.6)
-        out.append(round(v, 1) if v < 200 else None)
-    return out

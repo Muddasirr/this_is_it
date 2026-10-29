@@ -126,3 +126,54 @@ def test_outcome_stats_replays_padel_scoring():
     assert rep["teams"][0]["stats"]["breaks"] == 1 and rep["teams"][0]["stats"]["service_games_held"] == 1
     assert rep["teams"][0]["stats"]["points_won"] == 9
     assert rep["teams"][0]["stats"]["serve_points_won_pct"] == 100.0
+    # game 2 (team 1 serving): after 40-40, advantage team 0 -> 1 break point, converted
+    assert rep["teams"][0]["stats"]["break_points"] == {"won": 1, "of": 1}
+    assert rep["teams"][1]["stats"]["break_points_saved"] == {"saved": 0, "of": 1}
+
+
+def test_ball_speed_from_synthetic_camera():
+    import cv2
+
+    from padel_analyzer.engine import ballspeed as BS
+
+    # camera 8 m up, 18 m behind the near back glass, looking at the court centre; the scene is built in a
+    # frame with the sidelines swapped (x_rh = 10 - x) to exercise the other handedness of the calibration.
+    K = np.array([[2800.0, 0, 960], [0, 2800.0, 540], [0, 0, 1]])
+    c = np.array([5.0, 38.0, 8.0])
+    fwd = np.array([5.0, 10.0, 0.0]) - c
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0, 0, 1.0])
+    right /= np.linalg.norm(right)
+    R = np.stack([right, np.cross(fwd, right), fwd])
+    cam_rh = BS.Camera(K, R, -R @ c)
+    to_rh = lambda X: np.c_[C.WIDTH - X[:, 0], X[:, 1:]]  # noqa: E731
+    grid = np.array([[x, y, 0.0] for x in range(0, 11, 2) for y in range(0, 21, 2)])
+    H, _ = cv2.findHomography(cam_rh.project(to_rh(grid)), grid[:, :2])
+    calib = C.Calibration(H, (1920, 1080))
+    cam = BS.camera_from_calibration(calib)
+    assert cam.floor_err_px < 1 and np.linalg.norm(cam.centre - c) < 0.3
+    # a drive from (5, 3, 1) bouncing at (6, 15, 0) after 0.6 s, then rising
+    S, P, T, fps = np.array([5.0, 3.0, 1.0]), np.array([6.0, 15.0, 0.0]), 0.6, 30.0
+    g = np.array([0, 0, -9.81])
+    v0 = (P - S - 0.5 * g * T * T) / T
+    X = np.array([S + v0 * u + 0.5 * g * u * u if u <= T else
+                  P + np.array([v0[0], v0[1], 4.0]) * 0.7 * (u - T) + 0.5 * g * (u - T) ** 2
+                  for u in np.arange(0, 1.0, 1 / fps)])
+    xy = cam_rh.project(to_rh(X))
+    r = BS.shot_speed(cam, calib, xy, np.ones(len(xy), bool), 0, len(xy), S[:2], fps)
+    assert r is not None and abs(r["bounce_m"][1] - 15.0) < 0.6 and abs(r["contact_h_m"] - 1.0) < 0.2
+    assert abs(r["speed_kmh"] - np.linalg.norm(P - S) / T * 3.6) < 6
+
+
+def test_orientation_survives_lighting_and_changes_of_ends():
+    rng = np.random.default_rng(0)
+    pair_a, pair_b = rng.normal(size=32), rng.normal(size=32)
+    far_light, near_light = 3 * rng.normal(size=32), 3 * rng.normal(size=32)  # each end shifts every feature
+    truth = [0] * 6 + [1] * 8 + [0] * 5  # far pair: A, then B after a change of ends, then A again
+    seg = []
+    for t in truth:
+        far, near = (pair_a, pair_b) if t == 0 else (pair_b, pair_a)
+        seg.append({"F": far + far_light + 0.3 * rng.normal(size=32), "N": near + near_light + 0.3 * rng.normal(size=32),
+                    "w": 10})
+    seg[9]["F"] = None  # a segment without usable crops keeps the previous orientation
+    assert P._orientation(seg) == truth

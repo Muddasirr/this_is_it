@@ -195,3 +195,38 @@ The last hitter's pair won only 42 % of points in all three matches (errors end 
 | tried: joint orientation over all segments | 32 / 52 | 37 / 61 |
 
 The joint version was worse and was not kept. In the men's final and Kuwait the two pairs' shirts are similar enough that identity is lost after some changes of ends → per-player and per-pair totals over a whole match can mix the pairs there; **side-relative stats (per rally, per shot) are unaffected**. Next fix: use the padel rule that ends change only after odd games, once the game structure is known.
+
+
+## 10. Ball speed (2026-10-28)
+
+The first version ("distance between the two hitters / time between their hits") was wrong and was removed: on Kuwait it read a 33 km/h median with 17 % of shots under 10 km/h.
+
+**Why not the launch speed:** one camera behind the court sees shots travel mostly along its viewing direction. A free 3D parabola fitted to hand-labelled PT100 ball positions reproduces the image to 3–9 px yet puts the hit point 10–60 m behind the court, so depth (and with it the launch speed) is not observable. Pinning the contact and the bounce did not help either: those fits stayed 35–45 px off, with or without air drag.
+
+**What is measured — average speed from the racket to the first bounce** (`engine/ballspeed.py`): the camera (focal length + pose) is recovered from the floor calibration (PT100: 1.7 px floor error, camera 8.5 m high vs 7.6 m in the dataset paper; the net's top projects onto the net). Contact = the ball's camera ray above the hitter's feet; bounce = first sharp down-screen → up-screen turn of the ball's image path on the opponent's half, located on the floor through the homography; speed = distance / flight time, capped at 140 km/h. Volleys and shots into the glass get no speed.
+
+`padel-ballspeed` (PT100 labelled shots; "detected" = our held-out ball track at the same shots and hitter):
+
+| | Women's final | Men's final |
+| --- | --- | --- |
+| serves whose bounce lands in a service box (labelled / detected ball) | 30/30 · 30/30 | 35/36 · 24/25 |
+| same shot, detected vs labelled ball: median / 90th pct difference | 0.2 / 16 km/h | 0.3 / 31 km/h |
+| shots with a speed (detected ball) | 43 % | 36 % |
+| contact height serve / forehand / smash family (m) | 0.54 / 0.89 / 1.94 | 0.79 / 0.85 / 1.95 |
+
+Median speed by stroke (labelled ball): serve 54 / 58, forehand 54 / 58, backhand 45 / 54, smash family incl. bandejas 65 / 75, lobs & other 37 / 35 km/h (women / men). Kuwait 2025 (detected, unseen): serve 62, forehand 52, backhand 49, smash family 84 km/h. No radar ground truth exists for padel video, so these are physical checks (serve placement, contact heights within the rules, stroke ordering, men > women), not a measured error in km/h. It is an average over the flight: launch speeds are higher (drag, arc).
+
+
+## 11. Pair identity across changes of ends — fixed (2026-10-29)
+
+Truth: for every camera segment with a scoreboard point, which pair plays the far end (serve dot + where the serve was hit; `padel-identity`). The truth sequences change only 7 (women) / 9 (men) times, in blocks matching the changes of ends. Score = segments with the right pair at the far end, up to one global relabelling. Linker experiments on saved features in `padel-idlab` (CPU).
+
+| Linker / features | Women's final | Men's final |
+| --- | --- | --- |
+| old: prototypes from the first segment, segment by segment — shirt HS histogram | 30 / 52 | 61 / 61 |
+| old — DINOv2-S embeddings | 32 / 52 | 50 / 61 |
+| running per-end prototypes — shirt / DINOv2 | 31 / 52 · 32 / 52 | 61 / 61 · 33 / 61 |
+| joint (end-centred features, spectral sign of the segment-agreement matrix, Viterbi switch penalty 0 / 0.3 / 1) — shirt | 26–28 / 52 | 61 / 61 |
+| **joint — DINOv2-S, production tracker (`players._link_identity`)** | **52 / 52** | **61 / 61** |
+
+Both parts are needed: a general appearance model (build, shorts, hair, not only the shirt hue) and a decision over all segments that compares far with far and near with near after removing each end's lighting / scale bias. The result is the same for switch penalties 0–1. (The §9 table's 52/52 and 43/61 for the old linker were scored with a less careful truth; on this truth the old linker gets 30/52 and 61/61.) Production: `pipeline.sample_embeddings` (DINOv2 ViT-S/14 via torch.hub, every 0.5 s per confident player crop); shirt histograms only if the model cannot be loaded (`quality.identity_features`). Not measured: which partner is which inside a pair (no public labels); Kuwait 2025 (its video cannot reach Kaggle).

@@ -135,6 +135,29 @@ KERNELS = {
         "dataset_sources": [f"{USER}/padel-code"],
         "dir": "testsk",
     },
+    "ballspeed": {
+        "slug": "padel-ballspeed",
+        "code_file": "padel_ballspeed.py",
+        "enable_gpu": False,
+        "kernel_sources": [f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-pose"],
+        "dataset_sources": [f"{USER}/padel-code", f"{USER}/padel-kuwait-small"],
+        "dir": "ballspeedk",
+    },
+    "identity": {
+        "slug": "padel-identity",
+        "code_file": "padel_identity.py",
+        "enable_gpu": True,
+        "kernel_sources": [f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-pose", f"{USER}/padel-stroke-rgb",
+                           f"{USER}/padel-eval", f"{USER}/padel-fusion", f"{USER}/padel-scoreboard"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
+    "idlab": {
+        "slug": "padel-idlab",
+        "code_file": "padel_idlab.py",
+        "enable_gpu": False,
+        "kernel_sources": [f"{USER}/padel-pt100-prep", f"{USER}/padel-gpu-pose", f"{USER}/padel-identity"],
+        "dataset_sources": [f"{USER}/padel-code"],
+    },
 }
 CODE_DATASET = "padel-code"
 JOBS_DATASET = "padel-jobs"

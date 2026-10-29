@@ -131,6 +131,10 @@ export default function ReportPage({ id }: { id: string }) {
                     ['Games won · held · breaks', `${t.stats.games_won ?? 0} · ${t.stats.service_games_held ?? 0} · ${t.stats.breaks ?? 0}`],
                     ['Serve / return points won', `${t.stats.serve_points_won_pct ?? '–'} % / ${t.stats.return_points_won_pct ?? '–'} %`],
                     ['Winners / errors', `${t.stats.winners ?? 0} / ${t.stats.errors ?? 0}`],
+                    ['Break points won', fmtOf(t.stats.break_points, 'won')],
+                    ['Break points saved', fmtOf(t.stats.break_points_saved, 'saved')],
+                    ['Points finished at the net (won / lost)', `${(t.stats.net_finishes as Record<string, number> | undefined)?.won ?? 0} / ${(t.stats.net_finishes as Record<string, number> | undefined)?.lost ?? 0}`],
+                    ...(t.stats.golden_points ? [['Golden points won', fmtOf(t.stats.golden_points, 'won')]] : []),
                     ...pairExtra(t.stats),
                   ].map(([k, v]) => (
                     <tr key={String(k)}><td className="secondary">{k as React.ReactNode}</td><td className="num" style={{ textAlign: "right" }}>{v as React.ReactNode}</td></tr>
@@ -296,7 +300,6 @@ function PlayerCard({ p, onRename }: { p: Player; onRename: (name: string) => vo
         <div style={{ flex: 1, minWidth: 180 }}>
           <h3 style={{ marginBottom: 6 }}>Strokes</h3>
           <Bars data={s.by_type} />
-          {s.avg_shot_speed_kmh && <div className="small muted" style={{ marginTop: 6 }}>Avg shot ground speed {s.avg_shot_speed_kmh} km/h (est.)</div>}
           {s.direction && (
             <>
               <h3 style={{ margin: '12px 0 6px' }}>Shot direction <span className="small muted">(est.)</span></h3>
@@ -324,6 +327,10 @@ function PlayerCard({ p, onRename }: { p: Player; onRename: (name: string) => vo
               ['Shots from net / transition / back', `${s.shots_by_zone?.net ?? 0} / ${s.shots_by_zone?.transition ?? 0} / ${s.shots_by_zone?.back ?? 0}`],
               ['Shot depth deep / mid / short', `${s.depth?.deep ?? 0} / ${s.depth?.mid ?? 0} / ${s.depth?.short ?? 0}`],
               ['Winners / errors', `${s.winners ?? 0} / ${s.errors ?? 0}`],
+              ['Ball speed to bounce, avg / max (est.)', s.ball_speed_kmh?.avg != null ? `${s.ball_speed_kmh.avg} / ${s.ball_speed_kmh.max} km/h · ${s.ball_speed_kmh.shots_measured} shots` : '–'],
+              ['Median speed by stroke', fmtCounts(s.ball_speed_kmh?.by_type)],
+              ['Winners by stroke', fmtCounts(s.winners_by_type)],
+              ['Errors by stroke', fmtCounts(s.errors_by_type)],
               ['Serve points won', s.points_served ? `${s.serve_points_won ?? 0} of ${s.points_served}` : '–'],
               ['Smashes / bandejas & víboras', `${s.overhead_kind?.smash ?? 0} / ${s.overhead_kind?.['bandeja/víbora'] ?? 0}`],
               ['Lobs', s.lobs ?? 0],
@@ -341,6 +348,16 @@ function PlayerCard({ p, onRename }: { p: Player; onRename: (name: string) => vo
       )}
     </div>
   )
+}
+
+function fmtOf(v: unknown, key: string): string {
+  const o = v as Record<string, number> | undefined
+  return o && o.of ? `${o[key]} of ${o.of}` : '–'
+}
+
+function fmtCounts(v: Record<string, number> | undefined): string {
+  const e = Object.entries(v ?? {}).filter(([, n]) => n > 0)
+  return e.length ? e.map(([k, n]) => `${k} ${n}`).join(' · ') : '–'
 }
 
 function pairExtra(st: Record<string, unknown>): [string, string | number][] {
@@ -418,7 +435,7 @@ function Shots({ rep, names, seek, review, now }: {
       </div>
       <div style={{ overflowX: 'auto' }}>
         <table>
-          <thead><tr><th>Time</th><th>Rally</th><th>Player</th><th>Stroke</th><th>Padel shot</th><th>Tags</th><th>Speed</th><th /></tr></thead>
+          <thead><tr><th>Time</th><th>Rally</th><th>Player</th><th>Stroke</th><th>Padel shot</th><th>Tags</th><th title="Average ball speed from the racket to its first bounce (estimated). Volleys and shots into the glass have none.">Speed*</th><th /></tr></thead>
           <tbody>
             {list.map((s) => (
               <tr key={s.id} className={`clickable ${Math.abs(s.t - now) < 0.4 ? 'active' : ''}`} onClick={() => seek(s.t - 1)}>
@@ -433,7 +450,7 @@ function Shots({ rep, names, seek, review, now }: {
                 </td>
                 <td>{s.padel_type ? <>{s.padel_type} <span className="small muted">{Math.round((s.padel_type_conf ?? 0) * 100)}%</span></> : <span className="muted">–</span>}</td>
                 <td>{s.volley && <span className="tag">volley</span>}{s.overhead && <span className="tag">overhead</span>}</td>
-                <td className="num">{s.speed_kmh ? `${s.speed_kmh} km/h` : '–'}</td>
+                <td className="num">{s.speed_kmh ? `${Math.round(s.speed_kmh)} km/h` : '–'}</td>
                 <td onClick={(e) => e.stopPropagation()}>
                   <button className="ghost small" title="Not a shot — remove" onClick={() => review({ shots: { [s.id]: { deleted: true } } })}>✕</button>
                 </td>

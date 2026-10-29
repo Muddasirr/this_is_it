@@ -4,9 +4,8 @@ Padel structure does most of the work: exactly 4 players, a pair per net side, a
 1. Court filter: feet (ankle midpoint, else box bottom) -> metres; keep detections on the floor.
 2. Per side, up to 2 detections; slots 0,1 = far side, 2,3 = near side; Hungarian on metres
    against constant-velocity predictions.
-3. Segments break at scene cuts / side changes; teams are re-linked across segments by kit colour
-   (the pair on a side shares a kit), partners by individual colour (low confidence -> pair stats
-   are the reliable level).
+3. Segments break at scene cuts / side changes; which pair plays which end is decided over all segments
+   jointly from appearance embeddings (DINOv2), partners by individual appearance.
 """
 from __future__ import annotations
 
@@ -226,43 +225,100 @@ def _smooth(raw: np.ndarray, fps: float, max_fill: int) -> np.ndarray:
     return out
 
 
+def feature_dist(a: np.ndarray, b: np.ndarray) -> float:
+    """Shirt histograms (L1-normalised, all >= 0): Bhattacharyya distance; appearance embeddings: cosine."""
+    if a.min() >= 0 and b.min() >= 0 and abs(a.sum() - 1) < 1e-3:
+        return float(cv2.compareHist(a.astype(np.float32), b.astype(np.float32), cv2.HISTCMP_BHATTACHARYYA))
+    return float(1.0 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+
+SWITCH_PENALTY = 0.3  # cost of a change of ends between consecutive segments (ends change every ~2 games)
+
+
+def _orientation(seg: list[dict], lam: float = SWITCH_PENALTY) -> list[int]:
+    """Per segment: 0 if the pair seen at the far end in the first usable segment is at the far end, else 1.
+
+    Far and near players look different (size, lighting), so each end's mean feature is subtracted first;
+    then S[i, j] = how much segments i and j agree on "same ends" (far~far, near~near) over "swapped"
+    (far~near). The sign of S's leading eigenvector labels every segment jointly; a Viterbi pass over the
+    segment chain with a penalty per change of ends removes isolated flips. PT100 finals, DINOv2 features:
+    52/52 and 61/61 segments vs 30/52 and 61/61 for the old segment-by-segment shirt matching (EVAL §11).
+    """
+    ok = [g["F"] is not None and g["N"] is not None and g["w"] >= 2 for g in seg]
+    idx = [k for k in range(len(seg)) if ok[k]]
+    if len(idx) < 2:
+        return [0] * len(seg)
+    Fm = np.mean([seg[k]["F"] for k in idx], 0)
+    Nm = np.mean([seg[k]["N"] for k in idx], 0)
+    Fc = np.array([seg[k]["F"] - Fm for k in idx])
+    Nc = np.array([seg[k]["N"] - Nm for k in idx])
+    Fc /= np.linalg.norm(Fc, axis=1, keepdims=True) + 1e-9
+    Nc /= np.linalg.norm(Nc, axis=1, keepdims=True) + 1e-9
+    S = Fc @ Fc.T + Nc @ Nc.T - Fc @ Nc.T - Nc @ Fc.T
+    np.fill_diagonal(S, 0.0)
+    u = np.linalg.eigh(S)[1][:, -1]
+    unary = np.c_[-u, u] / (np.abs(u).max() + 1e-9)  # cost of state 0 / 1 per usable segment
+    cost, back = unary[0].copy(), []
+    for i in range(1, len(idx)):
+        stay, switch = cost, cost[::-1] + lam
+        back.append((switch < stay).astype(int))
+        cost = np.minimum(stay, switch) + unary[i]
+    st = int(np.argmin(cost))
+    path = [st]
+    for ch in reversed(back):
+        st = 1 - st if ch[st] else st
+        path.append(st)
+    lab = dict(zip(idx, path[::-1]))
+    flip = lab[idx[0]]  # the first usable segment's far pair is team 0
+    o, cur = [], lab[idx[0]] ^ flip
+    for k in range(len(seg)):
+        cur = (lab[k] ^ flip) if k in lab else cur
+        o.append(cur)
+    return o
+
+
 def _link_identity(segments, det_of, hists, n):
-    """team[f, slot], person[f, slot]. Segment 0: far pair = team 0, slots 0..3 = persons 0..3.
-    Later segments: the side whose kit matches team 0's kit is team 0; partners by individual colour."""
+    """team[f, slot], person[f, slot]. hists: {(frame, det_index): feature} — DINOv2 appearance embeddings
+    (production) or shirt histograms (fallback). Which pair plays which end: _orientation over all segments.
+    Partners within a pair: individual features against running per-person prototypes from the same end."""
     team = np.zeros((n, 4), int)
     person = np.tile(np.arange(4), (n, 1))
     team[:, 2:] = 1
     if not hists or len(segments) < 2:
         return team, person
-    def slot_hist(a, b, s):
-        hs = [hists[(f, det_of[f, s])] for f in range(a, b) if det_of[f, s] >= 0 and (f, det_of[f, s]) in hists]
-        return np.mean(hs, 0) if hs else None
-    proto_person: dict[int, np.ndarray] = {}
-    a, b = segments[0]
-    for s in range(4):
-        h = slot_hist(a, b, s)
-        if h is not None:
-            proto_person[s] = h
-    for a, b in segments[1:]:
-        hs = [slot_hist(a, b, s) for s in range(4)]
-        if len(proto_person) < 4 or any(h is None for h in hs):
-            team[a:b] = team[a - 1]
-            person[a:b] = person[a - 1]
-            continue
-        P = np.array([proto_person[p] for p in range(4)])
-        Hs = np.array(hs)
-        cost = np.array([[cv2.compareHist(Hs[s].astype(np.float32), P[p].astype(np.float32),
-                                          cv2.HISTCMP_BHATTACHARYYA) for p in range(4)] for s in range(4)])
-        # pair-level decision first: far side = team 0 or team 1
-        keep = cost[0, 0] + cost[0, 1] + cost[1, 0] + cost[1, 1] + cost[2, 2] + cost[2, 3] + cost[3, 2] + cost[3, 3]
-        swap = cost[0, 2] + cost[0, 3] + cost[1, 2] + cost[1, 3] + cost[2, 0] + cost[2, 1] + cost[3, 0] + cost[3, 1]
-        far_team = 0 if keep <= swap else 1
-        far_people = [0, 1] if far_team == 0 else [2, 3]
-        near_people = [2, 3] if far_team == 0 else [0, 1]
-        for slots, people in (((0, 1), far_people), ((2, 3), near_people)):
-            c = cost[np.ix_(slots, people)]
-            straight = c[0, 0] + c[1, 1] <= c[0, 1] + c[1, 0]
-            assigned = people if straight else people[::-1]
+
+    def slot_feat(a, b, s):
+        v = [hists[(f, det_of[f, s])] for f in range(a, b) if det_of[f, s] >= 0 and (f, det_of[f, s]) in hists]
+        return (np.mean(v, 0), len(v)) if v else (None, 0)
+
+    seg = []
+    for a, b in segments:
+        sl = [slot_feat(a, b, s) for s in range(4)]
+        far = [v for v, _ in sl[:2] if v is not None]
+        near = [v for v, _ in sl[2:] if v is not None]
+        seg.append({"slots": [v for v, _ in sl], "F": np.mean(far, 0) if far else None,
+                    "N": np.mean(near, 0) if near else None,
+                    "w": min(sum(c for _, c in sl[:2]), sum(c for _, c in sl[2:]))})
+    o = _orientation(seg)
+    proto: dict[tuple[int, int], list] = {}  # (person, end 0 far / 1 near) -> features
+    for k, (a, b) in enumerate(segments):
+        far_people = [0, 1] if o[k] == 0 else [2, 3]
+        near_people = [2, 3] if o[k] == 0 else [0, 1]
+        for end, (slots, people) in enumerate((((0, 1), far_people), ((2, 3), near_people))):
+            fs = [seg[k]["slots"][s] for s in slots]
+            assigned = list(people)
+            if all(v is not None for v in fs):
+                refs = []
+                for p in people:
+                    got = proto.get((p, end)) or proto.get((p, 1 - end))
+                    refs.append(np.mean(got[-20:], 0) if got else None)
+                if all(r is not None for r in refs):
+                    straight = feature_dist(fs[0], refs[0]) + feature_dist(fs[1], refs[1])
+                    crossed = feature_dist(fs[0], refs[1]) + feature_dist(fs[1], refs[0])
+                    if crossed < straight:
+                        assigned = assigned[::-1]
+                for v, p in zip(fs, assigned):
+                    proto.setdefault((p, end), []).append(v)
             for s, p in zip(slots, assigned):
                 person[a:b, s] = p
                 team[a:b, s] = 0 if p < 2 else 1

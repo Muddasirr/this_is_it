@@ -48,7 +48,6 @@ export interface PlayerStats {
   by_type: Record<string, number>
   volleys: number
   overheads: number
-  avg_shot_speed_kmh: number | null
   padel_types?: Record<string, number>
   serves?: number
   serve_side?: Record<string, number>
@@ -66,6 +65,9 @@ export interface PlayerStats {
   overhead_kind?: Record<string, number>
   winners?: number
   errors?: number
+  winners_by_type?: Record<string, number>
+  ball_speed_kmh?: { avg: number | null; max: number | null; shots_measured: number; by_type: Record<string, number> }
+  errors_by_type?: Record<string, number>
   points_served?: number
   serve_points_won?: number
 }
@@ -97,7 +99,6 @@ export interface Shot {
   type_probs: Record<string, number>
   overhead: boolean
   volley: boolean
-  speed_kmh: number | null
   pos_m: Pt | null
   ball_px: Pt | null
   label: 'estimated' | 'confirmed'
@@ -106,6 +107,8 @@ export interface Shot {
   padel_type_conf?: number
   lob?: boolean
   off_wall?: boolean
+  speed_kmh?: number | null
+  bounce_m?: Pt | null
   overhead_kind?: string
 }
 

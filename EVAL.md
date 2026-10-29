@@ -173,6 +173,54 @@ spotter's crop; with our own ball on the panorama the crop misses the play. Spee
 4 min of 4096x1080 (tiled ball passes). Note: `e2e_product.py` calibrates with fixed futsal points —
 on another venue that calibration is wrong and the court filter then drops real players.
 
+## Football events through the live app (SoccerTrack v2 M7, 12 min, 2026-10-28)
+
+Replaces the SoccerNet plan (NDA). Test match M7 (128057, never seen by the spotter: trained on
+M1 M3–M6 M8), 1st half 0–12 min cut straight from HF (`testing_videos/st2_128057_0_720.mp4`,
+4096x1080 panorama), `COURT_FORMAT=11v11`, Kaggle GPU, 18/18 product checks. Frame-aligned labels,
+whole clip labelled → `scripts/eval/score_soccertrack.py` (±1 s, one-to-one);
+`data/eval/soccertrack2/score_128057_0_720.json`.
+
+| Event (labelled) | Predicted | Precision | Recall | F1 |
+|---|---|---|---|---|
+| Pass (121: pass/high pass/cross) | 71 | 0.72 | 0.42 | **0.53** (0.57 at ±2 s) |
+| Dribble / carry (86) | 58 | 0.47 | 0.31 | 0.37 |
+| Any on-ball action (239) | 129 | 0.75 | 0.41 | 0.53 |
+| Throw-in (8), free kick (3), shot (1) | 0 | — | 0 | 0 |
+
+Raw spotter output (831 spots) swept by confidence: pass F1 peaks at 0.56 (thr 0.10), recall 0.85
+at the floor → the fused 0.53 is near the spotter's ceiling; dribble peaks 0.48 (thr 0.15). The
+limit is the ball on the panorama: found in **25 %** of frames, so the spotter's crop often misses
+the play (with the labelled ball the same spotter scored F1 0.80). The spotter emits no
+throw-in / free-kick / shot spots here. GPU 3859 s for 12 min (ball passes dominate: 5065 s summed
+stage time); round trip 4186 s.
+
+**Fixes (2026-10-28/29), same clip, live app:**
+
+1. Panorama ball model `ball_st2.pt` (`vision_ball_model_panorama`, football panoramas only):
+   `ball_yolov8m.pt` fine-tuned on 1,323 auto-labelled 960 px crops at labelled ball actions
+   from the 6 train matches (first 25 min of each 1st half; label = detection nearest the
+   keypoint-projected ball, off-pitch and static spots dropped) + the old DFL/futsal sets
+   (`scripts/eval/st2_ball_crops.py`, `scripts/kaggle/build_ball_st2.py`). Held-out M7 crops
+   (423): ball found 35 % (COCO) / 23 % (ball_yolov8m) → **53 %**, false balls 0.24 → 0.02 per
+   crop. Old test sets: DFL 0.84 → 0.79 / 0.36 → 0.40 mAP50, futsal 0.74 → 0.43 (9 images) →
+   not used for futsal. Live app: ball coverage 25 % → 54 %, but pass F1 0.53 → 0.51 — the
+   ball was not the limit.
+2. Spotter input = the pitch band (`action_spotting.pitch_band`, football only): the T-DEED
+   fine-tune was trained on a 16:9 window over the pitch rows; the app fed the full panorama
+   height (≈40 % foreground lettering, players ~1.6x smaller). Offline A/B on the same clip
+   (`scripts/eval/spot_geometry_ab.py`, `scripts/kaggle/build_spot_ab.py`), pass F1: full
+   height 0.59 · players' band 0.69 · keypoint band 0.74 · keypoint band + labelled ball 0.79.
+
+| Event (live app, both fixes) | Before | After |
+|---|---|---|
+| Pass (121) | P 0.72 / R 0.42 / **F1 0.53** | P 0.71 / R 0.74 / **F1 0.72** (0.76 at ±2 s) |
+| Dribble / carry (86) | F1 0.37 | **0.55** |
+| Any on-ball action (239) | F1 0.53 | **0.71** |
+| Throw-in, free kick, shot | 0 | 0 (still none spotted) |
+
+Thresholds unchanged (0.2 pass / 0.3 dribble, chosen before this test) — M7 stays a clean test.
+
 ## Football broadcast through the live app (DFL Bundesliga, 12 min, 2026-10-27)
 
 12 min of 1080p wide tactical feed (Bayern home, `A1606b0e6_0` chunks 21–44 stitched →

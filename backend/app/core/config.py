@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     # the primary's ball boxes (COCO: flags, cones, boards) are ignored and every processed
     # frame gets a ball pass with this model.
     vision_ball_model: str = ""
+    # COURT_FORMAT=11v11 on a fixed panorama (wider than VISION_FOOTBALL_MAX_W) when
+    # VISION_BALL_MODEL is unset: ball model fine-tuned on SoccerTrack v2 (6 train matches).
+    # Held-out M7 crops: ball found 35 % (COCO) / 23 % (ball_yolov8m) → 53 %, false balls
+    # 0.24 → 0.02 per crop. Not for futsal: its futsal test mAP50 fell 0.74 → 0.43.
+    vision_ball_model_panorama: str = "models/ball_st2.pt"
     # Tracker: botsort (default, GMC) | bytetrack (legacy A/B)
     vision_tracker: str = "botsort"
     # BoT-SORT global motion compensation: auto = off when the camera is static (facility

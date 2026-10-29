@@ -73,7 +73,8 @@ class YoloTrackBackend(VisionBackend):
     def _football_profile(self, video_path: str) -> int:
         """Football on broadcast-size frames: people from the football fine-tune (it has a referee
         class) at its own input size; the ball pass keeps the general model. Returns that input
-        size, or 0 when the profile does not apply (futsal, panoramas, weights missing)."""
+        size, or 0 when the profile does not apply (futsal, panoramas, weights missing).
+        Football panoramas keep the general model for people but get the panorama ball model."""
         from app.services.action_spotting import is_football
 
         settings = get_settings()
@@ -84,8 +85,13 @@ class YoloTrackBackend(VisionBackend):
         cap = cv2.VideoCapture(video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         cap.release()
+        if width > settings.vision_football_max_w:
+            ball = resolve_yolo_weights(settings.vision_ball_model_panorama)
+            if not self.ball_model_path and settings.vision_ball_model_panorama and Path(ball).is_file():
+                self.ball_model_path = ball
+            return 0
         weights = resolve_yolo_weights(settings.yolo_model_football)
-        if not width or width > settings.vision_football_max_w or not Path(weights).is_file():
+        if not width or not Path(weights).is_file():
             return 0
         if not self.ball_model_path:
             self.ball_model_path = self.model_name  # the general model still finds the ball best

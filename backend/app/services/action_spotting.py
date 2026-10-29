@@ -6,8 +6,10 @@ for the possession heuristics; dribble F1 0.72–0.77; shots P 0.50 / R 0.60–0
 Runs where T-DEED (GPL-3.0, server-side only) and the weights are present — the Modal
 GPU image (TDEED_REPO, TDEED_WEIGHTS). Input to the model: 25 fps, 796x448. 16:9-ish
 cameras are resized whole; panoramas (aspect > 2.2) get the training crop: a 16:9 window
-over the frame height that follows the play (our own ball, else the players' centroid,
-smoothed ±2 s) — the same geometry the model was trained on.
+over the pitch band (rows the players stand in, ≈ the training's keypoint band) that follows
+the play (our own ball, else the players' centroid, smoothed ±2 s). SoccerTrack M7, 12 min:
+pass F1 0.59 over the full height → 0.69 over the players' band (0.79 with the labelled
+ball) — scripts/eval/spot_geometry_ab.py.
 
 The model says *what* and *when*; `app.services.events.events_from_spotting` adds *who*
 from the possession timeline.
@@ -100,6 +102,24 @@ def crop_centres(detections: list, n_frames: int, fps: float, width: int) -> np.
     return np.convolve(np.pad(xs, (k // 2, k // 2), mode="edge"), np.ones(k) / k, mode="valid")
 
 
+def pitch_band(detections: list, height: int) -> tuple[int, int]:
+    """Rows of the pitch on a panorama: players' box tops (5th pct) − 60 … bottoms (99th pct) + 40
+    (the training crop used the pitch keypoints' rows −60/+40). Full height without players."""
+    tops, bottoms = [], []
+    for d in detections:
+        if d.class_name != "person":
+            continue
+        for p in d.bbox_series or []:
+            if "y1" in p:
+                tops.append(float(p["y1"]))
+                bottoms.append(float(p["y2"]))
+    if len(tops) < 50:
+        return 0, height
+    y0 = max(0, int(np.percentile(tops, 5)) - 60)
+    y1 = min(height, int(np.percentile(bottoms, 99)) + 40)
+    return (y0, y1) if y1 - y0 >= height // 3 else (0, height)
+
+
 def write_model_video(video_path: str, detections: list, out_path: str, until_ms: int | None = None) -> dict:
     """Source video → 25 fps 796x448 H.264 in the training geometry (see module doc), up to until_ms."""
     import cv2
@@ -110,7 +130,9 @@ def write_model_video(video_path: str, detections: list, out_path: str, until_ms
     fw, fh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     panorama = fw / max(1, fh) > PANORAMA_ASPECT
     cx = crop_centres(detections, max(1, n), fps, fw) if panorama else None
-    crop_w = min(fw, int(round(fh * 16 / 9))) if panorama else fw
+    # Football only: the SoccerTrack model was trained on the band; the futsal one was not measured on it
+    y0, y1 = pitch_band(detections, fh) if panorama and is_football() else (0, fh)
+    crop_w = min(fw, int(round((y1 - y0) * 16 / 9))) if panorama else fw
     ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
     enc = subprocess.Popen([ffmpeg, "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}",
                             "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -124,7 +146,7 @@ def write_model_video(video_path: str, detections: list, out_path: str, until_ms
         while i >= next_src - 1e-6:
             if panorama:
                 x0 = int(np.clip(cx[min(i, len(cx) - 1)] - crop_w / 2, 0, fw - crop_w))
-                view = frame[:, x0 : x0 + crop_w]
+                view = frame[y0:y1, x0 : x0 + crop_w]
             else:
                 view = frame
             enc.stdin.write(cv2.resize(view, (W, H), interpolation=cv2.INTER_AREA).tobytes())
@@ -134,7 +156,7 @@ def write_model_video(video_path: str, detections: list, out_path: str, until_ms
     enc.stdin.close()
     enc.wait()
     cap.release()
-    return {"frames": written, "panorama": panorama, "source_fps": fps}
+    return {"frames": written, "panorama": panorama, "source_fps": fps, "band": [y0, y1]}
 
 
 def _model(device: str):

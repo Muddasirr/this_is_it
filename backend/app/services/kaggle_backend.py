@@ -67,9 +67,12 @@ if not (work / "tdeed").exists():
 weights = next(iter(Path("/kaggle/input").rglob("tdeed_futsal.pt")), None)
 football = next(iter(Path("/kaggle/input").rglob("tdeed_soccertrack.pt")), None)  # used when COURT_FORMAT=11v11
 detector = next(iter(Path("/kaggle/input").rglob("yolov5x_football.pt")), None)  # 11v11 people + referees
+pano_ball = next(iter(Path("/kaggle/input").rglob("ball_st2.pt")), None)  # 11v11 panorama ball
 os.environ.update(job["env"])
 if detector is not None:
     os.environ.update(YOLO_MODEL_FOOTBALL=str(detector))
+if pano_ball is not None:
+    os.environ.update(VISION_BALL_MODEL_PANORAMA=str(pano_ball))
 os.environ.update(VISION_DEVICE="0", VISION_BACKEND="yolo", VISION_THUMB_DIR=str(work / "thumbs"), FFMPEG="ffmpeg")
 if weights is not None and (work / "tdeed").exists():
     os.environ.update(TDEED_REPO=str(work / "tdeed"), TDEED_WEIGHTS=str(weights))
